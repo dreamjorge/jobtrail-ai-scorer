@@ -1,5 +1,5 @@
 # Copy to config.yaml and update these local, non-secret values.
 jobtrail_base_url: http://localhost:3000
-candidate_profile_path: ./candidate-profile.md
+candidate_profile_path: ./candidate-profile.example.md
 provider: hermes
 marker: "[AI_JOB_SCORE_V1]"

@@ -4,4 +4,4 @@ services:
     command: ["score", "--config", "/config/config.yaml"]
     volumes:
       - ${SCORER_CONFIG_PATH:-./config.example.yaml}:/config/config.yaml:ro
-      - ${SCORER_PROFILE_PATH:-./candidate-profile.md}:/config/candidate-profile.md:ro
+      - ${SCORER_PROFILE_PATH:-./candidate-profile.example.md}:/config/candidate-profile.md:ro

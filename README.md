@@ -7,6 +7,7 @@ Provider-agnostic CLI that evaluates JobTrail jobs against a local candidate pro
 ```sh
 python -m pip install .
 cp config.example.yaml config.yaml
+cp candidate-profile.example.md candidate-profile.md
 # edit config.yaml and candidate-profile.md
 ```
 

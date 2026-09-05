@@ -11,3 +11,4 @@ def test_distribution_metadata_and_runtime_files_exist():
     assert (ROOT / "LICENSE").is_file()
     assert (ROOT / "docker-compose.yml").is_file()
     assert (ROOT / "Dockerfile").is_file()
+    assert (ROOT / "candidate-profile.example.md").is_file()
