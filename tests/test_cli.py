@@ -1,11 +1,13 @@
 """Focused tests for the public scorer command."""
 import pytest
+import importlib.util
 
-typer = pytest.importorskip("typer")
-from typer.testing import CliRunner
+pytestmark = pytest.mark.skipif(importlib.util.find_spec("typer") is None, reason="typer dependency not installed")
+import typer  # noqa: E402
+from typer.testing import CliRunner  # noqa: E402
 
-from jobtrail_ai_scorer import main
-from jobtrail_ai_scorer.scoring import ScoreOutcome, ScoreRunResult
+from jobtrail_ai_scorer import main  # noqa: E402
+from jobtrail_ai_scorer.scoring import ScoreOutcome, ScoreRunResult  # noqa: E402
 
 
 runner = CliRunner()
