@@ -17,3 +17,11 @@ def test_skips_legacy_marker_unless_forced():
 
     assert should_score(job, force=False) is False
     assert should_score(job, force=True) is True
+
+
+def test_skips_configured_marker_unless_forced():
+    custom_marker = "[CUSTOM_SCORE_V1]"
+    job = {"description": "A role", "notes": [{"body": f"{custom_marker}\n{{}}"}]}
+
+    assert should_score(job, force=False, marker=custom_marker) is False
+    assert should_score(job, force=True, marker=custom_marker) is True

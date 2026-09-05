@@ -47,7 +47,9 @@ class ScoreRunResult:
     outcomes: tuple[ScoreOutcome, ...]
 
 
-def should_score(job: dict[str, Any], *, force: bool = False) -> bool:
+def should_score(
+    job: dict[str, Any], *, force: bool = False, marker: str = CURRENT_MARKER
+) -> bool:
     """Return whether a complete job is eligible for scoring."""
 
     description = job.get("description")
@@ -55,7 +57,7 @@ def should_score(job: dict[str, Any], *, force: bool = False) -> bool:
         return False
     if force:
         return True
-    return not _contains_score_marker(job.get("notes"))
+    return not _contains_score_marker(job.get("notes"), marker=marker)
 
 
 def render_prompt(job: dict[str, Any], candidate_profile: str) -> str:
@@ -101,7 +103,7 @@ def score_jobs(
 
         try:
             full_job = client.get_job(candidate_id)
-            if not should_score(full_job, force=force):
+            if not should_score(full_job, force=force, marker=marker):
                 skipped += 1
                 reason = "empty_description" if not _has_description(full_job) else "already_scored"
                 outcomes.append(ScoreOutcome(candidate_id, "skipped", reason))
@@ -145,12 +147,12 @@ def _has_description(job: dict[str, Any]) -> bool:
     return isinstance(description, str) and bool(description.strip())
 
 
-def _contains_score_marker(notes: Any) -> bool:
+def _contains_score_marker(notes: Any, *, marker: str) -> bool:
     if not isinstance(notes, list):
         return False
     for note in notes:
         body = note.get("body") if isinstance(note, dict) else None
-        if isinstance(body, str) and (CURRENT_MARKER in body or LEGACY_MARKER in body):
+        if isinstance(body, str) and (marker in body or LEGACY_MARKER in body):
             return True
     return False
 
