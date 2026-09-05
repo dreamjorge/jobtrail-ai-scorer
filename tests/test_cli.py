@@ -2,8 +2,7 @@
 import pytest
 import importlib.util
 
-pytestmark = pytest.mark.skipif(importlib.util.find_spec("typer") is None, reason="typer dependency not installed")
-import typer  # noqa: E402
+typer = pytest.importorskip("typer")  # noqa: E402
 from typer.testing import CliRunner  # noqa: E402
 
 from jobtrail_ai_scorer import main  # noqa: E402
