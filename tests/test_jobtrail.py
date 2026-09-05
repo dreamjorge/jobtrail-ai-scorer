@@ -1,9 +1,18 @@
 import json
+import tomllib
+from pathlib import Path
 
 import httpx
 import pytest
 
 from jobtrail_ai_scorer.jobtrail import JobTrailApiError, JobTrailClient
+
+
+def test_project_declares_httpx_runtime_dependency():
+    project_file = Path(__file__).parents[1] / "pyproject.toml"
+    dependencies = tomllib.loads(project_file.read_text())["project"]["dependencies"]
+
+    assert any(dependency.startswith("httpx") for dependency in dependencies)
 
 
 def make_client(handler: httpx.MockTransport) -> JobTrailClient:
