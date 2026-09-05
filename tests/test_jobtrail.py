@@ -40,6 +40,16 @@ def test_get_job_gets_job_by_id():
     assert make_client(httpx.MockTransport(handler)).get_job("j1") == {"id": "j1"}
 
 
+def test_get_job_encodes_job_id_as_one_path_segment():
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert str(request.url) == "https://jobs.test/api/jobs/j%2F1%3Fsource%3Dtest"
+        return httpx.Response(200, json={"id": "j/1?source=test"}, request=request)
+
+    assert make_client(httpx.MockTransport(handler)).get_job("j/1?source=test") == {
+        "id": "j/1?source=test"
+    }
+
+
 def test_add_note_posts_body_and_accepts_created_response():
     requests: list[httpx.Request] = []
 
@@ -81,3 +91,49 @@ def test_transport_failures_raise_domain_specific_error():
 
     with pytest.raises(JobTrailApiError):
         make_client(httpx.MockTransport(handler)).list_jobs()
+
+
+def test_malformed_success_response_raises_domain_specific_error():
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(200, content=b"{not json", request=request)
+    )
+
+    with pytest.raises(JobTrailApiError):
+        make_client(transport).list_jobs()
+
+
+@pytest.mark.parametrize(
+    ("operation", "payload"),
+    [
+        (lambda client: client.list_jobs(), {"id": "j1"}),
+        (lambda client: client.get_job("j1"), [{"id": "j1"}]),
+    ],
+)
+def test_response_with_unexpected_top_level_shape_raises_domain_error(operation, payload):
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(200, json=payload, request=request)
+    )
+
+    with pytest.raises(JobTrailApiError):
+        operation(make_client(transport))
+
+
+def test_close_closes_only_an_internally_owned_http_client():
+    owned_client = JobTrailClient("https://jobs.test")
+    injected_http_client = httpx.Client(transport=httpx.MockTransport(lambda _: httpx.Response(200)))
+    injected_client = JobTrailClient("https://jobs.test", http_client=injected_http_client)
+
+    owned_client.close()
+    injected_client.close()
+
+    assert owned_client._http_client.is_closed
+    assert not injected_http_client.is_closed
+    injected_http_client.close()
+
+
+def test_context_manager_closes_internally_owned_http_client():
+    with JobTrailClient("https://jobs.test") as client:
+        http_client = client._http_client
+        assert not http_client.is_closed
+
+    assert http_client.is_closed
