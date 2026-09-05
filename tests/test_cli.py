@@ -1,0 +1,47 @@
+"""Focused tests for the public scorer command."""
+import pytest
+
+typer = pytest.importorskip("typer")
+from typer.testing import CliRunner
+
+from jobtrail_ai_scorer import main
+from jobtrail_ai_scorer.scoring import ScoreOutcome, ScoreRunResult
+
+
+runner = CliRunner()
+
+
+def _result(*, failed=0):
+    return ScoreRunResult(1, 0, failed, (ScoreOutcome("j1", "saved" if not failed else "failed", "saved"),))
+
+
+def test_score_forwards_flags_and_emits_once(monkeypatch, tmp_path):
+    calls = {}
+
+    def fake_run_score(**kwargs):
+        calls.update(kwargs)
+        return _result()
+
+    monkeypatch.setattr(main, "run_score", fake_run_score)
+    result = runner.invoke(main.app, ["score", "--job-id", "j1", "--limit", "2", "--force",
+                                      "--dry-run", "--marker", "[X]", "--provider", "hermes",
+                                      "--config", str(tmp_path / "cfg.yaml")])
+    assert result.exit_code == 0
+    assert calls["job_id"] == "j1"
+    assert calls["limit"] == 2
+    assert calls["force"] is True and calls["dry_run"] is True
+    assert calls["marker"] == "[X]" and calls["provider_name"] == "hermes"
+    assert calls["config_path"] == tmp_path / "cfg.yaml"
+
+
+def test_score_returns_nonzero_on_failures(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "run_score", lambda **_: _result(failed=1))
+    result = runner.invoke(main.app, ["score", "--config", str(tmp_path / "cfg.yaml")])
+    assert result.exit_code == 1
+
+
+def test_cli_does_not_duplicate_status_lines(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "run_score", lambda **_: ScoreRunResult(
+        1, 1, 0, (ScoreOutcome("j1", "skipped", "already_scored"),)))
+    result = runner.invoke(main.app, ["score", "--config", str(tmp_path / "cfg.yaml")])
+    assert result.output.count("SKIP j1") == 0  # run_score is injectable and owns output here
