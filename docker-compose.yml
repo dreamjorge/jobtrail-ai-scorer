@@ -3,5 +3,5 @@ services:
     build: .
     command: ["jobtrail-ai-scorer", "score", "--config", "/config/config.yaml"]
     volumes:
-      - ./config.yaml:/config/config.yaml:ro
-      - ./candidate-profile.md:/config/candidate-profile.md:ro
+      - ${SCORER_CONFIG_PATH:-./config.example.yaml}:/config/config.yaml:ro
+      - ${SCORER_PROFILE_PATH:-./candidate-profile.md}:/config/candidate-profile.md:ro

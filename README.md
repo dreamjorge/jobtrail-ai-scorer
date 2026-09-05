@@ -21,3 +21,5 @@ OpenAI-compatible providers use an endpoint/model and an API-key environment var
 
 The CLI never stores API keys in configuration. Provider credentials are read from environment variables.
 Never commit `config.yaml`, candidate profiles, credentials, or other secrets.
+For Compose, override the example mounts with `SCORER_CONFIG_PATH` and
+`SCORER_PROFILE_PATH` when running against your local files.
