@@ -1,7 +1,7 @@
 import json
 from dataclasses import dataclass, field
 
-from jobtrail_ai_scorer.scoring import score_jobs
+from jobtrail_ai_scorer.scoring import ScoreOutcome, score_jobs
 
 
 VALID_SCORE = {
@@ -149,3 +149,29 @@ def test_job_id_selects_only_that_candidate_and_limit_restricts_selection():
     assert result.processed == 1
     assert client.get_calls == ["j2"]
     assert [job_id for job_id, _ in client.notes] == ["j2"]
+
+
+def test_limit_in_list_mode_scores_only_first_candidate():
+    client = FakeClient(
+        [candidate("j1"), candidate("j2")],
+        {"j1": full_job("j1"), "j2": full_job("j2")},
+    )
+
+    result = score_jobs(client, FakeProvider(json.dumps(VALID_SCORE)), "Generic profile", limit=1)
+
+    assert result.processed == 1
+    assert result.failed == 0
+    assert client.get_calls == ["j1"]
+    assert [job_id for job_id, _ in client.notes] == ["j1"]
+
+
+def test_schema_invalid_provider_json_records_failure_without_saving_note():
+    client = FakeClient([candidate("j1")], {"j1": full_job("j1")})
+    invalid_score = {**VALID_SCORE, "score": "85"}
+
+    result = score_jobs(client, FakeProvider(json.dumps(invalid_score)), "Generic profile")
+
+    assert result.processed == 0
+    assert result.failed == 1
+    assert result.outcomes == (ScoreOutcome("j1", "failed", "invalid_score"),)
+    assert client.notes == []
