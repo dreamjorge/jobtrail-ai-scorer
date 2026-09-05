@@ -57,12 +57,14 @@ def test_run_scorer_example_uses_safe_configurable_runner():
     assert "set -euo pipefail" in script
     assert 'SCORER_CONFIG_PATH must be set' in script
     assert '[[ -f "$SCORER_CONFIG_PATH" ]]' in script
+    assert 'SCORER_COMMAND="${SCORER_COMMAND:-jobtrail-ai-scorer}"' in script
     assert 'SCORER_LIMIT="${SCORER_LIMIT:-1}"' in script
     assert 'SCORER_DRY_RUN="${SCORER_DRY_RUN:-1}"' in script
     assert 'SCORER_LOG_DIR="${SCORER_LOG_DIR:-/tmp/jobtrail-ai-scorer-logs}"' in script
     assert 'mkdir -p "$SCORER_LOG_DIR"' in script
-    assert 'jobtrail-ai-scorer score --config "$SCORER_CONFIG_PATH" --limit "$SCORER_LIMIT"' in script
+    assert '"$SCORER_COMMAND" score --config "$SCORER_CONFIG_PATH" --limit "$SCORER_LIMIT"' in script
     assert '"--dry-run"' in script
+    assert "eval " not in script
     assert 'PIPESTATUS[0]' in script
     assert 'exit "$scorer_exit"' in script
     assert 'Log written to: $log_path' in script
@@ -146,6 +148,66 @@ def test_run_scorer_example_preserves_scorer_exit_code(dry_run, expected_args, t
     assert "Scorer failed with exit code 37" in result.stderr
     assert args_path.read_text().splitlines() == [
         str(config) if arg == "{config}" else arg for arg in expected_args
+    ]
+
+
+def test_run_scorer_example_uses_configured_scorer_command_without_path_fallback(tmp_path):
+    runner = tmp_path / "run-scorer.example.sh"
+    shutil.copy2(ROOT / "scripts/run-scorer.example.sh", runner)
+    runner.chmod(runner.stat().st_mode | stat.S_IXUSR)
+
+    config = tmp_path / "config.toml"
+    config.write_text("[scorer]\n")
+    log_dir = tmp_path / "logs"
+    path_bin_dir = tmp_path / "path-bin"
+    path_bin_dir.mkdir()
+    custom_scorer = tmp_path / "custom-scorer"
+    args_path = tmp_path / "custom-scorer-args.txt"
+    path_fallback_marker = tmp_path / "path-fallback-was-called"
+
+    path_scorer = path_bin_dir / "jobtrail-ai-scorer"
+    path_scorer.write_text(
+        "#!/usr/bin/env bash\n"
+        f"touch {path_fallback_marker}\n"
+        "exit 99\n"
+    )
+    path_scorer.chmod(path_scorer.stat().st_mode | stat.S_IXUSR)
+
+    custom_scorer.write_text(
+        "#!/usr/bin/env bash\n"
+        "printf '%s\\n' \"$@\" > \"$FAKE_SCORER_ARGS_PATH\"\n"
+        "exit 0\n"
+    )
+    custom_scorer.chmod(custom_scorer.stat().st_mode | stat.S_IXUSR)
+
+    env = {
+        **os.environ,
+        "PATH": f"{path_bin_dir}{os.pathsep}{os.environ['PATH']}",
+        "SCORER_COMMAND": str(custom_scorer),
+        "SCORER_CONFIG_PATH": str(config),
+        "SCORER_DRY_RUN": "1",
+        "SCORER_LOG_DIR": str(log_dir),
+        "FAKE_SCORER_ARGS_PATH": str(args_path),
+    }
+
+    result = subprocess.run(
+        [str(runner)],
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert not path_fallback_marker.exists()
+    assert args_path.read_text().splitlines() == [
+        "score",
+        "--config",
+        str(config),
+        "--limit",
+        "1",
+        "--dry-run",
     ]
 
 
@@ -246,7 +308,7 @@ def test_run_scorer_example_captures_pipeline_status_immediately():
     pipeline_lines = [
         index
         for index, line in enumerate(lines)
-        if line.lstrip().startswith("jobtrail-ai-scorer ") and "| tee" in line
+        if line.lstrip().startswith('"$SCORER_COMMAND" ') and "| tee" in line
     ]
 
     assert len(pipeline_lines) == 2

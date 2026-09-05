@@ -63,6 +63,7 @@ Start with dry-run mode:
 
 ```sh
 export SCORER_CONFIG_PATH="$PWD/config.yaml"
+export SCORER_COMMAND=jobtrail-ai-scorer  # or /path/to/local/launcher
 export SCORER_LIMIT=1
 export SCORER_DRY_RUN=1
 export SCORER_LOG_DIR=/tmp/jobtrail-ai-scorer-logs
@@ -76,13 +77,13 @@ export SCORER_DRY_RUN=0
 ./run-scorer.local.sh
 ```
 
-Use a small `SCORER_LIMIT` until scheduling behavior is proven. The runner preserves the scorer exit code and prints the log path.
+Use `SCORER_COMMAND` when the scorer launcher is not on `PATH`; it defaults to `jobtrail-ai-scorer`. Use a small `SCORER_LIMIT` until scheduling behavior is proven. The runner preserves the scorer exit code and prints the log path.
 
 ## Scheduler choices
 
 Choose one scheduler; do not enable duplicate schedules.
 
-- `cron`: simple host-level scheduling. Export `SCORER_CONFIG_PATH`, `SCORER_LIMIT`, `SCORER_DRY_RUN`, and `SCORER_LOG_DIR` in the crontab entry or a sourced local environment file.
+- `cron`: simple host-level scheduling. Export `SCORER_CONFIG_PATH`, `SCORER_COMMAND` when needed, `SCORER_LIMIT`, `SCORER_DRY_RUN`, and `SCORER_LOG_DIR` in the crontab entry or a sourced local environment file.
 - `systemd timer`: useful when you want journal integration, explicit dependencies, and retry policy. Put private values in an environment file outside the repository.
 - `OpenClaw cron`: use when the runtime is managed by OpenClaw and the job should live with that operational schedule. Mount only ignored local config/profile files and write logs to an operator-owned location.
 

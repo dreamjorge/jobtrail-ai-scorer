@@ -2,6 +2,7 @@
 set -euo pipefail
 
 : "${SCORER_CONFIG_PATH:?SCORER_CONFIG_PATH must be set}"
+SCORER_COMMAND="${SCORER_COMMAND:-jobtrail-ai-scorer}"
 SCORER_LIMIT="${SCORER_LIMIT:-1}"
 SCORER_DRY_RUN="${SCORER_DRY_RUN:-1}"
 SCORER_LOG_DIR="${SCORER_LOG_DIR:-/tmp/jobtrail-ai-scorer-logs}"
@@ -38,10 +39,10 @@ echo "Log: $log_path"
 
 set +e
 if [[ "$scorer_dry_run_enabled" == "1" ]]; then
-  jobtrail-ai-scorer score --config "$SCORER_CONFIG_PATH" --limit "$SCORER_LIMIT" "--dry-run" 2>&1 | tee "$log_path"
+  "$SCORER_COMMAND" score --config "$SCORER_CONFIG_PATH" --limit "$SCORER_LIMIT" "--dry-run" 2>&1 | tee "$log_path"
   scorer_exit="${PIPESTATUS[0]}"
 else
-  jobtrail-ai-scorer score --config "$SCORER_CONFIG_PATH" --limit "$SCORER_LIMIT" 2>&1 | tee "$log_path"
+  "$SCORER_COMMAND" score --config "$SCORER_CONFIG_PATH" --limit "$SCORER_LIMIT" 2>&1 | tee "$log_path"
   scorer_exit="${PIPESTATUS[0]}"
 fi
 set -e
