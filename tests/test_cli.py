@@ -1,6 +1,5 @@
 """Focused tests for the public scorer command."""
 import pytest
-import importlib.util
 
 typer = pytest.importorskip("typer")  # noqa: E402
 from typer.testing import CliRunner  # noqa: E402
