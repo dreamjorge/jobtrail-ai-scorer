@@ -14,6 +14,11 @@ from .providers import (
 
 app = typer.Typer(help="Score JobTrail jobs with a configured AI provider.")
 
+
+@app.callback()
+def _root() -> None:
+    """JobTrail AI scorer commands."""
+
 ClientFactory = Callable[[str], object]
 ProviderFactory = Callable[[AppConfig], object]
 
