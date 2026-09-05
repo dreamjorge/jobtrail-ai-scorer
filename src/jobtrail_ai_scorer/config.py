@@ -20,9 +20,10 @@ class AppConfig(BaseModel):
     def require_nonempty_marker(cls, value: str) -> str:
         """Reject markers that would match every note body."""
 
-        if not value.strip():
+        marker = value.strip()
+        if not marker:
             raise ValueError("marker must not be empty or whitespace")
-        return value
+        return marker
 
 
 def load_config(config_path: Path) -> AppConfig:

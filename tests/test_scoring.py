@@ -185,3 +185,23 @@ def test_score_jobs_rejects_empty_or_whitespace_marker(marker):
 
     with pytest.raises(ValueError, match="marker must not be empty or whitespace"):
         score_jobs(client, FakeProvider(json.dumps(VALID_SCORE)), "Generic profile", marker=marker)
+
+
+def test_score_jobs_normalizes_marker_for_dedupe_and_note_serialization():
+    marker = " [CUSTOM] "
+    already_scored = FakeClient(
+        [candidate("already")],
+        {"already": full_job("already", notes=[{"body": "[CUSTOM]\n{}"}])},
+    )
+
+    skipped = score_jobs(
+        already_scored, FakeProvider(json.dumps(VALID_SCORE)), "Generic profile", marker=marker
+    )
+
+    assert skipped.skipped == 1
+    assert already_scored.notes == []
+
+    new_job = FakeClient([candidate("new")], {"new": full_job("new")})
+    score_jobs(new_job, FakeProvider(json.dumps(VALID_SCORE)), "Generic profile", marker=marker)
+
+    assert new_job.notes[0][1].startswith("[CUSTOM]\n")

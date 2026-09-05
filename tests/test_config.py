@@ -20,3 +20,13 @@ def test_app_config_rejects_empty_or_whitespace_marker(marker):
             candidate_profile_path="candidate-profile.md",
             marker=marker,
         )
+
+
+def test_app_config_trims_surrounding_marker_whitespace():
+    config = AppConfig(
+        jobtrail_base_url="https://jobs.test",
+        candidate_profile_path="candidate-profile.md",
+        marker=" [CUSTOM] ",
+    )
+
+    assert config.marker == "[CUSTOM]"
