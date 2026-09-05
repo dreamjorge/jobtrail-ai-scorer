@@ -39,3 +39,39 @@ def test_accepts_canonical_score_schema():
 def test_rejects_non_integer_scores_without_coercion(invalid_score):
     with pytest.raises(ValidationError):
         ScoreResult.model_validate(canonical_score(score=invalid_score))
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid_value"),
+    [
+        ("reasoning", b"bytes are not a string"),
+        ("strengths", ("tuples are not JSON arrays",)),
+    ],
+)
+def test_rejects_coercible_values_for_strict_schema(field, invalid_value):
+    with pytest.raises(ValidationError):
+        ScoreResult.model_validate(canonical_score(**{field: invalid_value}))
+
+
+def test_rejects_whitespace_only_reasoning():
+    with pytest.raises(ValidationError):
+        ScoreResult.model_validate(canonical_score(reasoning=" \t\n "))
+
+
+def test_rejects_unknown_score_field():
+    with pytest.raises(ValidationError):
+        ScoreResult.model_validate(canonical_score(unexpected="value"))
+
+
+def test_rejects_unknown_career_value():
+    with pytest.raises(ValidationError):
+        ScoreResult.model_validate(canonical_score(career_value="Very High"))
+
+
+def test_accepts_lower_score_boundary():
+    assert ScoreResult.model_validate(canonical_score(score=0)).score == 0
+
+
+def test_rejects_malformed_string_list():
+    with pytest.raises(ValidationError):
+        ScoreResult.model_validate(canonical_score(gaps="Not a list"))
