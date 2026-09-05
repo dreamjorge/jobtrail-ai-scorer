@@ -14,5 +14,8 @@ dependencies = [
   "typer>=0.12,<1",
 ]
 
+[project.scripts]
+jobtrail-ai-scorer = "jobtrail_ai_scorer.main:app"
+
 [tool.pytest.ini_options]
 pythonpath = ["src"]

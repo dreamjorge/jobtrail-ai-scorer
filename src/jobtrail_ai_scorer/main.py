@@ -47,7 +47,8 @@ def run_score(*, config_path: Path, limit: int | None = None, job_id: str | None
     provider = (provider_factory or _make_provider)(config)
     try:
         result = score_jobs(client, provider, profile, job_id=job_id, limit=limit,
-                            force=force, dry_run=dry_run, marker=marker or config.marker)
+                            force=force, dry_run=dry_run, marker=marker or config.marker,
+                            emit_status=False)
     finally:
         close = getattr(client, "close", None)
         if close:

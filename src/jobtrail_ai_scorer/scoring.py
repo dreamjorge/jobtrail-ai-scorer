@@ -84,6 +84,7 @@ def score_jobs(
     force: bool = False,
     dry_run: bool = False,
     marker: str = CURRENT_MARKER,
+    emit_status: bool = True,
 ) -> ScoreRunResult:
     """Score independently eligible jobs and save only validated results."""
 
@@ -118,7 +119,8 @@ def score_jobs(
             if dry_run:
                 processed += 1
                 outcomes.append(ScoreOutcome(candidate_id, "dry_run", "validated"))
-                print(f"DRY RUN {candidate_id}: validated score {score.score}")
+                if emit_status:
+                    print(f"DRY RUN {candidate_id}: validated score {score.score}")
             else:
                 client.add_note(candidate_id, note_body)
                 processed += 1
@@ -126,11 +128,13 @@ def score_jobs(
         except (json.JSONDecodeError, ValidationError, TypeError) as error:
             failed += 1
             outcomes.append(ScoreOutcome(candidate_id, "failed", "invalid_score"))
-            print(f"FAILED {candidate_id}: invalid score ({error.__class__.__name__})")
+            if emit_status:
+                print(f"FAILED {candidate_id}: invalid score ({error.__class__.__name__})")
         except Exception as error:  # Independent jobs must continue after boundary errors.
             failed += 1
             outcomes.append(ScoreOutcome(candidate_id, "failed", "error"))
-            print(f"FAILED {candidate_id}: {error.__class__.__name__}")
+            if emit_status:
+                print(f"FAILED {candidate_id}: {error.__class__.__name__}")
 
     return ScoreRunResult(processed, skipped, failed, tuple(outcomes))
 
