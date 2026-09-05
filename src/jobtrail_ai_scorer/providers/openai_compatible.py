@@ -6,7 +6,7 @@ from typing import Any, Callable
 
 import httpx
 
-from .base import ProviderConfigurationError, ProviderError
+from .base import ProviderConfigurationError, ProviderError, validate_timeout
 
 Transport = Callable[..., dict[str, Any]]
 
@@ -19,6 +19,9 @@ class OpenAICompatibleConfig:
     model: str
     api_key_env: str
     timeout_seconds: float = 60.0
+
+    def __post_init__(self) -> None:
+        validate_timeout(self.timeout_seconds)
 
 
 class OpenAICompatibleProvider:
@@ -50,8 +53,11 @@ class OpenAICompatibleProvider:
                     "messages": [{"role": "user", "content": prompt}],
                 },
             )
-            return response["choices"][0]["message"]["content"]
-        except (httpx.HTTPError, KeyError, IndexError, TypeError) as error:
+            content = response["choices"][0]["message"]["content"]
+            if not isinstance(content, str) or not content:
+                raise TypeError("completion content must be a non-empty string")
+            return content
+        except (httpx.HTTPError, KeyError, IndexError, TypeError, ValueError) as error:
             raise ProviderError("OpenAI-compatible provider returned an invalid response") from error
 
     def _post(self, endpoint: str, *, headers: dict[str, str], json: dict[str, Any]) -> dict[str, Any]:

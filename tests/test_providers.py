@@ -11,6 +11,7 @@ from jobtrail_ai_scorer.providers import (
     OpenAICompatibleConfig,
     OpenAICompatibleProvider,
     ProviderConfigurationError,
+    ProviderError,
     ProviderProcessError,
 )
 
@@ -48,8 +49,13 @@ def test_hermes_provider_wraps_nonzero_process_failure(monkeypatch):
         lambda *args, **kwargs: SimpleNamespace(returncode=2, stdout="", stderr="bad profile"),
     )
 
-    with pytest.raises(ProviderProcessError, match="bad profile"):
-        HermesProvider(HermesProviderConfig(executable="hermes", profile="test")).score("prompt")
+    with pytest.raises(ProviderProcessError, match="exit code 2") as error:
+        HermesProvider(HermesProviderConfig(executable="hermes", profile="test")).score(
+            "private candidate prompt"
+        )
+
+    assert "bad profile" not in str(error.value)
+    assert "private candidate prompt" not in str(error.value)
 
 
 def test_hermes_provider_wraps_timeout(monkeypatch):
@@ -111,3 +117,56 @@ def test_hermes_provider_wraps_process_start_failure(monkeypatch):
 
     with pytest.raises(ProviderProcessError, match="Unable to start"):
         HermesProvider(HermesProviderConfig(executable="hermes", profile="test")).score("prompt")
+
+
+@pytest.mark.parametrize("content", [None, ""])
+def test_openai_compatible_provider_rejects_missing_or_empty_model_content(monkeypatch, content):
+    monkeypatch.setenv("SCORER_API_KEY", "test-key")
+    provider = OpenAICompatibleProvider(
+        OpenAICompatibleConfig(
+            endpoint="https://example.test/v1/chat/completions",
+            model="test-model",
+            api_key_env="SCORER_API_KEY",
+        ),
+        transport=lambda *args, **kwargs: {"choices": [{"message": {"content": content}}]},
+    )
+
+    with pytest.raises(ProviderError, match="invalid response"):
+        provider.score("prompt")
+
+
+def test_openai_compatible_provider_wraps_malformed_json(monkeypatch):
+    monkeypatch.setenv("SCORER_API_KEY", "test-key")
+    provider = OpenAICompatibleProvider(
+        OpenAICompatibleConfig(
+            endpoint="https://example.test/v1/chat/completions",
+            model="test-model",
+            api_key_env="SCORER_API_KEY",
+        ),
+        transport=lambda *args, **kwargs: (_ for _ in ()).throw(ValueError("invalid JSON")),
+    )
+
+    with pytest.raises(ProviderError, match="invalid response"):
+        provider.score("prompt")
+
+
+@pytest.mark.parametrize("timeout", [0, -1, float("inf"), float("nan")])
+def test_hermes_config_requires_positive_finite_timeout(timeout):
+    with pytest.raises(ValueError, match="positive finite"):
+        HermesProviderConfig(executable="hermes", profile="test", timeout_seconds=timeout)
+
+
+@pytest.mark.parametrize("timeout", [0, -1, float("inf"), float("nan")])
+def test_openai_config_requires_positive_finite_timeout(timeout):
+    with pytest.raises(ValueError, match="positive finite"):
+        OpenAICompatibleConfig(
+            endpoint="https://example.test/v1/chat/completions",
+            model="test-model",
+            api_key_env="SCORER_API_KEY",
+            timeout_seconds=timeout,
+        )
+
+
+def test_hermes_config_rejects_profile_that_could_be_an_option():
+    with pytest.raises(ValueError, match="must not start with a dash"):
+        HermesProviderConfig(executable="hermes", profile="--malicious")

@@ -3,7 +3,7 @@
 from dataclasses import dataclass
 import subprocess
 
-from .base import ProviderProcessError
+from .base import ProviderProcessError, validate_timeout
 
 
 @dataclass(frozen=True)
@@ -13,6 +13,11 @@ class HermesProviderConfig:
     executable: str
     profile: str
     timeout_seconds: float = 60.0
+
+    def __post_init__(self) -> None:
+        validate_timeout(self.timeout_seconds)
+        if self.profile.startswith("-"):
+            raise ValueError("profile must not start with a dash")
 
 
 class HermesProvider:
@@ -36,9 +41,10 @@ class HermesProvider:
         except subprocess.TimeoutExpired as error:
             raise ProviderProcessError("Hermes process timed out") from error
         except OSError as error:
-            raise ProviderProcessError(f"Unable to start Hermes process: {error}") from error
+            raise ProviderProcessError("Unable to start Hermes process") from error
 
         if result.returncode != 0:
-            detail = result.stderr.strip() or f"exit code {result.returncode}"
-            raise ProviderProcessError(f"Hermes process failed: {detail}")
+            raise ProviderProcessError(
+                f"Hermes process failed with exit code {result.returncode}"
+            )
         return result.stdout
