@@ -28,18 +28,17 @@ class HermesProvider:
 
     def score(self, prompt: str) -> str:
         """Return Hermes' raw standard output for ``prompt``."""
-        command = [self._config.executable, "--profile", self._config.profile]
+        command = [self._config.executable, "--profile", self._config.profile, "-z", prompt, "--cli"]
         try:
             result = subprocess.run(
                 command,
-                input=prompt,
                 capture_output=True,
                 check=False,
                 text=True,
                 timeout=self._config.timeout_seconds,
             )
-        except subprocess.TimeoutExpired as error:
-            raise ProviderProcessError("Hermes process timed out") from error
+        except subprocess.TimeoutExpired:
+            raise ProviderProcessError("Hermes process timed out") from None
         except OSError as error:
             raise ProviderProcessError("Unable to start Hermes process") from error
 
