@@ -8,7 +8,7 @@ Provider-agnostic CLI that evaluates JobTrail jobs against a local candidate pro
 python -m pip install .
 cp config.example.yaml config.yaml
 cp candidate-profile.example.md candidate-profile.md
-# edit config.yaml and candidate-profile.md
+# edit config.yaml (set candidate_profile_path: ./candidate-profile.md) and candidate-profile.md
 ```
 
 Run `jobtrail-ai-scorer score --config config.yaml [OPTIONS]`. Options include `--limit N`,
