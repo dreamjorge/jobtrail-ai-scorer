@@ -52,6 +52,7 @@ def should_score(
 ) -> bool:
     """Return whether a complete job is eligible for scoring."""
 
+    _validate_marker(marker)
     description = job.get("description")
     if not isinstance(description, str) or not description.strip():
         return False
@@ -86,6 +87,7 @@ def score_jobs(
 ) -> ScoreRunResult:
     """Score independently eligible jobs and save only validated results."""
 
+    _validate_marker(marker)
     candidates = _select_candidates(client, job_id=job_id, limit=limit)
     outcomes: list[ScoreOutcome] = []
     processed = skipped = failed = 0
@@ -140,6 +142,11 @@ def _select_candidates(
         return [{"id": job_id, "description": "selected job"}]
     candidates = client.list_jobs()
     return candidates if limit is None else candidates[:limit]
+
+
+def _validate_marker(marker: str) -> None:
+    if not isinstance(marker, str) or not marker.strip():
+        raise ValueError("marker must not be empty or whitespace")
 
 
 def _has_description(job: dict[str, Any]) -> bool:

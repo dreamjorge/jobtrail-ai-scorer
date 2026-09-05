@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Literal
 
 import yaml
-from pydantic import AnyHttpUrl, BaseModel
+from pydantic import AnyHttpUrl, BaseModel, field_validator
 
 
 class AppConfig(BaseModel):
@@ -14,6 +14,15 @@ class AppConfig(BaseModel):
     candidate_profile_path: Path
     provider: Literal["hermes", "openai_compatible"] = "hermes"
     marker: str = "[AI_JOB_SCORE_V1]"
+
+    @field_validator("marker")
+    @classmethod
+    def require_nonempty_marker(cls, value: str) -> str:
+        """Reject markers that would match every note body."""
+
+        if not value.strip():
+            raise ValueError("marker must not be empty or whitespace")
+        return value
 
 
 def load_config(config_path: Path) -> AppConfig:

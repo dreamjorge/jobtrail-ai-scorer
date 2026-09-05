@@ -1,6 +1,8 @@
 import json
 from dataclasses import dataclass, field
 
+import pytest
+
 from jobtrail_ai_scorer.scoring import ScoreOutcome, score_jobs
 
 
@@ -175,3 +177,11 @@ def test_schema_invalid_provider_json_records_failure_without_saving_note():
     assert result.failed == 1
     assert result.outcomes == (ScoreOutcome("j1", "failed", "invalid_score"),)
     assert client.notes == []
+
+
+@pytest.mark.parametrize("marker", ["", " \t\n "])
+def test_score_jobs_rejects_empty_or_whitespace_marker(marker):
+    client = FakeClient([], {})
+
+    with pytest.raises(ValueError, match="marker must not be empty or whitespace"):
+        score_jobs(client, FakeProvider(json.dumps(VALID_SCORE)), "Generic profile", marker=marker)
