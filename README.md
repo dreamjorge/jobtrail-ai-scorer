@@ -24,3 +24,9 @@ The CLI never stores API keys in configuration. Provider credentials are read fr
 Never commit `config.yaml`, candidate profiles, credentials, or other secrets.
 For Compose, override the example mounts with `SCORER_CONFIG_PATH` and
 `SCORER_PROFILE_PATH` when running against your local files.
+
+## Runtime automation
+
+See [Runtime automation](docs/runtime-automation.md) for safe dry-run-first scheduler
+setup, Hermes Docker wrapper usage, optional WhatsApp notification through Hermes,
+and Docker maintenance rules.
