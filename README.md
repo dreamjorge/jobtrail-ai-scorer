@@ -57,3 +57,13 @@ empty cache and never crash the run.
 Warning: enabled runs write AI score notes and may send one summary through WhatsApp, but never apply to jobs.
 Summaries exclude descriptions, profiles, prompts, notes, credentials, and secrets.
 See [Runtime automation](docs/runtime-automation.md).
+
+## Runtime policy guardrail
+
+The runtime `SOUL.md` and `skills/jobtrail-automation/SKILL.md` are Hermes profile files that live outside this repository. To enforce the apply-gate contract in CI, the repository ships minimal fixture mocks under `tests/fixtures/hermes/`. The guardrail (`tests/test_runtime_policy.py`, run by `.github/workflows/policy.yml` on every PR and daily at 06:00 UTC) asserts:
+
+- the `SOUL.md` apply context contains the literal phrase `explicit confirmation`;
+- the `SKILL.md` contains the literal phrase `explicit confirmation`;
+- both files include `never submit` or `without an explicit confirmation` in the apply section.
+
+Drift in the fixtures fails the workflow with a focused diff. The fixtures must remain pure contract mocks — never copy runtime paths (`/DATA/...`, `/AppData/...`), profile, CV, or credential content into the repository. See [Runtime automation](docs/runtime-automation.md#hermes-runtime-policy-guardrail-ci) for details and local-run instructions.

@@ -189,3 +189,24 @@ export HERMES_PROFILE=job-search
 ```
 
 Send summaries only. Do not include raw prompts, candidate profile content, job descriptions, notes, tokens, credentials, or secrets in WhatsApp messages. Include counts, status, and log metadata that an operator can use to inspect the local log securely.
+
+## Hermes runtime policy guardrail (CI)
+
+The runtime SOUL.md and `skills/jobtrail-automation/SKILL.md` live in the operator's local Hermes profile (for example under `/DATA/AppData/hermes/profiles/job-search/`) and must NOT be committed to this repository. To keep the apply-gate contract reviewable, the repository ships CI-only fixture mocks under `tests/fixtures/hermes/` and a guardrail test suite (`tests/test_runtime_policy.py`) that runs on every PR and on a daily cron via `.github/workflows/policy.yml`.
+
+The fixtures assert three rules and any drift fails CI with a focused diff:
+
+- `SOUL.md` apply context contains the literal phrase `explicit confirmation`.
+- `SKILL.md` contains the literal phrase `explicit confirmation`.
+- Both files include either `never submit` or `without an explicit confirmation` in the apply section.
+
+The fixtures must remain minimal contract mocks. They must NEVER embed runtime paths (`/DATA/...`, `/AppData/...`), private CV/profile content, credentials, or any operator-only data. The leak guard (`test_fixtures_do_not_leak_runtime_data`) fails CI if such content sneaks in.
+
+When the runtime SOUL/SKILL evolve locally, mirror the required phrases into the fixture files in the same PR so the policy contract stays auditable. The fixtures never need to mirror the full runtime content — only the apply-gate phrases and any new apply-section heading structure the guardrail needs.
+
+To run the guardrail locally:
+
+```sh
+python -m pip install -e .
+python -m pytest tests/test_runtime_policy.py -v
+```

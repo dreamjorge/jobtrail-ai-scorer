@@ -19,3 +19,5 @@ jobtrail-ai-scorer = "jobtrail_ai_scorer.main:app"
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
+testpaths = ["tests"]
+addopts = ["-ra", "--strict-markers"]
