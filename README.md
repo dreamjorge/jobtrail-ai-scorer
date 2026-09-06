@@ -32,6 +32,14 @@ for a run with the positive integer environment variables `PROMPT_PROFILE_BUDGET
 `PROMPT_TRUNCATE_MARKER` (default: `\n[... content truncated ...]`). A missing, directory,
 or unreadable profile/CV logs a warning and the scorer continues with any remaining context.
 
+Every run emits a single `prompt_tokens_estimate={...}` line with a per-section token
+breakdown (`profile`, `cv`, `job`, `schema`, `instructions`, `total`) using a deterministic
+approximation (`chars/4` by default, `words` as an opt-in alternative). Override the
+estimator with `PROMPT_TOKEN_ESTIMATOR=chars4|words`. Set `PROMPT_TOKEN_BUDGET` to a
+positive integer to enable a budget check; when the estimate exceeds the budget the scorer
+prints a `prompt_token_budget={"budget": N, "total": M}` warning line in the same run.
+The estimator never calls a real token counter or external API.
+
 The CLI never stores API keys in configuration. Provider credentials are read from environment variables.
 Never commit `config.yaml`, candidate profiles, CVs, credentials, or other secrets.
 For Compose, override the example mounts with `SCORER_CONFIG_PATH` and

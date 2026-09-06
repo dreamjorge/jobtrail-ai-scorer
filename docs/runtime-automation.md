@@ -263,6 +263,25 @@ is appended; override it with `PROMPT_TRUNCATE_MARKER`. The marker counts toward
 budget. If a profile or CV is missing, a directory, or unreadable, the scorer logs a warning and
 continues with the context that could be loaded. It does not expose file contents in the warning.
 
+### Per-section token estimate and budget warning
+
+Every `score` run emits exactly one `prompt_tokens_estimate={...}` line with a per-section
+breakdown (`profile`, `cv`, `job`, `schema`, `instructions`, `total`). The estimate uses a
+deterministic, dependency-free approximation:
+
+- `PROMPT_TOKEN_ESTIMATOR=chars4` (default) rounds `len(text) / 4` up.
+- `PROMPT_TOKEN_ESTIMATOR=words` splits on whitespace and counts tokens.
+
+The estimate is reproducible for the same input so subsequent runs and CI logs can diff the
+breakdown. The job section uses the same JSON serialization the provider receives, with notes
+stripped. No external token counter or network call is involved.
+
+Set `PROMPT_TOKEN_BUDGET` to a positive integer to enable the optional budget check. When
+`total` exceeds the budget the scorer prints an extra `prompt_token_budget={"budget": N,
+"total": M}` warning line in the same run. When the variable is unset, empty, or the total
+fits, no warning is emitted. The warning never aborts the run and never embeds prompt,
+profile, CV, or description content.
+
 ## Hermes Docker wrapper script
 
 When Hermes is running in Docker, point `hermes_executable` at the copied Hermes Docker wrapper script. The example `scripts/hermes-docker-wrapper.example.sh` runs:
