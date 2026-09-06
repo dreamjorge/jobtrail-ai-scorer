@@ -73,8 +73,11 @@ off) to append a bounded failure summary to the WhatsApp helper message when
 the run finishes with at least one failure.
 
 Warning: enabled runs write AI score notes and may send one summary through WhatsApp, but never apply to jobs.
-Summaries exclude descriptions, profiles, prompts, notes, credentials, and secrets.
-See [Runtime automation](docs/runtime-automation.md).
+Every best-match summary exposes eleven allowlisted fields (title, company, location, score, recommendation,
+recommendation label, strengths, gaps, external job URL, JobTrail link, and run identifier) and never embeds
+descriptions, profiles, CVs, raw prompts, reasoning, notes, credentials, or secrets. The JobTrail link is
+built from `JOBTRAIL_BASE_URL` plus `/jobs/<id>` and can be optionally rewritten through `WHATSAPP_SHORT_URL_BASE`.
+See [Runtime automation](docs/runtime-automation.md) for the full field contract and the optional shortener.
 
 ## Runtime policy guardrail
 
