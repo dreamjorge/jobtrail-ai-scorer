@@ -1,24 +1,11 @@
-# Copy to config.yaml and update these local, non-secret values.
+# The canonical JobTrail AI scorer config example lives at
+# `scripts/scorer-config.example.yaml`. Copy that file to a local, ignored
+# `config.yaml` and edit only the local copy. Do not duplicate the YAML
+# settings in this file — this pointer exists so the repo has a single
+# source of truth for the example.
 #
-# `jobtrail_base_url` is the backend that the `jobtrail-ai-scorer score` CLI
-# talks to. For most local usage, leave it as a public loopback/placeholder;
-# the systemd automation launcher resolves the real backend URL itself on each
-# start via `jobtrail_ai_scorer.discover.resolve_backend_url` (see
-# `docs/runtime-automation.md`). Never commit a private host or Docker IP here.
-jobtrail_base_url: http://localhost:3000
-candidate_profile_path: ./candidate-profile.example.md
-# Optional private CV; keep this file outside version control.
-candidate_cv_path: ./candidate-cv.md
-provider: hermes
-marker: "[AI_JOB_SCORE_V1]"
-# Prompt context is bounded before it is sent to the provider. These are
-# character budgets (not YAML settings); override them per run with:
-# PROMPT_PROFILE_BUDGET, PROMPT_CV_BUDGET, and PROMPT_TRUNCATE_MARKER.
-# Defaults are 12000, 16000, and "\n[... content truncated ...]".
-#
-# Every run emits a single `prompt_tokens_estimate={...}` line with a
-# per-section breakdown (profile, cv, job, schema, instructions, total)
-# using a deterministic estimator (chars/4 by default; override per run with
-# PROMPT_TOKEN_ESTIMATOR=chars4|words). Set PROMPT_TOKEN_BUDGET to a positive
-# integer to enable a warning when the estimate exceeds the budget; the
-# scorer prints `prompt_token_budget={"budget": N, "total": M}` in that case.
+# See `docs/runtime-automation.md` for the runtime layout, the historical
+# runtime-duplicate purge helper (`scripts/_purge_runtime_example.py --yes`),
+# and the leak-detector test (`tests/test_example_redaction.py`) that fails
+# CI if private IPv4 ranges, runtime paths, or credential prefixes ever creep
+# back into committed examples.

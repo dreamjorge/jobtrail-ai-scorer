@@ -6,11 +6,22 @@ Provider-agnostic CLI that evaluates JobTrail jobs against a local candidate pro
 
 ```sh
 python -m pip install .
-cp config.example.yaml config.yaml
+cp scripts/scorer-config.example.yaml config.yaml
 cp candidate-profile.example.md candidate-profile.md
 # edit config.yaml (set candidate_profile_path: ./candidate-profile.md) and candidate-profile.md
-# optionally set candidate_cv_path: /DATA/AppData/jobtrail/candidate-cv.md
+# optionally set candidate_cv_path: /absolute/path/to/your/candidate-cv.md
 ```
+
+The repo-root `config.example.yaml` is now a thin pointer to the canonical
+example at `scripts/scorer-config.example.yaml`. Copy that canonical file
+to a local, ignored `config.yaml` so there is exactly one source of truth for
+the scorer configuration example. The leak-detector test
+(`tests/test_example_redaction.py`) scans every committed example and template
+for private IPv4 ranges, runtime paths, and credential prefixes and fails CI
+on any regression. See [Runtime automation](docs/runtime-automation.md) for
+the strict opt-in purge helper (`scripts/_purge_runtime_example.py --yes`)
+that removes the historical runtime duplicate once your local runtime has
+switched to the canonical file.
 
 Run `jobtrail-ai-scorer score --config config.yaml [OPTIONS]`. Options include `--limit N`,
 `--job-id ID`, `--dry-run`, `--force`, `--marker TEXT`, and `--provider hermes|openai_compatible`.
@@ -22,7 +33,7 @@ For Hermes, configure `hermes_executable`, `hermes_profile`, and optional
 OpenAI-compatible providers use an endpoint/model and an API-key environment variable.
 
 The optional `candidate_cv_path` points to a private, local CV file (for example,
-`/DATA/AppData/jobtrail/candidate-cv.md`). When configured, its contents are included
+`/absolute/path/to/your/candidate-cv.md`). When configured, its contents are included
 alongside the candidate profile in the provider prompt. Keep the CV outside version control.
 
 Prompt context is bounded before it is sent to the provider. The profile defaults to a
@@ -50,8 +61,9 @@ For Compose, override the example mounts with `SCORER_CONFIG_PATH` and
 See [Runtime automation](docs/runtime-automation.md) for safe dry-run-first scheduler
 setup, `SCORER_COMMAND` local launcher overrides, Hermes Docker wrapper usage,
 optional WhatsApp notification through Hermes, dynamic backend URL discovery
-(precedence: published host port → Docker container IP → fail closed), and
-Docker maintenance rules.
+(precedence: published host port → Docker container IP → fail closed), Docker
+maintenance rules, and the strict opt-in purge helper that removes the
+historical runtime duplicate of the config example.
 
 ## Automated JobTrail search
 
@@ -62,7 +74,7 @@ and notifications are disabled by default.
 
 The launcher consults a seen cache before every `POST /api/discover/import` so
 offers already imported within the last `2 * JOB_SEARCH_HOURS_OLD` hours are
-skipped. The cache defaults to `/DATA/AppData/jobtrail/logs/automated-job-search/seen.json`,
+skipped. The cache defaults to `<runtime-root>/jobtrail/logs/automated-job-search/seen.json`,
 is rewritten atomically (`tmp + rename`), and is always `0600`. Override the
 path with `JOBTRAIL_SEEN_CACHE_PATH`. Pass `--reset-seen-cache` (or set
 `JOBTRAIL_RESET_SEEN_CACHE=1`) to clear the cache and force a re-import.
