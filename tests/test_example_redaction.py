@@ -31,8 +31,17 @@ DOCKER_COMPOSE = ROOT / "docker-compose.yml"
 
 # Build the scanned list from a single source of truth and dedupe so the
 # canonical example is only listed once even though it also matches the
-# ``scripts/*.example.*`` glob.
-_EXAMPLE_GLOB = tuple(sorted((ROOT / "scripts").glob("*.example.*")))
+# repo-wide ``*.example.*`` glob. Recursive (``rglob``) so example files
+# under any subdirectory (e.g. ``prompts/`` or ``scripts/legacy/``) are
+# scanned too, not just the immediate contents of ``scripts/``.
+_IGNORED_DIR_PARTS = {".git", ".venv", "node_modules", "build", "dist"}
+_EXAMPLE_GLOB = tuple(
+    sorted(
+        p
+        for p in ROOT.rglob("*.example.*")
+        if not _IGNORED_DIR_PARTS.intersection(p.parts)
+    )
+)
 EXAMPLES_AND_TEMPLATES = tuple(
     dict.fromkeys(
         (

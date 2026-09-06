@@ -142,27 +142,28 @@ def test_hours_old_parameter_changes_ttl(tmp_path: Path):
     assert cache.should_skip("linkedin", "job-1", hours_old=72) is True
 
 
-def test_mark_seen_preserves_original_first_seen(tmp_path: Path):
-    """Re-marking the same pair must not extend its TTL window."""
+def test_mark_seen_refreshes_expired_entry(tmp_path: Path):
+    """Re-marking an already-expired pair must restart its TTL window.
+
+    ``mark_seen`` is only ever called by the automation after
+    ``should_skip`` returned False, i.e. the pair is either new or its TTL
+    already expired. If ``first_seen`` were preserved instead of refreshed,
+    an expired entry would stay expired forever and the offer would get
+    reimported/rescored on every subsequent run indefinitely.
+    """
 
     sep = SEEN_CACHE_KEY_SEPARATOR
     clock = _FakeClock(1_000.0)
     cache = SeenCache(tmp_path / "seen.json", clock=clock)
     cache.mark_seen("linkedin", "job-1")
-    # Advance 100 hours and mark again.
-    clock.advance(100 * 3600)
-    cache.mark_seen("linkedin", "job-1")
-    # Original first_seen was 1000.0; re-mark must not have changed it.
-    # TTL with hours_old=72 = 144h. Now is 1000+100h = first_seen+100h. Still in TTL.
-    assert cache.should_skip("linkedin", "job-1", hours_old=72) is True
-    # Move just past the original first_seen + 144h:
-    clock.advance((144 - 100) * 3600 + 60)
-    # Verify the entry's stored first_seen is the original timestamp, not the later one.
-    assert cache._entries[f"linkedin{sep}job-1"]["first_seen"] == 1_000.0  # noqa: SLF001
-    # And now the entry is out of TTL (expired relative to original first_seen).
+    # Move past the TTL (hours_old=72 -> 144h window).
+    clock.advance(144 * 3600 + 60)
     assert cache.should_skip("linkedin", "job-1", hours_old=72) is False
-    # Sanity: the call did not change first_seen.
-    assert cache._entries[f"linkedin{sep}job-1"]["first_seen"] == 1_000.0  # noqa: SLF001
+    # Re-mark after expiry: first_seen must move to "now", not stay at 1000.0.
+    cache.mark_seen("linkedin", "job-1")
+    assert cache._entries[f"linkedin{sep}job-1"]["first_seen"] == clock()  # noqa: SLF001
+    # The entry is fresh again relative to the new first_seen.
+    assert cache.should_skip("linkedin", "job-1", hours_old=72) is True
 
 
 # --- Persistence & atomic write ----------------------------------------------

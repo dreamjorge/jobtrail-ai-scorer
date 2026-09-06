@@ -92,8 +92,12 @@ def _validate_target(raw_arg: str, resolved: Path) -> str | None:
             "absolute path so a relative argument cannot accidentally target "
             "a local config.yaml."
         )
-    if resolved.is_symlink():
-        return f"refusing to remove {resolved}: refusing to follow symlinks."
+    # Check the raw, unresolved argument for a symlink: `resolved` already
+    # had `.resolve()` follow any link down to its real target, so checking
+    # `resolved.is_symlink()` here would always be False and never catch a
+    # symlink planted at the given path.
+    if Path(raw_arg).is_symlink():
+        return f"refusing to remove {raw_arg}: refusing to follow symlinks."
     if not resolved.exists():
         return f"runtime example does not exist: {resolved}"
     if not resolved.is_file():
