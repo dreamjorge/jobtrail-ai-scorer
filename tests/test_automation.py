@@ -1,5 +1,6 @@
 import json
 
+import httpx
 import pytest
 
 import jobtrail_ai_scorer.automation as automation
@@ -569,3 +570,306 @@ def test_automation_seen_cache_uses_hours_old_for_ttl(tmp_path):
     clock.t = 1_000.0 + 49 * 3600
     assert cache.should_skip("indeed", "source-1", hours_old=24) is False
     assert cache.should_skip("indeed", "source-1", hours_old=72) is True
+
+
+# --- Retry/backoff wiring for idempotent calls ----------------------------
+
+
+class _FlakySearchHTTPClient:
+    """HTTP client stub that fails search N times before succeeding."""
+
+    def __init__(self, *, search_failures: int, status_code: int = 503) -> None:
+        self._search_failures = search_failures
+        self._status_code = status_code
+        self.posts: list[tuple[str, dict]] = []
+
+    def post(self, path, *, json):
+        self.posts.append((path, json))
+        if path.endswith("/search") and self._search_failures > 0:
+            self._search_failures -= 1
+            request = httpx.Request("POST", "http://test/search")
+            response = httpx.Response(self._status_code, request=request)
+            raise httpx.HTTPStatusError(
+                "transient", request=request, response=response
+            )
+        if path.endswith("/search"):
+            return FakeResponse([])
+        return FakeResponse({"id": "j1"})
+
+
+def test_automation_search_retries_on_5xx_and_recovers(caplog):
+    """Transient 5xx errors during search are retried and recovered silently."""
+
+    client = JobTrailHTTPClient(
+        "http://test",
+        client=_FlakySearchHTTPClient(search_failures=2, status_code=503),
+    )
+
+    with caplog.at_level("WARNING", logger="jobtrail_ai_scorer.retry"):
+        result = JobSearchAutomation(client).run(
+            config=AutomationConfig(scorer_config_path="safe/config.yaml")
+        )
+
+    assert result.failures == ()
+    # Two retry log records were emitted with the structured prefix.
+    assert any("retry:" in record.getMessage() for record in caplog.records)
+
+
+def test_automation_search_exhausts_retries_and_records_failure_metadata():
+    """When search retries are exhausted, the failure carries retry metadata."""
+
+    client = JobTrailHTTPClient(
+        "http://test",
+        client=_FlakySearchHTTPClient(search_failures=10, status_code=503),
+    )
+
+    result = JobSearchAutomation(client).run(
+        config=AutomationConfig(scorer_config_path="safe/config.yaml")
+    )
+
+    assert result.searched == 0
+    assert result.imported == 0
+    assert result.scored == 0
+    assert result.failures
+    failure = result.failures[0]
+    assert failure.startswith("search:exhausted")
+    assert "HTTPStatusError" in failure
+
+
+def test_automation_import_terminal_failure_records_metadata(monkeypatch):
+    """When an import raises a terminal 4xx the failure string marks it terminal."""
+
+    gateway = FakeJobTrail()
+
+    def boom_import(payload):
+        request = httpx.Request("POST", "http://test/import")
+        response = httpx.Response(422, request=request)
+        raise httpx.HTTPStatusError(
+            "unprocessable", request=request, response=response
+        )
+
+    monkeypatch.setattr(gateway, "import_job", boom_import)
+    result = JobSearchAutomation(gateway).run(
+        config=AutomationConfig(scorer_config_path="safe/config.yaml")
+    )
+
+    # ``FakeJobTrail.search`` returns one job per location; the default
+    # ``AutomationConfig`` declares two locations (Queretaro, remote).
+    assert result.searched == 2
+    assert result.imported == 0
+    # One terminal import failure per location that surfaced the job.
+    assert sum(
+        1
+        for failure in result.failures
+        if failure.startswith("import:terminal") and "HTTPStatusError" in failure
+    ) == 2
+
+
+def test_automation_scorer_retries_transient_failure(monkeypatch):
+    """Scorer subprocess failures are retried before giving up."""
+
+    gateway = FakeJobTrail()
+    attempts = {"count": 0}
+
+    def flaky_scorer(job_id, _config_path):
+        attempts["count"] += 1
+        if attempts["count"] < 2:
+            raise httpx.ConnectError("transient")
+        gateway.jobs[job_id]["notes"] = [
+            {"body": '[AI_JOB_SCORE_V1]\\n{"score":82}'}
+        ]
+
+    notifier = FakeNotifier()
+    result = JobSearchAutomation(gateway, scorer=flaky_scorer, notifier=notifier).run(
+        config=AutomationConfig(scorer_config_path="safe/config.yaml")
+    )
+
+    assert attempts["count"] == 2
+    assert result.scored == 1
+    assert result.failures == ()
+
+
+# --- WHATSAPP_NOTIFY_ON_FAILURE opt-in -----------------------------------
+
+
+def test_whatsapp_notify_on_failure_default_is_off():
+    """Without WHATSAPP_NOTIFY_ON_FAILURE, failures never trigger a notification."""
+
+    config = AutomationConfig.from_env({})
+    assert config.notify_on_failure is False
+
+
+def test_whatsapp_notify_on_failure_env_is_parsed():
+    """The env var is parsed into the boolean ``notify_on_failure`` field."""
+
+    config = AutomationConfig.from_env({"WHATSAPP_NOTIFY_ON_FAILURE": "1"})
+    assert config.notify_on_failure is True
+    config = AutomationConfig.from_env({"WHATSAPP_NOTIFY_ON_FAILURE": "true"})
+    assert config.notify_on_failure is True
+    config = AutomationConfig.from_env({"WHATSAPP_NOTIFY_ON_FAILURE": "0"})
+    assert config.notify_on_failure is False
+
+
+def test_whatsapp_notify_on_failure_sends_bounded_summary_when_set(monkeypatch):
+    """When the opt-in is on, the notifier receives a bounded failure summary."""
+
+    gateway = FakeJobTrail()
+
+    def boom_import(payload):
+        request = httpx.Request("POST", "http://test/import")
+        response = httpx.Response(503, request=request)
+        raise httpx.HTTPStatusError(
+            "transient", request=request, response=response
+        )
+
+    monkeypatch.setattr(gateway, "import_job", boom_import)
+    notifier = FakeNotifier()
+
+    JobSearchAutomation(gateway, notifier=notifier).run(
+        config=AutomationConfig(
+            scorer_config_path="safe/config.yaml",
+            notify_on_failure=True,
+            whatsapp_command="./local-notify.sh",
+        )
+    )
+
+    assert len(notifier.messages) == 1
+    payload = json.loads(notifier.messages[0])
+    assert payload["kind"] == "failure_summary"
+    assert payload["failure_count"] >= 1
+    # The summary must not leak the description or any sensitive fields.
+    assert "description" not in json.dumps(payload).lower()
+
+
+def test_whatsapp_notify_on_failure_sends_summary_even_without_match(monkeypatch):
+    """Failures alone (no selected match) still produce a notification."""
+
+    gateway = FakeJobTrail()
+
+    def boom_import(payload):
+        request = httpx.Request("POST", "http://test/import")
+        response = httpx.Response(500, request=request)
+        raise httpx.HTTPStatusError(
+            "transient", request=request, response=response
+        )
+
+    monkeypatch.setattr(gateway, "import_job", boom_import)
+    notifier = FakeNotifier()
+
+    JobSearchAutomation(gateway, notifier=notifier).run(
+        config=AutomationConfig(
+            scorer_config_path="safe/config.yaml",
+            notify_enabled=False,
+            notify_on_failure=True,
+            whatsapp_command="./local-notify.sh",
+        )
+    )
+
+    # Only the failure summary is sent because notify_enabled is off.
+    assert len(notifier.messages) == 1
+    payload = json.loads(notifier.messages[0])
+    assert payload["kind"] == "failure_summary"
+
+
+# --- Triangulation: additional retry wiring cases ----------------------------
+
+
+def test_automation_import_retries_on_5xx_then_succeeds():
+    """Transient 5xx import errors are retried by the HTTP client."""
+
+    class _FlakyImportHTTPClient:
+        def __init__(self) -> None:
+            self.import_failures = 2
+            self.posts: list[tuple[str, dict]] = []
+
+        def post(self, path, *, json):
+            self.posts.append((path, json))
+            if path.endswith("/import") and self.import_failures > 0:
+                self.import_failures -= 1
+                request = httpx.Request("POST", "http://test/import")
+                response = httpx.Response(503, request=request)
+                raise httpx.HTTPStatusError(
+                    "transient", request=request, response=response
+                )
+            if path.endswith("/search"):
+                return FakeResponse(
+                    [{"id": "x", "site": "indeed", "title": "T", "company": "C"}]
+                )
+            # Use a stable id so the same job is de-duplicated by ``ids``.
+            return FakeResponse({"id": "j1"})
+
+        def get(self, path):
+            return FakeResponse({"id": "j1", "notes": []})
+
+    recorder = _FlakyImportHTTPClient()
+    client = JobTrailHTTPClient("http://test", client=recorder)
+    scorer = FakeScorer()
+    scorer.jobs = {"j1": {"id": "j1", "notes": []}}
+
+    result = JobSearchAutomation(client, scorer=scorer).run(
+        config=AutomationConfig(
+            scorer_config_path="safe/config.yaml",
+            locations=("Queretaro",),  # single location to keep the test focused
+        )
+    )
+
+    # Both transient 5xx responses were absorbed by the retry helper; the
+    # eventual success was recorded as one imported job.
+    assert recorder.import_failures == 0
+    assert result.failures == ()
+    assert result.imported == 1
+
+
+def test_automation_no_notification_when_nothing_to_report():
+    """No notifier call when neither a best match nor a failure summary applies."""
+
+    gateway = FakeJobTrail()
+    scorer = FakeScorer()
+    scorer.jobs = gateway.jobs
+
+    notifier = FakeNotifier()
+    JobSearchAutomation(gateway, scorer=scorer, notifier=notifier).run(
+        config=AutomationConfig(
+            scorer_config_path="safe/config.yaml",
+            notify_enabled=True,
+        )
+    )
+
+    # Existing behavior: a best match above the threshold triggers one notification.
+    assert len(notifier.messages) == 1
+
+    # With both flags off and no failures, the notifier must not be called again.
+    notifier_off = FakeNotifier()
+    JobSearchAutomation(gateway, scorer=scorer, notifier=notifier_off).run(
+        config=AutomationConfig(
+            scorer_config_path="safe/config.yaml",
+            notify_enabled=False,
+            notify_on_failure=False,
+        )
+    )
+    assert notifier_off.messages == []
+
+
+def test_automation_failure_summary_is_bounded_and_safe():
+    """The failure summary exposes only abstract labels, no sensitive content."""
+
+    summary = automation.build_failure_summary(
+        (
+            "import:exhausted:HTTPStatusError",
+            "search:exhausted:ConnectError",
+            "score:j1:terminal:ValueError",
+            "read:j2:exhausted:TimeoutError",
+            "import:exhausted:HTTPStatusError",
+            "import:exhausted:HTTPStatusError",
+        ),
+        max_items=5,
+    )
+
+    assert summary["kind"] == "failure_summary"
+    assert summary["failure_count"] == 6
+    assert len(summary["failures"]) == 5
+    # All labels are abstract; no raw messages or sensitive fields.
+    for label in summary["failures"]:
+        assert isinstance(label, str)
+        assert "sensitive" not in label
+        assert "description" not in label.lower()

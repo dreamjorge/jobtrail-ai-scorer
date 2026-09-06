@@ -91,6 +91,63 @@ the run summary as `seen-cache:check:<reason>` or `seen-cache:write:<reason>`.
 The cache is always consulted before `POST /api/discover/import`; the backend
 never sees offers that the cache reports as already-seen within the TTL.
 
+## Bounded retries with backoff
+
+Idempotent network calls (`/api/discover/search`, `/api/discover/import`,
+`GET /api/jobs/...`, and the local scorer subprocess) are wrapped in a
+bounded retry helper (`jobtrail_ai_scorer.retry`). Retries are skipped for
+operations that could produce duplicate side effects (`POST /api/jobs/.../notes`).
+
+The retry helper uses an exponential schedule with a hard cap:
+
+- Default policy: `max_attempts=3`, `base_delay=0.5s`, `max_delay=8.0s`.
+- The delay is `min(base_delay * 2 ** attempt_index, max_delay)` so backoff
+  stays bounded even for long-running transient outages.
+- `jitter=False` by default. Enable it per-client when de-correlating parallel
+  runs.
+
+### Retry classification
+
+The helper classifies each exception before deciding whether to retry:
+
+- **Retryable (retried):** HTTP `5xx`, network/timeout failures,
+  `CalledProcessError` from the scorer subprocess. The previous attempt's
+  delay is logged with the structured prefix `retry:` so operators can grep
+  the journal.
+- **Exhausted:** every retry attempt failed; the helper re-raises the last
+  exception with `retry_metadata={"attempts": N, "classification": "exhausted"}`.
+  The orchestration records it on `AutomationRun.failures` as
+  `<stage>[:<job_id>]:exhausted:<ExceptionType>`.
+- **Terminal (no retry):** HTTP `4xx`, `ValueError`, `KeyError`,
+  `FileNotFoundError`, `PermissionError`. The orchestration records it as
+  `<stage>[:<job_id>]:terminal:<ExceptionType>`.
+
+### Partial-success reporting
+
+`AutomationRun.failures` carries the classification for every stage
+(`search`, `import`, `score:<job_id>`, `read:<job_id>`, `seen-cache:...`).
+Operators can grep the summary for `:retryable`, `:exhausted`, or `:terminal`
+to distinguish transient blips from persistent failures. The summary never
+includes exception messages, descriptions, profiles, prompts, or credentials.
+
+### WHATSAPP_NOTIFY_ON_FAILURE opt-in
+
+`WHATSAPP_NOTIFY_ON_FAILURE=1` (or `true`/`yes`/`on`) appends a bounded
+failure summary to the WhatsApp helper message when the run finishes with at
+least one failure. It is independent of `WHATSAPP_NOTIFY_ENABLED`:
+
+- `notify_enabled=False`, `notify_on_failure=True`: a failure summary is sent
+  only when failures were recorded.
+- `notify_enabled=True`, `notify_on_failure=False`: the existing best-match
+  notification is sent when a match is selected (unchanged behavior).
+- `notify_enabled=True`, `notify_on_failure=True`: when both apply, the
+  failure summary is appended on a separate line after the best-match JSON so
+  the match payload stays diff-friendly.
+
+The summary exposes only the failure count and the first five abstract labels.
+It never includes descriptions, profiles, prompts, notes, credentials, or
+secrets. Default is off; opt in explicitly.
+
 ## Safety rules
 
 - **Dry-run first:** keep `SCORER_DRY_RUN=1` until the config, JobTrail connection, provider, and logs look correct.
@@ -135,6 +192,19 @@ marker: "[AI_JOB_SCORE_V1]"
 ```
 
 The CLI reads provider credentials from environment variables when a provider needs them. Do not place tokens or secrets in YAML.
+
+### Prompt context budgets
+
+The scorer bounds each local context section before constructing the provider prompt:
+
+- candidate profile: 12,000 characters by default;
+- optional candidate CV: 16,000 characters by default.
+
+Set `PROMPT_PROFILE_BUDGET` or `PROMPT_CV_BUDGET` to a positive integer to override a
+budget for one run. When a section is clipped, the default marker `\n[... content truncated ...]`
+is appended; override it with `PROMPT_TRUNCATE_MARKER`. The marker counts toward the section's
+budget. If a profile or CV is missing, a directory, or unreadable, the scorer logs a warning and
+continues with the context that could be loaded. It does not expose file contents in the warning.
 
 ## Hermes Docker wrapper script
 
@@ -191,3 +261,24 @@ export HERMES_PROFILE=job-search
 ```
 
 Send summaries only. Do not include raw prompts, candidate profile content, job descriptions, notes, tokens, credentials, or secrets in WhatsApp messages. Include counts, status, and log metadata that an operator can use to inspect the local log securely.
+
+## Hermes runtime policy guardrail (CI)
+
+The runtime SOUL.md and `skills/jobtrail-automation/SKILL.md` live in the operator's local Hermes profile (for example under `/DATA/AppData/hermes/profiles/job-search/`) and must NOT be committed to this repository. To keep the apply-gate contract reviewable, the repository ships CI-only fixture mocks under `tests/fixtures/hermes/` and a guardrail test suite (`tests/test_runtime_policy.py`) that runs on every PR and on a daily cron via `.github/workflows/policy.yml`.
+
+The fixtures assert three rules and any drift fails CI with a focused diff:
+
+- `SOUL.md` apply context contains the literal phrase `explicit confirmation`.
+- `SKILL.md` contains the literal phrase `explicit confirmation`.
+- Both files include either `never submit` or `without an explicit confirmation` in the apply section.
+
+The fixtures must remain minimal contract mocks. They must NEVER embed runtime paths (`/DATA/...`, `/AppData/...`), private CV/profile content, credentials, or any operator-only data. The leak guard (`test_fixtures_do_not_leak_runtime_data`) fails CI if such content sneaks in.
+
+When the runtime SOUL/SKILL evolve locally, mirror the required phrases into the fixture files in the same PR so the policy contract stays auditable. The fixtures never need to mirror the full runtime content — only the apply-gate phrases and any new apply-section heading structure the guardrail needs.
+
+To run the guardrail locally:
+
+```sh
+python -m pip install -e .
+python -m pytest tests/test_runtime_policy.py -v
+```

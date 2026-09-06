@@ -137,3 +137,157 @@ def test_context_manager_closes_internally_owned_http_client():
         assert not http_client.is_closed
 
     assert http_client.is_closed
+
+
+# --- Retry/backoff wiring for idempotent JobTrailClient methods -------------
+
+
+def test_jobtrail_api_error_carries_status_code():
+    """``JobTrailApiError`` records the HTTP status code returned by the server."""
+
+    from jobtrail_ai_scorer.jobtrail import JobTrailApiError
+
+    err = JobTrailApiError("boom", status_code=503)
+    assert err.status_code == 503
+
+    # Missing status is preserved as ``None`` so the classifier can default it.
+    err_no_status = JobTrailApiError("connection refused")
+    assert err_no_status.status_code is None
+
+
+def test_jobtrail_list_jobs_retries_on_5xx_and_succeeds():
+    """``list_jobs`` retries on 5xx and returns the eventual success payload."""
+
+    attempts = {"count": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts["count"] += 1
+        if attempts["count"] < 2:
+            return httpx.Response(503, request=request)
+        return httpx.Response(200, json=[{"id": "j1"}], request=request)
+
+    sleeps: list[float] = []
+    client = JobTrailClient(
+        "https://jobs.test",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+        retry_sleep=lambda d: sleeps.append(d),
+        retry_policy=__import__(
+            "jobtrail_ai_scorer.retry", fromlist=["RetryPolicy"]
+        ).RetryPolicy(max_attempts=3, base_delay=0.01),
+    )
+
+    assert client.list_jobs() == [{"id": "j1"}]
+    assert attempts["count"] == 2
+    assert len(sleeps) == 1
+    client.close()
+
+
+def test_jobtrail_list_jobs_no_retry_on_4xx():
+    """``list_jobs`` raises immediately on a terminal 4xx status code."""
+
+    attempts = {"count": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts["count"] += 1
+        return httpx.Response(404, request=request)
+
+    sleeps: list[float] = []
+    client = JobTrailClient(
+        "https://jobs.test",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+        retry_sleep=lambda d: sleeps.append(d),
+        retry_policy=__import__(
+            "jobtrail_ai_scorer.retry", fromlist=["RetryPolicy"]
+        ).RetryPolicy(max_attempts=5, base_delay=0.01),
+    )
+
+    with pytest.raises(JobTrailApiError) as exc_info:
+        client.list_jobs()
+    assert exc_info.value.status_code == 404
+    assert attempts["count"] == 1
+    assert sleeps == []
+    client.close()
+
+
+def test_jobtrail_get_job_retries_on_5xx_and_succeeds():
+    """``get_job`` retries on 5xx and returns the eventual success payload."""
+
+    attempts = {"count": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts["count"] += 1
+        if attempts["count"] < 3:
+            return httpx.Response(502, request=request)
+        return httpx.Response(200, json={"id": "j1"}, request=request)
+
+    sleeps: list[float] = []
+    client = JobTrailClient(
+        "https://jobs.test",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+        retry_sleep=lambda d: sleeps.append(d),
+        retry_policy=__import__(
+            "jobtrail_ai_scorer.retry", fromlist=["RetryPolicy"]
+        ).RetryPolicy(max_attempts=5, base_delay=0.01),
+    )
+
+    assert client.get_job("j1") == {"id": "j1"}
+    assert attempts["count"] == 3
+    assert len(sleeps) == 2
+    client.close()
+
+
+def test_jobtrail_list_jobs_raises_after_retry_exhaustion():
+    """Exhausted retries raise the last ``JobTrailApiError`` with the last status."""
+
+    attempts = {"count": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts["count"] += 1
+        return httpx.Response(503, request=request)
+
+    sleeps: list[float] = []
+    client = JobTrailClient(
+        "https://jobs.test",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+        retry_sleep=lambda d: sleeps.append(d),
+        retry_policy=__import__(
+            "jobtrail_ai_scorer.retry", fromlist=["RetryPolicy"]
+        ).RetryPolicy(max_attempts=3, base_delay=0.01),
+    )
+
+    with pytest.raises(JobTrailApiError) as exc_info:
+        client.list_jobs()
+    assert exc_info.value.status_code == 503
+    assert attempts["count"] == 3
+    assert len(sleeps) == 2  # one sleep per failed attempt that is not the last
+    client.close()
+
+
+# --- Triangulation: add_note is never retried (POST side-effect) -------------
+
+
+def test_jobtrail_add_note_is_not_retried_on_5xx():
+    """``add_note`` POSTs a new resource and must not be retried automatically."""
+
+    attempts = {"count": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts["count"] += 1
+        return httpx.Response(500, request=request)
+
+    sleeps: list[float] = []
+    client = JobTrailClient(
+        "https://jobs.test",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+        retry_sleep=lambda d: sleeps.append(d),
+        retry_policy=__import__(
+            "jobtrail_ai_scorer.retry", fromlist=["RetryPolicy"]
+        ).RetryPolicy(max_attempts=5, base_delay=0.01),
+    )
+
+    with pytest.raises(JobTrailApiError) as exc_info:
+        client.add_note("j1", "some note body")
+    assert exc_info.value.status_code == 500
+    assert attempts["count"] == 1
+    assert sleeps == []
+    client.close()

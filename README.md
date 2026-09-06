@@ -25,6 +25,13 @@ The optional `candidate_cv_path` points to a private, local CV file (for example
 `/DATA/AppData/jobtrail/candidate-cv.md`). When configured, its contents are included
 alongside the candidate profile in the provider prompt. Keep the CV outside version control.
 
+Prompt context is bounded before it is sent to the provider. The profile defaults to a
+12,000-character budget and the CV defaults to 16,000 characters. Override these values
+for a run with the positive integer environment variables `PROMPT_PROFILE_BUDGET` and
+`PROMPT_CV_BUDGET`. Oversized sections receive a clear marker; customize it with
+`PROMPT_TRUNCATE_MARKER` (default: `\n[... content truncated ...]`). A missing, directory,
+or unreadable profile/CV logs a warning and the scorer continues with any remaining context.
+
 The CLI never stores API keys in configuration. Provider credentials are read from environment variables.
 Never commit `config.yaml`, candidate profiles, CVs, credentials, or other secrets.
 For Compose, override the example mounts with `SCORER_CONFIG_PATH` and
@@ -54,6 +61,27 @@ path with `JOBTRAIL_SEEN_CACHE_PATH`. Pass `--reset-seen-cache` (or set
 Corruption, missing parent directories, or permission errors degrade to an
 empty cache and never crash the run.
 
+Idempotent network calls (search, import, scorer subprocess, JobTrail reads)
+are wrapped in a bounded retry helper. HTTP `5xx` and transient transport
+errors are retried with exponential backoff (default 3 attempts, 0.5–8s
+capped); HTTP `4xx` and configuration errors are terminal and recorded
+without retries. Failures carry `retryable`, `exhausted`, or `terminal`
+classifications on `AutomationRun.failures` so operators can distinguish
+transient blips from persistent failures. Each retry attempt is logged with
+the structured prefix `retry:`. Set `WHATSAPP_NOTIFY_ON_FAILURE=1` (default
+off) to append a bounded failure summary to the WhatsApp helper message when
+the run finishes with at least one failure.
+
 Warning: enabled runs write AI score notes and may send one summary through WhatsApp, but never apply to jobs.
 Summaries exclude descriptions, profiles, prompts, notes, credentials, and secrets.
 See [Runtime automation](docs/runtime-automation.md).
+
+## Runtime policy guardrail
+
+The runtime `SOUL.md` and `skills/jobtrail-automation/SKILL.md` are Hermes profile files that live outside this repository. To enforce the apply-gate contract in CI, the repository ships minimal fixture mocks under `tests/fixtures/hermes/`. The guardrail (`tests/test_runtime_policy.py`, run by `.github/workflows/policy.yml` on every PR and daily at 06:00 UTC) asserts:
+
+- the `SOUL.md` apply context contains the literal phrase `explicit confirmation`;
+- the `SKILL.md` contains the literal phrase `explicit confirmation`;
+- both files include `never submit` or `without an explicit confirmation` in the apply section.
+
+Drift in the fixtures fails the workflow with a focused diff. The fixtures must remain pure contract mocks — never copy runtime paths (`/DATA/...`, `/AppData/...`), profile, CV, or credential content into the repository. See [Runtime automation](docs/runtime-automation.md#hermes-runtime-policy-guardrail-ci) for details and local-run instructions.
