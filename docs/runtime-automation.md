@@ -52,13 +52,15 @@ branch served the run. Discovery errors are surfaced on stderr with the original
 
 ### Disabling discovery
 
-Existing systemd units that already export `JOBTRAIL_BASE_URL=http://<host>:8000`
-do not need to change. Either:
+`--container` always defaults to `jobtrail-backend-1` regardless of
+`JOBTRAIL_DISCOVER_CONTAINER`, so leaving that variable unset does **not**
+disable discovery: the launcher still probes the published port and then that
+default container name, and exits `2` if neither is reachable.
 
-- leave `JOBTRAIL_DISCOVER_CONTAINER` unset (the launcher falls back to
-  `JOBTRAIL_BASE_URL`/`--base-url`); or
-- pass `--no-discover` to make the static-URL path explicit and traceable in
-  the unit definition.
+To make an existing systemd unit that already exports
+`JOBTRAIL_BASE_URL=http://<host>:8000` use that URL as-is, pass
+`--no-discover` (or `--base-url`) explicitly in the unit definition — this is
+the only way to skip the published-port and Docker probes.
 
 
 ## Pre-import deduplication (seen cache)

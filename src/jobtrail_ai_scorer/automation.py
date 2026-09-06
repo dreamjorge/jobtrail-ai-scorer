@@ -333,25 +333,21 @@ class JobTrailAutomation:
         self._scorer_retry_sleep = retry_sleep
 
     def _score(self, job_id: str, config_path: str) -> None:
-        def _run_score() -> None:
-            subprocess.run(
-                [
-                    *shlex.split(self._scorer_command),
-                    "score",
-                    "--config",
-                    config_path,
-                    "--job-id",
-                    job_id,
-                    "--force",
-                ],
-                check=True,
-            )
-
-        retry_call(
-            _run_score,
-            policy=self._scorer_retry_policy,
-            sleep=self._scorer_retry_sleep,
-            label=f"scorer score {job_id}",
+        # No retry here: ``run()`` already wraps every call to ``self.scorer``
+        # (default or injected) in a single ``retry_call`` with
+        # ``_scorer_retry_policy``. Retrying here too would nest attempts
+        # (up to max_attempts**2) and silently exceed the documented policy.
+        subprocess.run(
+            [
+                *shlex.split(self._scorer_command),
+                "score",
+                "--config",
+                config_path,
+                "--job-id",
+                job_id,
+                "--force",
+            ],
+            check=True,
         )
 
     def _notify(self, message: str) -> None:
@@ -442,7 +438,10 @@ class JobTrailAutomation:
             base_url=self.base_url,
         )
         if notification_body is not None:
-            self.notifier(notification_body)
+            try:
+                self.notifier(notification_body)
+            except Exception:
+                failures.append("notify")
         return AutomationRun(searched, imported, scored, tuple(failures), best)
 
     @staticmethod
@@ -532,9 +531,10 @@ class JobTrailAutomation:
                 hours_old=config.hours_old,
             )
         except Exception as exc:  # pragma: no cover - defensive guard
-            # Cache failures must never crash a run; surface as a
-            # ``seen-cache:...`` failure so operators can see the cause.
-            failures.append(f"seen-cache:check:{exc}")
+            # Cache failures must never crash a run; surface only the
+            # exception type (never str(exc), which can leak local paths)
+            # as a ``seen-cache:...`` failure so operators can see the cause.
+            failures.append(f"seen-cache:check:{type(exc).__name__}")
             return False
 
     def _record_seen(
@@ -554,7 +554,8 @@ class JobTrailAutomation:
         try:
             self.seen_cache.mark_seen(source, source_job_id)
         except Exception as exc:  # pragma: no cover - defensive guard
-            failures.append(f"seen-cache:write:{exc}")
+            # See ``_is_cached``: never surface str(exc) here either.
+            failures.append(f"seen-cache:write:{type(exc).__name__}")
 
 
 JobSearchAutomation = JobTrailAutomation

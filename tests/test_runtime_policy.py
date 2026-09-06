@@ -12,8 +12,6 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-import pytest
-
 FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures" / "hermes"
 SOUL_FIXTURE = FIXTURES_DIR / "SOUL.md"
 SKILL_FIXTURE = (
@@ -101,27 +99,23 @@ def test_skill_requires_explicit_confirmation():
     )
 
 
-@pytest.mark.parametrize(
-    "required_phrase",
-    [NEVER_SUBMIT, WITHOUT_EXPLICIT_CONFIRMATION],
-    ids=["never-submit", "without-explicit-confirmation"],
-)
-def test_runtime_files_never_submit_without_confirmation(required_phrase):
-    # Both fixtures must include at least one of the two deny phrases (the param
-    # tries them in order; pytest reports the first failing phrase).
+def test_runtime_files_never_submit_without_confirmation():
+    # Each fixture must include at least one of the two deny phrases (OR, not
+    # AND): a document is compliant whether it says "never submit" or
+    # "without an explicit confirmation" (or both).
+    deny_phrases = (NEVER_SUBMIT, WITHOUT_EXPLICIT_CONFIRMATION)
     soul = _apply_section(_read(SOUL_FIXTURE))
     skill = _read(SKILL_FIXTURE)
-    soul_match = required_phrase.lower() in soul.lower()
-    skill_match = required_phrase.lower() in skill.lower()
-    # If the first param fails, surface a clear diff for SOUL and SKILL.
+    soul_match = any(phrase.lower() in soul.lower() for phrase in deny_phrases)
+    skill_match = any(phrase.lower() in skill.lower() for phrase in deny_phrases)
     assert soul_match, (
-        f"SOUL.md apply section missing deny phrase {required_phrase!r}. "
-        "Add 'never submit' or 'without an explicit confirmation' to the "
-        f"apply context.\n--- SOUL apply section ---\n{soul}\n---"
+        "SOUL.md apply section missing both deny phrases. Add 'never submit' "
+        f"or 'without an explicit confirmation' to the apply context.\n"
+        f"--- SOUL apply section ---\n{soul}\n---"
     )
     assert skill_match, (
-        f"SKILL.md missing deny phrase {required_phrase!r}. Add 'never submit' "
-        "or 'without an explicit confirmation'.\n--- SKILL.md ---\n" + skill
+        "SKILL.md missing both deny phrases. Add 'never submit' or "
+        "'without an explicit confirmation'.\n--- SKILL.md ---\n" + skill
     )
 
 
