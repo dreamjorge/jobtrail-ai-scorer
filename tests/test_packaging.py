@@ -23,7 +23,7 @@ def test_distribution_metadata_and_runtime_files_exist():
 def test_runtime_automation_examples_are_packaged():
     scripts = [
         ROOT / "scripts/hermes-docker-wrapper.example.sh",
-        ROOT / "scripts/run-scorer.example.sh",
+        ROOT / "scripts/legacy/run-scorer.example.sh",
         ROOT / "scripts/notify-whatsapp-via-hermes.example.sh",
     ]
     for script in scripts:
@@ -52,7 +52,7 @@ def test_hermes_docker_wrapper_uses_safe_configurable_exec():
 
 
 def test_run_scorer_example_uses_safe_configurable_runner():
-    script = (ROOT / "scripts/run-scorer.example.sh").read_text()
+    script = (ROOT / "scripts/legacy/run-scorer.example.sh").read_text()
 
     assert "set -euo pipefail" in script
     assert 'SCORER_CONFIG_PATH must be set' in script
@@ -107,7 +107,7 @@ def test_run_scorer_example_uses_safe_configurable_runner():
 )
 def test_run_scorer_example_preserves_scorer_exit_code(dry_run, expected_args, tmp_path):
     runner = tmp_path / "run-scorer.example.sh"
-    shutil.copy2(ROOT / "scripts/run-scorer.example.sh", runner)
+    shutil.copy2(ROOT / "scripts/legacy/run-scorer.example.sh", runner)
     runner.chmod(runner.stat().st_mode | stat.S_IXUSR)
 
     config = tmp_path / "config.toml"
@@ -153,7 +153,7 @@ def test_run_scorer_example_preserves_scorer_exit_code(dry_run, expected_args, t
 
 def test_run_scorer_example_uses_configured_scorer_command_without_path_fallback(tmp_path):
     runner = tmp_path / "run-scorer.example.sh"
-    shutil.copy2(ROOT / "scripts/run-scorer.example.sh", runner)
+    shutil.copy2(ROOT / "scripts/legacy/run-scorer.example.sh", runner)
     runner.chmod(runner.stat().st_mode | stat.S_IXUSR)
 
     config = tmp_path / "config.toml"
@@ -213,7 +213,7 @@ def test_run_scorer_example_uses_configured_scorer_command_without_path_fallback
 
 def test_run_scorer_example_rejects_invalid_dry_run_without_invoking_scorer(tmp_path):
     runner = tmp_path / "run-scorer.example.sh"
-    shutil.copy2(ROOT / "scripts/run-scorer.example.sh", runner)
+    shutil.copy2(ROOT / "scripts/legacy/run-scorer.example.sh", runner)
     runner.chmod(runner.stat().st_mode | stat.S_IXUSR)
 
     config = tmp_path / "config.toml"
@@ -257,7 +257,7 @@ def test_run_scorer_example_rejects_invalid_dry_run_without_invoking_scorer(tmp_
 
 def test_run_scorer_example_zero_invokes_scorer_without_dry_run(tmp_path):
     runner = tmp_path / "run-scorer.example.sh"
-    shutil.copy2(ROOT / "scripts/run-scorer.example.sh", runner)
+    shutil.copy2(ROOT / "scripts/legacy/run-scorer.example.sh", runner)
     runner.chmod(runner.stat().st_mode | stat.S_IXUSR)
 
     config = tmp_path / "config.toml"
@@ -304,7 +304,7 @@ def test_run_scorer_example_zero_invokes_scorer_without_dry_run(tmp_path):
 
 
 def test_run_scorer_example_captures_pipeline_status_immediately():
-    lines = (ROOT / "scripts/run-scorer.example.sh").read_text().splitlines()
+    lines = (ROOT / "scripts/legacy/run-scorer.example.sh").read_text().splitlines()
     pipeline_lines = [
         index
         for index, line in enumerate(lines)

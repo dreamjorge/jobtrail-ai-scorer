@@ -10,6 +10,14 @@ Set `WHATSAPP_NOTIFY_COMMAND=./notify-whatsapp-via-hermes.local.sh` (the helper 
 
 Use these examples to run JobTrail AI Scorer from a local scheduler while keeping private runtime files out of the repository. Copy the example files, edit only local ignored copies, and dry-run first before allowing writes to JobTrail notes.
 
+> **Deprecation note.** The historical dry-run wrappers
+> `scripts/run-scorer.example.sh` and `scripts/hermes-score-jobs.sh` have been
+> moved under [`scripts/legacy/`](scripts/legacy/README.md) with a
+> `DEPRECATED` header. Do not use them in production; the canonical real-path
+> flow is `scripts/automated-job-search.example.py`. See
+> [`scripts/legacy/README.md`](scripts/legacy/README.md) for the replacement
+> mapping and target removal date.
+
 ## Backend URL resolution
 
 The systemd service must reach the JobTrail backend. Instead of baking a private
@@ -69,7 +77,7 @@ The automation launcher skips offers whose `(source, sourceJobId)` pair was
 already imported within the configured TTL window. The cache lives outside the
 repository in a JSON file with `0600` permissions:
 
-- Default path: `/DATA/AppData/jobtrail/logs/automated-job-search/seen.json`.
+- Default path: `<runtime-root>/jobtrail/logs/automated-job-search/seen.json`.
 - Override with `JOBTRAIL_SEEN_CACHE_PATH=/absolute/path/to/seen.json`.
 - TTL: `max(now - first_seen, hours_old * 2)`; entries older than
   `2 * JOB_SEARCH_HOURS_OLD` hours are considered expired and will be
@@ -226,15 +234,66 @@ docker compose -f compose.hub.yml -f compose.override.yml logs --tail=100 jobtra
 ## Copy the example files
 
 ```sh
-cp config.example.yaml config.yaml
+cp scripts/scorer-config.example.yaml config.yaml
 cp candidate-profile.example.md candidate-profile.md
 cp scripts/hermes-docker-wrapper.example.sh ./hermes-docker-wrapper.local.sh
-cp scripts/run-scorer.example.sh ./run-scorer.local.sh
+cp scripts/automated-job-search.example.py ./automated-job-search.local.py
 cp scripts/notify-whatsapp-via-hermes.example.sh ./notify-whatsapp-via-hermes.local.sh
-chmod +x ./hermes-docker-wrapper.local.sh ./run-scorer.local.sh ./notify-whatsapp-via-hermes.local.sh
+chmod +x ./hermes-docker-wrapper.local.sh ./automated-job-search.local.py ./notify-whatsapp-via-hermes.local.sh
 ```
 
+`scripts/run-scorer.example.sh` no longer exists at that path; it moved to
+[`scripts/legacy/run-scorer.example.sh`](scripts/legacy/README.md) and is
+deprecated in favor of `scripts/automated-job-search.example.py` above (see
+the deprecation note at the top of this document).
+
 Edit the copied files or environment variables for your host. Keep public/example values in committed examples; put real local paths, profile text, and credentials only in ignored local files or environment variables.
+
+## Canonical example layout and purge helper
+
+The repo ships a single canonical config example at
+`scripts/scorer-config.example.yaml`. The repo-root `config.example.yaml` is a
+thin pointer to that file; do not duplicate the YAML settings between them. A
+leak-detector test (`tests/test_example_redaction.py`) scans every committed
+example and template for private IPv4 ranges (`10.x`, `172.16-31.x`,
+`192.168.x`), private runtime path fragments, and credential prefixes
+(`sk-…`, `ghp_…`, `gho_…`, `github_pat_…`, `xox[abprs]-…`) and fails CI on any
+regression. A historical duplicate of the example lived at
+`<runtime-root>/jobtrail/scorer.config.example.yaml` and contained an embedded
+private IP. Remove it with the strict opt-in helper:
+
+```sh
+python3 scripts/_purge_runtime_example.py \
+    --runtime-example "<runtime-root>/jobtrail/scorer.config.example.yaml" \
+    --yes
+```
+
+Safety properties of `scripts/_purge_runtime_example.py`:
+
+- Refuses to act without `--yes` (the script never deletes anything by accident).
+- Refuses any target whose basename is not exactly
+  `scorer.config.example.yaml` (so a typo cannot delete a CV, profile, or
+  unrelated config).
+- Requires an absolute path (relative paths cannot accidentally point at
+  `config.yaml` in the current working directory).
+- Refuses symlinks, directories, and missing files (the script never follows
+  links or walks directories).
+- Uses `os.remove` on the explicit file only — no shell-out, no recursive
+  delete, no globbing.
+
+Run the helper without `--yes` to see the refusal without touching the
+filesystem:
+
+```sh
+python3 scripts/_purge_runtime_example.py \
+    --runtime-example "<runtime-root>/jobtrail/scorer.config.example.yaml"
+# refusing to remove … without --yes; pass --yes to confirm.
+```
+
+The helper is exercised end-to-end by `tests/test_runtime_layout.py`, which
+asserts all of the safety properties above against a temporary file so the
+tests never touch operator data.
+
 
 ## Local config example
 
@@ -296,6 +355,14 @@ Configure `HERMES_CONTAINER` and `HERMES_BIN` in the scheduler environment if yo
 
 ## Runner usage
 
+> **Deprecated.** The `run-scorer.example.sh` runner was moved under
+> [`scripts/legacy/`](scripts/legacy/README.md) in Issue #8 and is kept only
+> as a historical reference. New scheduler units must drive
+> `scripts/automated-job-search.example.py` directly. The guidance below is
+> retained verbatim so existing operators can keep their local `run-scorer.local.sh`
+> copies running until they migrate; the wrapper itself is marked
+> `DEPRECATED` and will be removed.
+
 Start with dry-run mode:
 
 ```sh
@@ -342,7 +409,7 @@ Send summaries only. Do not include raw prompts, candidate profile content, job 
 
 ## Hermes runtime policy guardrail (CI)
 
-The runtime SOUL.md and `skills/jobtrail-automation/SKILL.md` live in the operator's local Hermes profile (for example under `/DATA/AppData/hermes/profiles/job-search/`) and must NOT be committed to this repository. To keep the apply-gate contract reviewable, the repository ships CI-only fixture mocks under `tests/fixtures/hermes/` and a guardrail test suite (`tests/test_runtime_policy.py`) that runs on every PR and on a daily cron via `.github/workflows/policy.yml`.
+The runtime SOUL.md and `skills/jobtrail-automation/SKILL.md` live in the operator's local Hermes profile (for example under `<runtime-root>/hermes/profiles/job-search/`) and must NOT be committed to this repository. To keep the apply-gate contract reviewable, the repository ships CI-only fixture mocks under `tests/fixtures/hermes/` and a guardrail test suite (`tests/test_runtime_policy.py`) that runs on every PR and on a daily cron via `.github/workflows/policy.yml`.
 
 The fixtures assert three rules and any drift fails CI with a focused diff:
 
@@ -350,7 +417,7 @@ The fixtures assert three rules and any drift fails CI with a focused diff:
 - `SKILL.md` contains the literal phrase `explicit confirmation`.
 - Both files include either `never submit` or `without an explicit confirmation` in the apply section.
 
-The fixtures must remain minimal contract mocks. They must NEVER embed runtime paths (`/DATA/...`, `/AppData/...`), private CV/profile content, credentials, or any operator-only data. The leak guard (`test_fixtures_do_not_leak_runtime_data`) fails CI if such content sneaks in.
+The fixtures must remain minimal contract mocks. They must NEVER embed private runtime paths, runtime path fragments that look like them, private CV/profile content, credentials, or any operator-only data. The leak guard (`test_fixtures_do_not_leak_runtime_data`) fails CI if such content sneaks in.
 
 When the runtime SOUL/SKILL evolve locally, mirror the required phrases into the fixture files in the same PR so the policy contract stays auditable. The fixtures never need to mirror the full runtime content — only the apply-gate phrases and any new apply-section heading structure the guardrail needs.
 

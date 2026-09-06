@@ -3,5 +3,5 @@ services:
     build: .
     command: ["score", "--config", "/config/config.yaml"]
     volumes:
-      - ${SCORER_CONFIG_PATH:-./config.example.yaml}:/config/config.yaml:ro
+      - ${SCORER_CONFIG_PATH:-./scripts/scorer-config.example.yaml}:/config/config.yaml:ro
       - ${SCORER_PROFILE_PATH:-./candidate-profile.example.md}:/app/candidate-profile.example.md:ro
