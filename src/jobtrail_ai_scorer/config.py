@@ -12,6 +12,7 @@ class AppConfig(BaseModel):
 
     jobtrail_base_url: AnyHttpUrl
     candidate_profile_path: Path
+    candidate_cv_path: Path | None = None
     provider: Literal["hermes", "openai_compatible"] = "hermes"
     hermes_executable: str = "hermes"
     hermes_profile: str = "default"

@@ -32,6 +32,21 @@ def test_app_config_trims_surrounding_marker_whitespace():
     assert config.marker == "[CUSTOM]"
 
 
+def test_load_config_preserves_candidate_cv_path(tmp_path):
+    config_path = tmp_path / "config.yaml"
+    profile_path = tmp_path / "profile.md"
+    cv_path = tmp_path / "cv.md"
+    config_path.write_text(
+        f"jobtrail_base_url: https://jobs.test\n"
+        f"candidate_profile_path: {profile_path}\n"
+        f"candidate_cv_path: {cv_path}\n"
+    )
+
+    config = load_config(config_path)
+
+    assert config.candidate_cv_path == cv_path
+
+
 def test_load_config_preserves_hermes_provider_settings(tmp_path):
     config_path = tmp_path / "config.yaml"
     profile_path = tmp_path / "profile.md"
