@@ -329,12 +329,15 @@ def test_redaction_strips_forbidden_tokens_from_notification(server, state):
     # substrings in the strengths/gaps arrays. The orchestrator overwrites
     # any pre-seeded notes with the scorer output, so the redaction test
     # must exercise the path through the scorer stub.
+    # Cover all four FORBIDDEN_TOKENS sentinels (see notify.py), not just two:
+    # a redaction regression that only breaks PROFILE_SENTINEL or
+    # CREDENTIAL_SENTINEL handling must fail this end-to-end test too.
     scorer = StubScorer(
         state,
         default_score=92,
         recommendation="PRIORITY_APPLY",
-        strengths=["PROMPT_SENTINEL exposed", "good"],
-        gaps=["RESUME_SENTINEL exposed"],
+        strengths=["PROMPT_SENTINEL exposed", "PROFILE_SENTINEL exposed", "good"],
+        gaps=["RESUME_SENTINEL exposed", "CREDENTIAL_SENTINEL exposed"],
     )
     whatsapp = StubWhatsApp()
 

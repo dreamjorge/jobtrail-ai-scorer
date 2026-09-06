@@ -171,16 +171,24 @@ def _validate(target: Path, current: Path) -> None:
         raise RuntimeBackupError(
             f"refusing to replace {target}: it exists and is not a directory."
         )
-    if current == target:
+    # Resolve (normalize ``..`` and follow any symlinked parent directory)
+    # before the containment checks below: comparing raw, unresolved
+    # ``Path.parents`` lets a ``..`` segment or a symlinked ancestor dir
+    # disguise a source nested in the target (or vice versa), which would
+    # make the final ``shutil.move`` below clobber part of its own source
+    # tree and leave the target directory missing.
+    resolved_current = current.resolve(strict=False)
+    resolved_target = target.resolve(strict=False)
+    if resolved_current == resolved_target:
         raise RuntimeBackupError(
             f"refusing to overwrite the active install with itself: {target}"
         )
-    if _is_within(current, target):
+    if _is_within(resolved_current, resolved_target):
         raise RuntimeBackupError(
             f"refusing to rotate {current}: it lives inside the active install "
             f"{target}."
         )
-    if _is_within(target, current):
+    if _is_within(resolved_target, resolved_current):
         raise RuntimeBackupError(
             f"refusing to rotate {current}: the active install {target} lives "
             "inside the staged tree."
@@ -248,15 +256,6 @@ def rotate(
         # tree is left for the caller to clean up; this helper never deletes it.
         return STATUS_IDENTICAL
 
-    # A staged tree already represented by the retained backup needs no
-    # rotation. Leave both the active and staged trees untouched.
-    if (
-        previous.is_dir()
-        and not previous.is_symlink()
-        and current_digest == tree_digest(previous)
-    ):
-        return STATUS_IDENTICAL
-
     keeps_previous = (
         previous.is_dir()
         and not previous.is_symlink()
@@ -311,6 +310,13 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
+    # Both flags are documented as absolute paths (see --target/--current
+    # help above); a relative path would make the rotation depend on the
+    # invoker's cwd, which is never intentional for a runtime install path.
+    for flag, value in (("--target", args.target), ("--current", args.current)):
+        if not Path(value).is_absolute():
+            print(f"{flag} must be an absolute path: {value}", file=sys.stderr)
+            return 2
     try:
         status = rotate(args.target, args.current, dry_run=args.dry_run)
     except RuntimeBackupError as error:

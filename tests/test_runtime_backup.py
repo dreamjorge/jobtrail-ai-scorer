@@ -209,6 +209,34 @@ def test_rotate_refuses_to_overwrite_identical_previous(
     )
 
 
+def test_rotate_replaces_target_when_staged_matches_only_previous(
+    runtime_backup, tmp_path: Path
+) -> None:
+    """Staged bytes matching the old ``.previous`` must still rotate.
+
+    The staged tree can legitimately match an *older* ``.previous`` backup
+    while the *active* tree already differs (someone rotated forward and is
+    now rotating back, or the same content was staged twice). ``rotate``'s
+    contract is to make ``current_dir`` become ``target_dir`` regardless;
+    reporting ``identical`` here would leave the (different) active tree in
+    place and silently drop the staged content.
+    """
+
+    target = _make_tree(tmp_path / TARGET_NAME, {"pkg/__init__.py": "x = 2\n"})
+    _make_tree(tmp_path / PREVIOUS_NAME, {"pkg/__init__.py": "x = 1\n"})
+    staged = _make_tree(tmp_path / "staged", {"pkg/__init__.py": "x = 1\n"})
+
+    status = runtime_backup.rotate(target, staged)
+
+    assert status == runtime_backup.STATUS_ROTATED, (
+        "staged content matching only the retained backup (not the active "
+        f"tree) must still rotate; got {status!r}"
+    )
+    assert (target / "pkg" / "__init__.py").read_text(encoding="utf-8") == "x = 1\n", (
+        "the staged content must become the active install"
+    )
+
+
 def test_rotate_installs_when_target_missing(runtime_backup, tmp_path: Path) -> None:
     target = tmp_path / TARGET_NAME
     staged = _make_tree(tmp_path / "staged", {"pkg/__init__.py": "x = 1\n"})
@@ -241,6 +269,25 @@ def test_rotate_refuses_to_overwrite_active(runtime_backup, tmp_path: Path) -> N
     assert not (tmp_path / PREVIOUS_NAME).exists(), (
         "a refused rotation must not create a backup"
     )
+
+
+def test_rotate_refuses_dotdot_disguised_nesting(runtime_backup, tmp_path: Path) -> None:
+    """A ``..``-laden path must not bypass the nested-source/target check.
+
+    Comparing raw ``Path.parents`` (without resolving ``..``) would let a
+    source path like ``<target>/../<target-name>/staged`` slip past the
+    literal containment check while still landing inside the active install
+    after normalization, corrupting the final ``shutil.move``.
+    """
+
+    target = _make_tree(tmp_path / TARGET_NAME, {"pkg/__init__.py": "x = 1\n"})
+    nested = _make_tree(target / "staged", {"pkg/__init__.py": "x = 9\n"})
+    disguised = target.parent / ".." / target.parent.name / TARGET_NAME / "staged"
+
+    with pytest.raises(runtime_backup.RuntimeBackupError):
+        runtime_backup.rotate(target, disguised)
+
+    assert nested.exists(), "a refused rotation must leave the staged tree intact"
 
 
 def test_rotate_refuses_previous_as_target(runtime_backup, tmp_path: Path) -> None:
@@ -357,3 +404,30 @@ def test_cli_reports_status_without_mutating_in_dry_run(tmp_path: Path) -> None:
     assert _snapshot(target) == before
     assert staged.is_dir()
     assert not (tmp_path / PREVIOUS_NAME).exists()
+
+
+def test_cli_refuses_relative_paths(tmp_path: Path) -> None:
+    """--target/--current are documented as absolute; a relative path must
+    be refused instead of silently depending on the invoker's cwd."""
+
+    _make_tree(tmp_path / TARGET_NAME, {"pkg/__init__.py": "x = 1\n"})
+    _make_tree(tmp_path / "staged", {"pkg/__init__.py": "x = 2\n"})
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(RUNTIME_BACKUP),
+            "--target",
+            TARGET_NAME,
+            "--current",
+            "staged",
+            "--dry-run",
+        ],
+        cwd=os.fspath(tmp_path),
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert result.returncode != 0, "a relative --target/--current must be refused"
+    assert "absolute" in result.stderr.lower()
