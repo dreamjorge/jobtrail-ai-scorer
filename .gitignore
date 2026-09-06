@@ -2,6 +2,7 @@
 config.yaml
 *.local.yaml
 candidate-profile.md
+candidate-cv.md
 __pycache__/
 .pytest_cache/
 *.egg-info/

@@ -2,6 +2,6 @@
 jobtrail_base_url: http://localhost:3000
 candidate_profile_path: ./candidate-profile.example.md
 # Optional private CV; keep this file outside version control.
-candidate_cv_path: ./candidate-cv.md
+# candidate_cv_path: ./candidate-cv.md
 provider: hermes
 marker: "[AI_JOB_SCORE_V1]"

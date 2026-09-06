@@ -211,7 +211,10 @@ class JobTrailAutomation:
             except Exception:
                 failures.append(f"read:{job_id}")
         if best is not None and config.notify_enabled:
-            self.notifier(json.dumps(build_notification_summary(best_job, best_score), ensure_ascii=False, sort_keys=True))
+            try:
+                self.notifier(json.dumps(build_notification_summary(best_job, best_score), ensure_ascii=False, sort_keys=True))
+            except Exception:
+                failures.append("notify")
         return AutomationRun(searched, imported, scored, tuple(failures), best)
 
 
