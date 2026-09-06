@@ -89,6 +89,63 @@ the run summary as `seen-cache:check:<reason>` or `seen-cache:write:<reason>`.
 The cache is always consulted before `POST /api/discover/import`; the backend
 never sees offers that the cache reports as already-seen within the TTL.
 
+## Bounded retries with backoff
+
+Idempotent network calls (`/api/discover/search`, `/api/discover/import`,
+`GET /api/jobs/...`, and the local scorer subprocess) are wrapped in a
+bounded retry helper (`jobtrail_ai_scorer.retry`). Retries are skipped for
+operations that could produce duplicate side effects (`POST /api/jobs/.../notes`).
+
+The retry helper uses an exponential schedule with a hard cap:
+
+- Default policy: `max_attempts=3`, `base_delay=0.5s`, `max_delay=8.0s`.
+- The delay is `min(base_delay * 2 ** attempt_index, max_delay)` so backoff
+  stays bounded even for long-running transient outages.
+- `jitter=False` by default. Enable it per-client when de-correlating parallel
+  runs.
+
+### Retry classification
+
+The helper classifies each exception before deciding whether to retry:
+
+- **Retryable (retried):** HTTP `5xx`, network/timeout failures,
+  `CalledProcessError` from the scorer subprocess. The previous attempt's
+  delay is logged with the structured prefix `retry:` so operators can grep
+  the journal.
+- **Exhausted:** every retry attempt failed; the helper re-raises the last
+  exception with `retry_metadata={"attempts": N, "classification": "exhausted"}`.
+  The orchestration records it on `AutomationRun.failures` as
+  `<stage>[:<job_id>]:exhausted:<ExceptionType>`.
+- **Terminal (no retry):** HTTP `4xx`, `ValueError`, `KeyError`,
+  `FileNotFoundError`, `PermissionError`. The orchestration records it as
+  `<stage>[:<job_id>]:terminal:<ExceptionType>`.
+
+### Partial-success reporting
+
+`AutomationRun.failures` carries the classification for every stage
+(`search`, `import`, `score:<job_id>`, `read:<job_id>`, `seen-cache:...`).
+Operators can grep the summary for `:retryable`, `:exhausted`, or `:terminal`
+to distinguish transient blips from persistent failures. The summary never
+includes exception messages, descriptions, profiles, prompts, or credentials.
+
+### WHATSAPP_NOTIFY_ON_FAILURE opt-in
+
+`WHATSAPP_NOTIFY_ON_FAILURE=1` (or `true`/`yes`/`on`) appends a bounded
+failure summary to the WhatsApp helper message when the run finishes with at
+least one failure. It is independent of `WHATSAPP_NOTIFY_ENABLED`:
+
+- `notify_enabled=False`, `notify_on_failure=True`: a failure summary is sent
+  only when failures were recorded.
+- `notify_enabled=True`, `notify_on_failure=False`: the existing best-match
+  notification is sent when a match is selected (unchanged behavior).
+- `notify_enabled=True`, `notify_on_failure=True`: when both apply, the
+  failure summary is appended on a separate line after the best-match JSON so
+  the match payload stays diff-friendly.
+
+The summary exposes only the failure count and the first five abstract labels.
+It never includes descriptions, profiles, prompts, notes, credentials, or
+secrets. Default is off; opt in explicitly.
+
 ## Safety rules
 
 - **Dry-run first:** keep `SCORER_DRY_RUN=1` until the config, JobTrail connection, provider, and logs look correct.
