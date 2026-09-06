@@ -21,3 +21,6 @@ jobtrail-ai-scorer = "jobtrail_ai_scorer.main:app"
 pythonpath = ["src"]
 testpaths = ["tests"]
 addopts = ["-ra", "--strict-markers"]
+markers = [
+  "e2e: hermetic end-to-end tests for the JobTrailAutomation pipeline (no Docker, no systemd, no real network)",
+]

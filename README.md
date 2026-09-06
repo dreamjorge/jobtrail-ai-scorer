@@ -108,6 +108,29 @@ descriptions, profiles, CVs, raw prompts, reasoning, notes, credentials, or secr
 built from `JOBTRAIL_BASE_URL` plus `/jobs/<id>` and can be optionally rewritten through `WHATSAPP_SHORT_URL_BASE`.
 See [Runtime automation](docs/runtime-automation.md) for the full field contract and the optional shortener.
 
+## Hermetic end-to-end tests
+
+The repository ships an in-process end-to-end suite at
+`tests/test_automation_e2e.py` that exercises the full `search → import →
+score → notify` pipeline through the real `JobTrailAutomation.run`
+orchestration code. No Docker, systemd, or real HTTP is required:
+`tests/stubs/` provides an in-process `http.server` JobTrail backend,
+a fake scorer provider, and a WhatsApp buffer that captures the
+rendered message. Run it with:
+
+```sh
+python -m pytest tests/test_automation_e2e.py -v
+# or via the registered marker:
+python -m pytest -m e2e -v
+```
+
+The suite asserts the five invariant contracts required by Issue #11
+(happy path, dedup-skip-second-search, partial failure, redaction,
+single notification) plus a triangulation test that verifies the
+`GET /api/jobs/<id>` read-back path. See
+[Runtime automation](docs/runtime-automation.md#hermetic-end-to-end-tests)
+for the full contract.
+
 ## Runtime policy guardrail
 
 The runtime `SOUL.md` and `skills/jobtrail-automation/SKILL.md` are Hermes profile files that live outside this repository. To enforce the apply-gate contract in CI, the repository ships minimal fixture mocks under `tests/fixtures/hermes/`. The guardrail (`tests/test_runtime_policy.py`, run by `.github/workflows/policy.yml` on every PR and daily at 06:00 UTC) asserts:
