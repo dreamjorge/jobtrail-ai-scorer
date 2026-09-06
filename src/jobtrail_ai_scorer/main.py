@@ -79,12 +79,16 @@ def run_score(*, config_path: Path, limit: int | None = None, job_id: str | None
         result = score_jobs(client, provider, profile, job_id=job_id, limit=limit,
                             force=force, dry_run=dry_run, marker=marker or config.marker,
                             emit_status=False)
+        # Must run before the client closes below: with --job-id this samples
+        # the live job via client.get_job, and a closed client makes that
+        # call fail silently, falling back to a tiny stub payload that
+        # undercounts the estimate and can hide a genuinely oversized prompt.
+        _emit_prompt_tokens_estimate(client, profile_only=profile_only, cv=cv,
+                                      job_id=job_id)
     finally:
         close = getattr(client, "close", None)
         if close:
             close()
-    _emit_prompt_tokens_estimate(client, profile_only=profile_only, cv=cv,
-                                  job_id=job_id)
     for outcome in result.outcomes:
         if outcome.status == "skipped":
             typer.echo(f"SKIP {outcome.job_id}: {outcome.reason}")

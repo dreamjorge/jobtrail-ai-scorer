@@ -97,10 +97,13 @@ class SeenCache:
 
         key = self._key(source, source_job_id)
         current = self._current_time(now)
-        # Preserve the original first_seen timestamp; never extend TTL on re-mark.
-        if key not in self._entries:
-            self._entries[key] = {"first_seen": current}
-            self.save()
+        # ``mark_seen`` is only called after ``should_skip`` returned False,
+        # i.e. the pair is either new or its TTL already expired. Refresh
+        # ``first_seen`` unconditionally so an expired entry starts a new TTL
+        # window instead of staying permanently expired (which would make the
+        # offer get reimported/rescored on every subsequent run forever).
+        self._entries[key] = {"first_seen": current}
+        self.save()
 
     def reset(self) -> None:
         """Clear every entry from the cache and persist the empty state."""
@@ -162,7 +165,9 @@ class SeenCache:
 
     def _tmp_path(self, path: Path) -> Path:
         suffix = path.suffix or ".json"
-        return path.with_name(f"{path.stem}.tmp{suffix}")
+        # Unique per writer (pid + object id) so concurrent/overlapping runs
+        # never share the same tmp file and interleave writes.
+        return path.with_name(f"{path.stem}.tmp.{os.getpid()}.{id(self)}{suffix}")
 
     def _enforce_mode(self, path: Path) -> None:
         try:
