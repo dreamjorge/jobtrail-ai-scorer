@@ -16,6 +16,7 @@ from jobtrail_ai_scorer.automation import (
     resolve_automation_base_url,
     search_payloads,
 )
+from jobtrail_ai_scorer.seen_cache import SeenCache
 
 
 class FakeJobTrail:
@@ -445,3 +446,126 @@ def test_automation_from_env_reads_discover_container():
 def test_automation_from_env_defaults_discover_container_to_none():
     config = AutomationConfig.from_env({})
     assert config.discover_container is None
+
+
+# --- Seen-cache integration --------------------------------------------------
+
+
+class _CacheClock:
+    def __init__(self, t: float = 0.0) -> None:
+        self.t = t
+
+    def __call__(self) -> float:
+        return self.t
+
+
+def test_automation_skips_offers_already_in_seen_cache(tmp_path):
+    cache = SeenCache(tmp_path / "seen.json", clock=_CacheClock(1_000.0))
+    # Pre-seed the cache with the offer FakeJobTrail will return.
+    cache.mark_seen("indeed", "source-1")
+    gateway = FakeJobTrail()
+    scorer = FakeScorer()
+    scorer.jobs = gateway.jobs
+
+    result = JobSearchAutomation(gateway, scorer=scorer, seen_cache=cache).run(
+        config=AutomationConfig(
+            scorer_config_path="safe/config.yaml",
+            hours_old=72,
+            results_wanted=10,
+            locations=("Queretaro",),
+        )
+    )
+
+    assert gateway.imported == []
+    assert result.imported == 0
+    assert result.scored == 0
+    assert result.searched == 1  # search still runs; cache filters at import time
+
+
+def test_automation_records_imported_offers_in_seen_cache(tmp_path):
+    cache = SeenCache(tmp_path / "seen.json", clock=_CacheClock(1_000.0))
+    gateway = FakeJobTrail()
+    scorer = FakeScorer()
+    scorer.jobs = gateway.jobs
+
+    result = JobSearchAutomation(gateway, scorer=scorer, seen_cache=cache).run(
+        config=AutomationConfig(scorer_config_path="safe/config.yaml", hours_old=72)
+    )
+
+    assert result.imported == 1
+    # Cache now contains the (source, sourceJobId) pair.
+    assert cache.should_skip("indeed", "source-1", hours_old=72) is True
+    # Reloading from disk confirms the entry was persisted.
+    reloaded = SeenCache(tmp_path / "seen.json", clock=_CacheClock(1_010.0))
+    assert reloaded.should_skip("indeed", "source-1", hours_old=72) is True
+
+
+def test_automation_continues_run_when_seen_cache_load_fails(tmp_path, monkeypatch):
+    """A broken cache file must never crash the automation run."""
+
+    cache_path = tmp_path / "seen.json"
+    cache_path.write_text("{not json", encoding="utf-8")
+    cache = SeenCache(cache_path, clock=_CacheClock(1_000.0))
+    assert cache.size == 0  # degraded to empty
+
+    # Force mark_seen to fail and ensure the run still completes.
+    def _boom_save(*_args, **_kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(cache, "save", _boom_save)
+
+    gateway = FakeJobTrail()
+    scorer = FakeScorer()
+    scorer.jobs = gateway.jobs
+
+    result = JobSearchAutomation(gateway, scorer=scorer, seen_cache=cache).run(
+        config=AutomationConfig(
+            scorer_config_path="safe/config.yaml",
+            hours_old=72,
+            locations=("Queretaro",),
+        )
+    )
+
+    # Import still happened (search was not blocked), and the run reported
+    # a seen-cache failure without aborting.
+    assert result.searched == 1
+    assert any(failure.startswith("seen-cache:") for failure in result.failures)
+
+
+def test_automation_without_seen_cache_keeps_legacy_behavior():
+    """The seen_cache argument must be optional to preserve existing callers."""
+
+    gateway = FakeJobTrail()
+    scorer = FakeScorer()
+    scorer.jobs = gateway.jobs
+
+    result = JobSearchAutomation(gateway, scorer=scorer).run(
+        config=AutomationConfig(scorer_config_path="safe/config.yaml")
+    )
+
+    assert result.imported == 1
+    assert result.scored == 1
+
+
+def test_automation_seen_cache_uses_hours_old_for_ttl(tmp_path):
+    """The TTL passed to the cache must follow the AutomationConfig.hours_old value."""
+
+    clock = _CacheClock(1_000.0)
+    cache = SeenCache(tmp_path / "seen.json", clock=clock)
+    gateway = FakeJobTrail()
+    scorer = FakeScorer()
+    scorer.jobs = gateway.jobs
+
+    JobSearchAutomation(gateway, scorer=scorer, seen_cache=cache).run(
+        config=AutomationConfig(scorer_config_path="safe/config.yaml", hours_old=24)
+    )
+
+    # At the same instant, hours_old=24 (TTL=48h) keeps it skipped.
+    assert cache.should_skip("indeed", "source-1", hours_old=24) is True
+    # hours_old=72 (TTL=144h) also keeps it skipped at the same instant.
+    assert cache.should_skip("indeed", "source-1", hours_old=72) is True
+
+    # Move past the 48h TTL: hours_old=24 must report a miss while 72 reports a hit.
+    clock.t = 1_000.0 + 49 * 3600
+    assert cache.should_skip("indeed", "source-1", hours_old=24) is False
+    assert cache.should_skip("indeed", "source-1", hours_old=72) is True

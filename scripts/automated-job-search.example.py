@@ -17,6 +17,7 @@ discovery and uses the URL verbatim (highest priority).
 """
 
 import argparse
+import os
 import sys
 
 from jobtrail_ai_scorer.automation import (
@@ -28,6 +29,46 @@ from jobtrail_ai_scorer.automation import (
     merge_resolved_base_url,
     resolve_automation_base_url,
 )
+from jobtrail_ai_scorer.seen_cache import DEFAULT_SEEN_CACHE_PATH, SeenCache
+
+
+_TRUTHY = {"1", "true", "yes", "on"}
+
+
+def _resolve_reset_request(args: argparse.Namespace) -> bool:
+    """Return True if the operator asked to reset the seen cache.
+
+    Honors both the explicit CLI flag and the JOBTRAIL_RESET_SEEN_CACHE env var.
+    """
+
+    if getattr(args, "reset_seen_cache", False):
+        return True
+    return os.environ.get("JOBTRAIL_RESET_SEEN_CACHE", "").strip().lower() in _TRUTHY
+
+
+def _build_seen_cache(args: argparse.Namespace) -> SeenCache | None:
+    """Construct the seen cache honoring reset/bypass requests.
+
+    The cache is always constructed from the operator-controlled path so the
+    cache state is observable on disk. The launcher swallows any construction
+    failure so a missing runtime directory never aborts the run; the run
+    proceeds without deduplication and a warning is emitted on stderr.
+    """
+
+    override = os.environ.get("JOBTRAIL_SEEN_CACHE_PATH", "").strip()
+    cache_path = override or DEFAULT_SEEN_CACHE_PATH
+    try:
+        cache = SeenCache(cache_path)
+    except Exception as exc:  # pragma: no cover - defensive guard
+        print(f"seen cache unavailable at {cache_path}: {exc}", file=sys.stderr)
+        return None
+    if _resolve_reset_request(args):
+        try:
+            cache.reset()
+            print(f"seen cache reset at {cache.path}", file=sys.stderr)
+        except Exception as exc:
+            print(f"seen cache reset failed at {cache.path}: {exc}", file=sys.stderr)
+    return cache
 
 
 def main() -> int:
@@ -57,6 +98,14 @@ def main() -> int:
         "--no-discover",
         action="store_true",
         help="Use JOBTRAIL_BASE_URL without probing the published port or Docker container",
+    )
+    parser.add_argument(
+        "--reset-seen-cache",
+        action="store_true",
+        help=(
+            "Clear the seen cache before this run so every offer is "
+            "re-imported (also set by JOBTRAIL_RESET_SEEN_CACHE=1)."
+        ),
     )
     args = parser.parse_args()
     config = AutomationConfig.from_env()
@@ -98,8 +147,11 @@ def main() -> int:
     config = merge_resolved_base_url(config, base_url)
 
     gateway = JobTrailHTTPClient(config.base_url)
+    seen_cache = _build_seen_cache(args)
     try:
-        result = JobSearchAutomation(gateway).run(config=config)
+        result = JobSearchAutomation(gateway, seen_cache=seen_cache).run(
+            config=config
+        )
     finally:
         gateway.close()
     print(

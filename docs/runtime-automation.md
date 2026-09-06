@@ -61,6 +61,34 @@ do not need to change. Either:
   the unit definition.
 
 
+## Pre-import deduplication (seen cache)
+
+The automation launcher skips offers whose `(source, sourceJobId)` pair was
+already imported within the configured TTL window. The cache lives outside the
+repository in a JSON file with `0600` permissions:
+
+- Default path: `/DATA/AppData/jobtrail/logs/automated-job-search/seen.json`.
+- Override with `JOBTRAIL_SEEN_CACHE_PATH=/absolute/path/to/seen.json`.
+- TTL: `max(now - first_seen, hours_old * 2)`; entries older than
+  `2 * JOB_SEARCH_HOURS_OLD` hours are considered expired and will be
+  re-imported on the next run.
+
+The cache is rewritten atomically via `tmp + rename`. A corrupted, missing, or
+unreadable file degrades to an empty cache; the run continues without
+deduplication and never aborts because of the cache. Cache failures appear on
+the run summary as `seen-cache:check:<reason>` or `seen-cache:write:<reason>`.
+
+### Bypass and reset
+
+- `--reset-seen-cache` clears the cache before the run so every offer is
+  re-imported (forces a one-shot re-import).
+- `JOBTRAIL_RESET_SEEN_CACHE=1` (or `true`/`yes`/`on`) triggers the same reset.
+- To disable the cache for a single run, point `JOBTRAIL_SEEN_CACHE_PATH` at a
+  throwaway file and pass `--reset-seen-cache`.
+
+The cache is always consulted before `POST /api/discover/import`; the backend
+never sees offers that the cache reports as already-seen within the TTL.
+
 ## Safety rules
 
 - **Dry-run first:** keep `SCORER_DRY_RUN=1` until the config, JobTrail connection, provider, and logs look correct.

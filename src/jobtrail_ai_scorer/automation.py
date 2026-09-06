@@ -16,6 +16,7 @@ from .discover import (  # noqa: F401  (re-exported on purpose)
     BackendDiscoveryError,
     DEFAULT_DOCKER_CONTAINER as DISCOVER_DEFAULT_CONTAINER,
 )
+from .seen_cache import SeenCache
 
 
 DEFAULT_TERMS = (
@@ -238,12 +239,19 @@ class JobTrailAutomation:
         *,
         scorer: Callable[[str, str], Any] | None = None,
         notifier: Callable[[str], Any] | None = None,
+        seen_cache: SeenCache | None = None,
     ) -> None:
         self.gateway, self.scorer, self.notifier = (
             gateway,
             scorer or self._score,
             notifier or self._notify,
         )
+        # ``seen_cache`` is opt-in. When provided, the cache is queried
+        # before every ``/api/discover/import`` call so we don't re-import
+        # offers already seen within the configured TTL window. Cache
+        # failures must never crash a run; they are reported as
+        # ``seen-cache:...`` entries on ``AutomationRun.failures``.
+        self.seen_cache = seen_cache
         self._scorer_command = "jobtrail-ai-scorer"
         self._whatsapp_command = ""
 
@@ -285,11 +293,14 @@ class JobTrailAutomation:
                 searched += len(jobs)
                 for job in jobs:
                     try:
+                        if self._is_cached(job, config=config, failures=failures):
+                            continue
                         result = self.gateway.import_job(map_jobspy_job(job))
                         job_id = result.get("id")
                         if job_id is not None and str(job_id) not in ids:
                             ids.append(str(job_id))
                             imported += 1
+                        self._record_seen(job, failures=failures)
                     except Exception:
                         failures.append("import")
             except Exception:
@@ -336,6 +347,69 @@ class JobTrailAutomation:
                 )
             )
         return AutomationRun(searched, imported, scored, tuple(failures), best)
+
+    # --- seen-cache helpers -----------------------------------------------
+
+    def _cache_identity(self, job: Mapping[str, Any]) -> tuple[str, str] | None:
+        """Return ``(source, sourceJobId)`` for the cache key, or None."""
+
+        # Apply the same mapper the import path uses; the raw search result has
+        # ``site``/``id``, but the cache keys must match what we send to
+        # ``/api/discover/import`` (i.e. ``source``/``sourceJobId``).
+        mapped = map_jobspy_job(job)
+        source = mapped.get("source")
+        source_job_id = mapped.get("sourceJobId")
+        if not isinstance(source, str) or not source:
+            return None
+        if not isinstance(source_job_id, str) or not source_job_id:
+            return None
+        return source, source_job_id
+
+    def _is_cached(
+        self,
+        job: Mapping[str, Any],
+        *,
+        config: AutomationConfig,
+        failures: list[str],
+    ) -> bool:
+        """Return True when the offer should be skipped due to the cache."""
+
+        if self.seen_cache is None:
+            return False
+        identity = self._cache_identity(job)
+        if identity is None:
+            return False
+        source, source_job_id = identity
+        try:
+            return self.seen_cache.should_skip(
+                source,
+                source_job_id,
+                hours_old=config.hours_old,
+            )
+        except Exception as exc:  # pragma: no cover - defensive guard
+            # Cache failures must never crash a run; surface as a
+            # ``seen-cache:...`` failure so operators can see the cause.
+            failures.append(f"seen-cache:check:{exc}")
+            return False
+
+    def _record_seen(
+        self,
+        job: Mapping[str, Any],
+        *,
+        failures: list[str],
+    ) -> None:
+        """Persist the (source, sourceJobId) pair to the seen cache."""
+
+        if self.seen_cache is None:
+            return
+        identity = self._cache_identity(job)
+        if identity is None:
+            return
+        source, source_job_id = identity
+        try:
+            self.seen_cache.mark_seen(source, source_job_id)
+        except Exception as exc:  # pragma: no cover - defensive guard
+            failures.append(f"seen-cache:write:{exc}")
 
 
 JobSearchAutomation = JobTrailAutomation
