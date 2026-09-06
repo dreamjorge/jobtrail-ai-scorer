@@ -440,7 +440,10 @@ class JobTrailAutomation:
             notify_on_failure=config.notify_on_failure,
         )
         if notification_body is not None:
-            self.notifier(notification_body)
+            try:
+                self.notifier(notification_body)
+            except Exception:
+                failures.append("notify")
         return AutomationRun(searched, imported, scored, tuple(failures), best)
 
     @staticmethod
