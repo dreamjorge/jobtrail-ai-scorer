@@ -493,3 +493,17 @@ To run the guardrail locally:
 python -m pip install -e .
 python -m pytest tests/test_runtime_policy.py -v
 ```
+
+## Runtime install retention and cleanup
+
+Use `scripts/runtime_install.py` to stage and install the `scorer-python` runtime. The default invocation is a dry run; pass `--yes` only after reviewing it. Changed installs retain exactly one sibling backup, `scorer-python.previous`; identical content is not rotated. Importing the helper never runs pip.
+
+Historical backups can be removed only by explicitly naming them with `scripts/runtime_clean.py`. The command requires `--yes`, refuses symlinks, files, missing targets (unless `--missing-ok` is supplied), unrelated names, and targets outside an optional `--runtime-root`. It never discovers or removes unlisted paths.
+
+```sh
+python3 scripts/runtime_clean.py \\
+  --runtime-root /absolute/runtime-root \\
+  --target /absolute/runtime-root/scorer-python.previous \\
+  --target /absolute/runtime-root/scorer-python.backup-automation-20260906T172527Z
+# review the listed plan, then add --yes
+```

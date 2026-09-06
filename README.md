@@ -59,8 +59,10 @@ For Compose, override the example mounts with `SCORER_CONFIG_PATH` and
 ## Runtime automation
 
 See [Runtime automation](docs/runtime-automation.md) for safe dry-run-first scheduler
-setup, `SCORER_COMMAND` local launcher overrides, Hermes Docker wrapper usage,
-optional WhatsApp notification through Hermes, dynamic backend URL discovery
+setup, runtime install retention (`scripts/runtime_install.py`) and explicit backup
+cleanup (`scripts/runtime_clean.py`), `SCORER_COMMAND` local launcher overrides,
+Hermes Docker wrapper usage, optional WhatsApp notification through Hermes, dynamic
+backend URL discovery
 (precedence: published host port → Docker container IP → fail closed), Docker
 maintenance rules, and the strict opt-in purge helper that removes the
 historical runtime duplicate of the config example.
