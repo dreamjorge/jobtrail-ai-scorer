@@ -43,6 +43,9 @@ CANONICAL_SCRIPTS: tuple[Path, ...] = (
     SCRIPTS_DIR / "automated-job-search.example.py",
     SCRIPTS_DIR / "hermes-docker-wrapper.example.sh",
     SCRIPTS_DIR / "notify-whatsapp-via-hermes.example.sh",
+    SCRIPTS_DIR / "runtime_backup.py",
+    SCRIPTS_DIR / "runtime_install.py",
+    SCRIPTS_DIR / "runtime_clean.py",
 )
 
 # Legacy dry-run wrappers that must live under scripts/legacy/ with a

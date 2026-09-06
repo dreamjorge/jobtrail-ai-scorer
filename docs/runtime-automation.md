@@ -407,6 +407,79 @@ export HERMES_PROFILE=job-search
 
 Send summaries only. Do not include raw prompts, candidate profile content, job descriptions, notes, tokens, credentials, or secrets in WhatsApp messages. Include counts, status, and log metadata that an operator can use to inspect the local log securely.
 
+## Hermetic end-to-end tests
+
+The repository ships an in-process end-to-end suite at
+`tests/test_automation_e2e.py` that exercises the full
+`search → import → score → notify` pipeline through the real
+`JobTrailAutomation.run` orchestration code. The suite never reaches
+out to Docker, systemd, or a real JobTrail backend; every external
+dependency is replaced by a stub from `tests/stubs/`:
+
+- `stubs.stub_jobtrail.StubJobTrailServer` runs an
+  `http.server.BaseHTTPRequestHandler` on a random localhost port and
+  imitates `/api/discover/search`, `/api/discover/import`, and
+  `/api/jobs/<id>`. The handler is wired to a lock-protected
+  `StubJobTrailState` so tests can assert on every request.
+- `stubs.stub_jobspy.StubJobSpy` produces JobSpy-style search listings
+  that the stub server returns verbatim from `POST /api/discover/search`.
+- `stubs.stub_scorer.StubScorer` is a `Callable[[str, str], Any]` that
+  writes a fixed `[AI_JOB_SCORE_V1]` note into the stub state, replacing
+  the `SCORER_COMMAND` subprocess.
+- `stubs.stub_whatsapp.StubWhatsApp` captures the WhatsApp helper message
+  body to an in-memory buffer so tests can assert on the rendered output.
+
+The stubs use only the standard library (`http.server`, `threading`,
+`json`, `urllib.parse`); the orchestrator uses the real `httpx.Client`
+and the production `RetryPolicy`, so the test exercises the genuine
+HTTP boundary. The `conftest.py` adds `tests/` to `sys.path` so future
+modules can `from stubs.stub_xxx import ...`.
+
+### Required invariants
+
+The suite asserts five invariant contracts required by Issue #11:
+
+1. **Happy path** — `JobTrailAutomation.run` drives the full pipeline
+   end-to-end: `searched`, `imported`, and `scored` counts match the
+   number of listings returned by the in-process JobSpy; the captured
+   WhatsApp message contains only the allowlisted fields and never
+   embeds descriptions, candidate content, profile, prompt, or CV text.
+2. **Dedup-skip-second-search** — a second run with the same
+   `SeenCache` skips offers already imported within the TTL window;
+   `imported == 0`, `scored == 0`, and no WhatsApp message is captured.
+3. **Partial failure** — a transient 5xx on one import is retried by
+   the bounded retry helper, surfaced as `import:exhausted:...` on the
+   run summary, and does not stop the remaining offers from completing.
+   When `notify_on_failure=True`, the bounded failure summary is the
+   only message the WhatsApp helper receives.
+4. **Redaction** — sentinel substrings in the scorer's
+   `strengths`/`gaps` (`RESUME_SENTINEL`, `PROFILE_SENTINEL`,
+   `PROMPT_SENTINEL`, `CREDENTIAL_SENTINEL`) are scrubbed by the
+   production `NotificationBuilder` before the message reaches the
+   WhatsApp buffer; `[REDACTED]` appears in the captured body.
+5. **Single notification** — multiple scored jobs above the threshold
+   still produce exactly one best-match notification, the
+   `jobTrailLink` ends with `/jobs/<decoded id>`, and `runId` matches
+   `^\d{4}-\d{2}-\d{2}-\d{4}-[a-f0-9]{6}$`.
+
+A sixth triangulation test (`test_get_job_endpoint_serves_persisted_notes`)
+verifies that notes written by the scorer survive a separate
+`GET /api/jobs/<id>` request against the in-process server, proving the
+read-back path is exercised through the real HTTP boundary.
+
+### Running
+
+```sh
+python -m pytest tests/test_automation_e2e.py -v
+# or, using the registered marker:
+python -m pytest -m e2e -v
+```
+
+The suite takes a few seconds to run and requires no external services.
+It uses the production `RetryPolicy(max_attempts=3, base_delay=0.0,
+max_delay=0.0)` and a no-op `retry_sleep` so transient retries are
+exercised without slowing CI.
+
 ## Hermes runtime policy guardrail (CI)
 
 The runtime SOUL.md and `skills/jobtrail-automation/SKILL.md` live in the operator's local Hermes profile (for example under `<runtime-root>/hermes/profiles/job-search/`) and must NOT be committed to this repository. To keep the apply-gate contract reviewable, the repository ships CI-only fixture mocks under `tests/fixtures/hermes/` and a guardrail test suite (`tests/test_runtime_policy.py`) that runs on every PR and on a daily cron via `.github/workflows/policy.yml`.
@@ -426,4 +499,18 @@ To run the guardrail locally:
 ```sh
 python -m pip install -e .
 python -m pytest tests/test_runtime_policy.py -v
+```
+
+## Runtime install retention and cleanup
+
+Use `scripts/runtime_install.py` to stage and install the `scorer-python` runtime. The default invocation is a dry run; pass `--yes` only after reviewing it. Changed installs retain exactly one sibling backup, `scorer-python.previous`; identical content is not rotated. Importing the helper never runs pip.
+
+Historical backups can be removed only by explicitly naming them with `scripts/runtime_clean.py`. The command requires `--yes`, refuses symlinks, files, missing targets (unless `--missing-ok` is supplied), unrelated names, and targets outside an optional `--runtime-root`. It never discovers or removes unlisted paths.
+
+```sh
+python3 scripts/runtime_clean.py \\
+  --runtime-root /absolute/runtime-root \\
+  --target /absolute/runtime-root/scorer-python.previous \\
+  --target /absolute/runtime-root/scorer-python.backup-automation-20260906T172527Z
+# review the listed plan, then add --yes
 ```

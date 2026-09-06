@@ -59,8 +59,10 @@ For Compose, override the example mounts with `SCORER_CONFIG_PATH` and
 ## Runtime automation
 
 See [Runtime automation](docs/runtime-automation.md) for safe dry-run-first scheduler
-setup, `SCORER_COMMAND` local launcher overrides, Hermes Docker wrapper usage,
-optional WhatsApp notification through Hermes, dynamic backend URL discovery
+setup, runtime install retention (`scripts/runtime_install.py`) and explicit backup
+cleanup (`scripts/runtime_clean.py`), `SCORER_COMMAND` local launcher overrides,
+Hermes Docker wrapper usage, optional WhatsApp notification through Hermes, dynamic
+backend URL discovery
 (precedence: published host port → Docker container IP → fail closed), Docker
 maintenance rules, and the strict opt-in purge helper that removes the
 historical runtime duplicate of the config example.
@@ -107,6 +109,29 @@ recommendation label, strengths, gaps, external job URL, JobTrail link, and run 
 descriptions, profiles, CVs, raw prompts, reasoning, notes, credentials, or secrets. The JobTrail link is
 built from `JOBTRAIL_BASE_URL` plus `/jobs/<id>` and can be optionally rewritten through `WHATSAPP_SHORT_URL_BASE`.
 See [Runtime automation](docs/runtime-automation.md) for the full field contract and the optional shortener.
+
+## Hermetic end-to-end tests
+
+The repository ships an in-process end-to-end suite at
+`tests/test_automation_e2e.py` that exercises the full `search → import →
+score → notify` pipeline through the real `JobTrailAutomation.run`
+orchestration code. No Docker, systemd, or real HTTP is required:
+`tests/stubs/` provides an in-process `http.server` JobTrail backend,
+a fake scorer provider, and a WhatsApp buffer that captures the
+rendered message. Run it with:
+
+```sh
+python -m pytest tests/test_automation_e2e.py -v
+# or via the registered marker:
+python -m pytest -m e2e -v
+```
+
+The suite asserts the five invariant contracts required by Issue #11
+(happy path, dedup-skip-second-search, partial failure, redaction,
+single notification) plus a triangulation test that verifies the
+`GET /api/jobs/<id>` read-back path. See
+[Runtime automation](docs/runtime-automation.md#hermetic-end-to-end-tests)
+for the full contract.
 
 ## Runtime policy guardrail
 
