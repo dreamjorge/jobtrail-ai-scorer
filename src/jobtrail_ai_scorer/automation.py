@@ -1,4 +1,5 @@
 """Safe orchestration boundary for JobTrail search, scoring, and notification."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -11,8 +12,15 @@ from urllib.parse import quote
 
 import httpx
 
+from .discover import (  # noqa: F401  (re-exported on purpose)
+    BackendDiscoveryError,
+    DEFAULT_DOCKER_CONTAINER as DISCOVER_DEFAULT_CONTAINER,
+)
 
-DEFAULT_TERMS = "Python C++ MATLAB backend APIs databases automation CI/CD Docker LLMs agents"
+
+DEFAULT_TERMS = (
+    "Python C++ MATLAB backend APIs databases automation CI/CD Docker LLMs agents"
+)
 
 
 @dataclass(frozen=True)
@@ -29,12 +37,18 @@ class AutomationConfig:
     scorer_config_path: str = ""
     notify_enabled: bool = False
     whatsapp_command: str = ""
+    discover_container: str | None = None
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "AutomationConfig":
         e = os.environ if env is None else env
+
         def split(key: str, default: str, separator: str) -> tuple[str, ...]:
-            return tuple(x.strip() for x in e.get(key, default).split(separator) if x.strip())
+            return tuple(
+                x.strip() for x in e.get(key, default).split(separator) if x.strip()
+            )
+
+        discover_container = e.get("JOBTRAIL_DISCOVER_CONTAINER", "").strip() or None
         return cls(
             base_url=e.get("JOBTRAIL_BASE_URL", cls.base_url),
             sites=split("JOB_SEARCH_SITES", "linkedin,indeed", ","),
@@ -46,25 +60,85 @@ class AutomationConfig:
             score_threshold=int(e.get("JOB_SCORE_THRESHOLD", "80")),
             scorer_command=e.get("SCORER_COMMAND", "jobtrail-ai-scorer"),
             scorer_config_path=e.get("SCORER_CONFIG_PATH", ""),
-            notify_enabled=e.get("WHATSAPP_NOTIFY_ENABLED", "0").lower() in {"1", "true", "yes"},
+            notify_enabled=e.get("WHATSAPP_NOTIFY_ENABLED", "0").lower()
+            in {"1", "true", "yes"},
             whatsapp_command=e.get("WHATSAPP_NOTIFY_COMMAND", ""),
+            discover_container=discover_container,
         )
 
 
+def resolve_automation_base_url(
+    config: AutomationConfig,
+    *,
+    container_name: str | None = None,
+    probe: Any | None = None,
+    inspect: Any | None = None,
+) -> tuple[str, str]:
+    """Return ``(url, source)`` honoring ``config.discover_container`` if set.
+
+    Falls back to ``config.base_url`` (source ``"static"``) when discovery is
+    not requested, preserving prior behavior for callers that pass
+    ``JOBTRAIL_BASE_URL`` only. The precedence logic lives in
+    :mod:`jobtrail_ai_scorer.discover`; this helper just adapts the
+    ``AutomationConfig`` contract to it.
+    """
+    if config.discover_container:
+        # Imported lazily so the static-only code path does not pull in the
+        # dependency-free discovery helper for callers that never opt in.
+        from .discover import resolve_backend_url
+
+        return resolve_backend_url(
+            container_name=container_name or config.discover_container,
+            probe=probe,
+            inspect=inspect,
+        )
+    return config.base_url, "static"
+
+
+def merge_resolved_base_url(
+    config: AutomationConfig,
+    base_url: str,
+) -> AutomationConfig:
+    """Return a new ``AutomationConfig`` with ``base_url`` replaced by ``base_url``."""
+
+    overrides = {**config.__dict__, "base_url": base_url}
+    return AutomationConfig(**overrides)
+
+
 def search_payloads(config: AutomationConfig) -> list[dict[str, Any]]:
-    return [{
-        "sites": list(config.sites), "searchTerm": config.search_terms, "location": location,
-        "resultsWanted": config.results_wanted, "hoursOld": config.hours_old,
-        "isRemote": location.strip().lower() == "remote",
-    } for location in config.locations]
+    return [
+        {
+            "sites": list(config.sites),
+            "searchTerm": config.search_terms,
+            "location": location,
+            "resultsWanted": config.results_wanted,
+            "hoursOld": config.hours_old,
+            "isRemote": location.strip().lower() == "remote",
+        }
+        for location in config.locations
+    ]
 
 
 def map_jobspy_job(job: Mapping[str, Any]) -> dict[str, Any]:
-    mapping = {"source": "site", "sourceJobId": "id", "company": "company", "position": "title",
-               "description": "description", "jobUrl": "job_url", "location": "location", "remote": "is_remote",
-               "salaryMin": "min_amount", "salaryMax": "max_amount", "salaryCurrency": "currency",
-               "jobType": "job_type"}
-    return {target: job[source] for target, source in mapping.items() if source in job and job[source] is not None}
+    mapping = {
+        "source": "site",
+        "sourceJobId": "id",
+        "company": "company",
+        "position": "title",
+        "description": "description",
+        "jobUrl": "job_url",
+        "location": "location",
+        "remote": "is_remote",
+        "salaryMin": "min_amount",
+        "salaryMax": "max_amount",
+        "salaryCurrency": "currency",
+        "jobType": "job_type",
+    }
+    return {
+        target: job[source]
+        for target, source in mapping.items()
+        if source in job and job[source] is not None
+    }
 
 
 def parse_score_note(notes: Any) -> dict[str, Any] | None:
@@ -83,8 +157,11 @@ def parse_score_note(notes: Any) -> dict[str, Any] | None:
     return None
 
 
-def build_notification_summary(job: Mapping[str, Any], score: Mapping[str, Any]) -> dict[str, Any]:
+def build_notification_summary(
+    job: Mapping[str, Any], score: Mapping[str, Any]
+) -> dict[str, Any]:
     """Build a bounded notification from explicitly allowlisted fields."""
+
     def text(value: Any, limit: int = 200) -> str:
         return str(value or "")[:limit]
 
@@ -113,6 +190,7 @@ class AutomationGateway(Protocol):
 
 class JobTrailHTTPClient:
     """HTTP boundary kept injectable so orchestration never needs a live service in tests."""
+
     def __init__(self, base_url: str, *, client: httpx.Client | None = None) -> None:
         self._client = client or httpx.Client(base_url=base_url.rstrip("/"), timeout=30)
         self._owned = client is None
@@ -128,7 +206,11 @@ class JobTrailHTTPClient:
 
     def search(self, payload: dict[str, Any]) -> list[dict[str, Any]]:
         result = self._post("/api/discover/search", payload)
-        return result if isinstance(result, list) else result.get("results", result.get("jobs", []))
+        return (
+            result
+            if isinstance(result, list)
+            else result.get("results", result.get("jobs", []))
+        )
 
     def import_job(self, payload: dict[str, Any]) -> dict[str, Any]:
         result = self._post("/api/discover/import", payload)
@@ -150,19 +232,43 @@ class AutomationRun:
 
 
 class JobTrailAutomation:
-    def __init__(self, gateway: AutomationGateway, *, scorer: Callable[[str, str], Any] | None = None,
-                 notifier: Callable[[str], Any] | None = None) -> None:
-        self.gateway, self.scorer, self.notifier = gateway, scorer or self._score, notifier or self._notify
+    def __init__(
+        self,
+        gateway: AutomationGateway,
+        *,
+        scorer: Callable[[str, str], Any] | None = None,
+        notifier: Callable[[str], Any] | None = None,
+    ) -> None:
+        self.gateway, self.scorer, self.notifier = (
+            gateway,
+            scorer or self._score,
+            notifier or self._notify,
+        )
         self._scorer_command = "jobtrail-ai-scorer"
         self._whatsapp_command = ""
 
     def _score(self, job_id: str, config_path: str) -> None:
-        subprocess.run([*shlex.split(self._scorer_command), "score", "--config", config_path, "--job-id", job_id, "--force"], check=True)
+        subprocess.run(
+            [
+                *shlex.split(self._scorer_command),
+                "score",
+                "--config",
+                config_path,
+                "--job-id",
+                job_id,
+                "--force",
+            ],
+            check=True,
+        )
 
     def _notify(self, message: str) -> None:
         if not self._whatsapp_command:
-            raise ValueError("WHATSAPP_NOTIFY_COMMAND is required when notifications are enabled")
-        subprocess.run(shlex.split(self._whatsapp_command), input=message, text=True, check=True)
+            raise ValueError(
+                "WHATSAPP_NOTIFY_COMMAND is required when notifications are enabled"
+            )
+        subprocess.run(
+            shlex.split(self._whatsapp_command), input=message, text=True, check=True
+        )
 
     def run(self, *, config: AutomationConfig) -> AutomationRun:
         if not config.scorer_config_path:
@@ -188,7 +294,7 @@ class JobTrailAutomation:
                         failures.append("import")
             except Exception:
                 failures.append("search")
-        for job_id in ids[:config.max_score]:
+        for job_id in ids[: config.max_score]:
             try:
                 self.scorer(job_id, config.scorer_config_path)
                 scored_ids.append(job_id)
@@ -202,16 +308,33 @@ class JobTrailAutomation:
             try:
                 job = self.gateway.get_job(job_id)
                 score = parse_score_note(job.get("notes"))
-                if score and score.get("score", -1) >= config.score_threshold and (best is None or score["score"] > best["score"]):
-                    best = {"title": job.get("position", job.get("title", "")), "company": job.get("company", ""),
-                            "location": job.get("location", ""), "score": score["score"], "recommendation": score.get("recommendation", ""),
-                            "strengths": score.get("strengths", []), "gaps": score.get("gaps", []), "jobUrl": job.get("jobUrl", job.get("job_url", ""))}
+                if (
+                    score
+                    and score.get("score", -1) >= config.score_threshold
+                    and (best is None or score["score"] > best["score"])
+                ):
+                    best = {
+                        "title": job.get("position", job.get("title", "")),
+                        "company": job.get("company", ""),
+                        "location": job.get("location", ""),
+                        "score": score["score"],
+                        "recommendation": score.get("recommendation", ""),
+                        "strengths": score.get("strengths", []),
+                        "gaps": score.get("gaps", []),
+                        "jobUrl": job.get("jobUrl", job.get("job_url", "")),
+                    }
                     best_job = job
                     best_score = score
             except Exception:
                 failures.append(f"read:{job_id}")
         if best is not None and config.notify_enabled:
-            self.notifier(json.dumps(build_notification_summary(best_job, best_score), ensure_ascii=False, sort_keys=True))
+            self.notifier(
+                json.dumps(
+                    build_notification_summary(best_job, best_score),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+            )
         return AutomationRun(searched, imported, scored, tuple(failures), best)
 
 

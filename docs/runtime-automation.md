@@ -10,6 +10,57 @@ Set `WHATSAPP_NOTIFY_COMMAND=./notify-whatsapp-via-hermes.local.sh` (the helper 
 
 Use these examples to run JobTrail AI Scorer from a local scheduler while keeping private runtime files out of the repository. Copy the example files, edit only local ignored copies, and dry-run first before allowing writes to JobTrail notes.
 
+## Backend URL resolution
+
+The systemd service must reach the JobTrail backend. Instead of baking a private
+host or Docker IP into `JOBTRAIL_BASE_URL`, the launcher resolves the URL on every
+start through `jobtrail_ai_scorer.discover.resolve_backend_url`. The precedence
+is fixed and lives in one place (`src/jobtrail_ai_scorer/discover.py`):
+
+1. **`http://127.0.0.1:8000`** (the published host port). The probe issues a
+   short-timeout HTTP GET via `urllib.request`; any reply (including 404 on the
+   root path) is treated as "reachable" because the backend may not expose a
+   health route.
+2. **Docker container IP** resolved by
+   `docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' <container>`
+   pointed at the container name from `--container` (default
+   `jobtrail-backend-1`) or `JOBTRAIL_DISCOVER_CONTAINER`. The probe of the
+   resulting URL must succeed.
+3. **Fail closed**: the resolver raises `BackendDiscoveryError` with a clear
+   message naming the published URL and the container. The launcher exits with
+   status `2`, so the systemd unit will mark the run as failed instead of
+   silently pointing at a stale address.
+
+The precedence is never baked into runtime environment files; the env stores
+only the container name and overrides, never an IP. The example YAML config
+never contains a private IP.
+
+### Launcher flags
+
+`scripts/automated-job-search.example.py` exposes:
+
+- `--container NAME`: Docker container to inspect when the published port is
+  unreachable. Default: `jobtrail-backend-1`.
+- `--base-url URL`: bypass discovery and use the URL verbatim (highest priority).
+- `--no-discover`: skip the published-port and Docker probes; use
+  `JOBTRAIL_BASE_URL` only.
+
+The launcher prints the chosen `base_url` and `source` (`published-port`,
+`docker-container`, `static`, or `cli`) to stderr so systemd logs show which
+branch served the run. Discovery errors are surfaced on stderr with the original
+`BackendDiscoveryError` message.
+
+### Disabling discovery
+
+Existing systemd units that already export `JOBTRAIL_BASE_URL=http://<host>:8000`
+do not need to change. Either:
+
+- leave `JOBTRAIL_DISCOVER_CONTAINER` unset (the launcher falls back to
+  `JOBTRAIL_BASE_URL`/`--base-url`); or
+- pass `--no-discover` to make the static-URL path explicit and traceable in
+  the unit definition.
+
+
 ## Safety rules
 
 - **Dry-run first:** keep `SCORER_DRY_RUN=1` until the config, JobTrail connection, provider, and logs look correct.

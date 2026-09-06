@@ -34,7 +34,9 @@ For Compose, override the example mounts with `SCORER_CONFIG_PATH` and
 
 See [Runtime automation](docs/runtime-automation.md) for safe dry-run-first scheduler
 setup, `SCORER_COMMAND` local launcher overrides, Hermes Docker wrapper usage,
-optional WhatsApp notification through Hermes, and Docker maintenance rules.
+optional WhatsApp notification through Hermes, dynamic backend URL discovery
+(precedence: published host port → Docker container IP → fail closed), and
+Docker maintenance rules.
 
 ## Automated JobTrail search
 
