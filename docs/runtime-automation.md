@@ -10,6 +10,87 @@ Set `WHATSAPP_NOTIFY_COMMAND=./notify-whatsapp-via-hermes.local.sh` (the helper 
 
 Use these examples to run JobTrail AI Scorer from a local scheduler while keeping private runtime files out of the repository. Copy the example files, edit only local ignored copies, and dry-run first before allowing writes to JobTrail notes.
 
+## Backend URL resolution
+
+The systemd service must reach the JobTrail backend. Instead of baking a private
+host or Docker IP into `JOBTRAIL_BASE_URL`, the launcher resolves the URL on every
+start through `jobtrail_ai_scorer.discover.resolve_backend_url`. The precedence
+is fixed and lives in one place (`src/jobtrail_ai_scorer/discover.py`):
+
+1. **`http://127.0.0.1:8000`** (the published host port). The probe issues a
+   short-timeout HTTP GET via `urllib.request`; any reply (including 404 on the
+   root path) is treated as "reachable" because the backend may not expose a
+   health route.
+2. **Docker container IP** resolved by
+   `docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' <container>`
+   pointed at the container name from `--container` (default
+   `jobtrail-backend-1`) or `JOBTRAIL_DISCOVER_CONTAINER`. The probe of the
+   resulting URL must succeed.
+3. **Fail closed**: the resolver raises `BackendDiscoveryError` with a clear
+   message naming the published URL and the container. The launcher exits with
+   status `2`, so the systemd unit will mark the run as failed instead of
+   silently pointing at a stale address.
+
+The precedence is never baked into runtime environment files; the env stores
+only the container name and overrides, never an IP. The example YAML config
+never contains a private IP.
+
+### Launcher flags
+
+`scripts/automated-job-search.example.py` exposes:
+
+- `--container NAME`: Docker container to inspect when the published port is
+  unreachable. Default: `jobtrail-backend-1`.
+- `--base-url URL`: bypass discovery and use the URL verbatim (highest priority).
+- `--no-discover`: skip the published-port and Docker probes; use
+  `JOBTRAIL_BASE_URL` only.
+
+The launcher prints the chosen `base_url` and `source` (`published-port`,
+`docker-container`, `static`, or `cli`) to stderr so systemd logs show which
+branch served the run. Discovery errors are surfaced on stderr with the original
+`BackendDiscoveryError` message.
+
+### Disabling discovery
+
+`--container` always defaults to `jobtrail-backend-1` regardless of
+`JOBTRAIL_DISCOVER_CONTAINER`, so leaving that variable unset does **not**
+disable discovery: the launcher still probes the published port and then that
+default container name, and exits `2` if neither is reachable.
+
+To make an existing systemd unit that already exports
+`JOBTRAIL_BASE_URL=http://<host>:8000` use that URL as-is, pass
+`--no-discover` (or `--base-url`) explicitly in the unit definition — this is
+the only way to skip the published-port and Docker probes.
+
+
+## Pre-import deduplication (seen cache)
+
+The automation launcher skips offers whose `(source, sourceJobId)` pair was
+already imported within the configured TTL window. The cache lives outside the
+repository in a JSON file with `0600` permissions:
+
+- Default path: `/DATA/AppData/jobtrail/logs/automated-job-search/seen.json`.
+- Override with `JOBTRAIL_SEEN_CACHE_PATH=/absolute/path/to/seen.json`.
+- TTL: `max(now - first_seen, hours_old * 2)`; entries older than
+  `2 * JOB_SEARCH_HOURS_OLD` hours are considered expired and will be
+  re-imported on the next run.
+
+The cache is rewritten atomically via `tmp + rename`. A corrupted, missing, or
+unreadable file degrades to an empty cache; the run continues without
+deduplication and never aborts because of the cache. Cache failures appear on
+the run summary as `seen-cache:check:<reason>` or `seen-cache:write:<reason>`.
+
+### Bypass and reset
+
+- `--reset-seen-cache` clears the cache before the run so every offer is
+  re-imported (forces a one-shot re-import).
+- `JOBTRAIL_RESET_SEEN_CACHE=1` (or `true`/`yes`/`on`) triggers the same reset.
+- To disable the cache for a single run, point `JOBTRAIL_SEEN_CACHE_PATH` at a
+  throwaway file and pass `--reset-seen-cache`.
+
+The cache is always consulted before `POST /api/discover/import`; the backend
+never sees offers that the cache reports as already-seen within the TTL.
+
 ## Safety rules
 
 - **Dry-run first:** keep `SCORER_DRY_RUN=1` until the config, JobTrail connection, provider, and logs look correct.

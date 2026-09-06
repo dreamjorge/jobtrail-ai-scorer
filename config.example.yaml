@@ -1,4 +1,10 @@
 # Copy to config.yaml and update these local, non-secret values.
+#
+# `jobtrail_base_url` is the backend that the `jobtrail-ai-scorer score` CLI
+# talks to. For most local usage, leave it as a public loopback/placeholder;
+# the systemd automation launcher resolves the real backend URL itself on each
+# start via `jobtrail_ai_scorer.discover.resolve_backend_url` (see
+# `docs/runtime-automation.md`). Never commit a private host or Docker IP here.
 jobtrail_base_url: http://localhost:3000
 candidate_profile_path: ./candidate-profile.example.md
 # Optional private CV; keep this file outside version control.

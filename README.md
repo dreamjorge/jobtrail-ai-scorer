@@ -34,7 +34,9 @@ For Compose, override the example mounts with `SCORER_CONFIG_PATH` and
 
 See [Runtime automation](docs/runtime-automation.md) for safe dry-run-first scheduler
 setup, `SCORER_COMMAND` local launcher overrides, Hermes Docker wrapper usage,
-optional WhatsApp notification through Hermes, and Docker maintenance rules.
+optional WhatsApp notification through Hermes, dynamic backend URL discovery
+(precedence: published host port → Docker container IP → fail closed), and
+Docker maintenance rules.
 
 ## Automated JobTrail search
 
@@ -42,6 +44,15 @@ Run `scripts/automated-job-search.example.py` with required `SCORER_CONFIG_PATH`
 Configure `JOB_SEARCH_*`, `JOB_SCORE_THRESHOLD`, `SCORER_COMMAND`, and `WHATSAPP_NOTIFY_*`;
 `SCORER_COMMAND` must be the direct `jobtrail-ai-scorer` CLI/launcher (not `run-scorer.sh`),
 and notifications are disabled by default.
+
+The launcher consults a seen cache before every `POST /api/discover/import` so
+offers already imported within the last `2 * JOB_SEARCH_HOURS_OLD` hours are
+skipped. The cache defaults to `/DATA/AppData/jobtrail/logs/automated-job-search/seen.json`,
+is rewritten atomically (`tmp + rename`), and is always `0600`. Override the
+path with `JOBTRAIL_SEEN_CACHE_PATH`. Pass `--reset-seen-cache` (or set
+`JOBTRAIL_RESET_SEEN_CACHE=1`) to clear the cache and force a re-import.
+Corruption, missing parent directories, or permission errors degrade to an
+empty cache and never crash the run.
 
 Warning: enabled runs write AI score notes and may send one summary through WhatsApp, but never apply to jobs.
 Summaries exclude descriptions, profiles, prompts, notes, credentials, and secrets.
