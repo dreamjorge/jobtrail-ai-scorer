@@ -67,6 +67,47 @@ def test_run_score_passes_profile_and_cv_to_provider_prompt(tmp_path):
     assert "PRIVATE CV CONTENT" in prompts[0]
 
 
+def test_run_score_warns_and_continues_when_profile_is_missing(caplog, tmp_path):
+    profile_path = tmp_path / "missing-profile.md"
+    cv_path = tmp_path / "cv.md"
+    config_path = tmp_path / "cfg.yaml"
+    cv_path.write_text("CV CONTENT")
+    config_path.write_text(
+        f"jobtrail_base_url: http://localhost:3000\n"
+        f"candidate_profile_path: {profile_path}\n"
+        f"candidate_cv_path: {cv_path}\n"
+    )
+    prompts = []
+
+    class FakeClient:
+        def get_job(self, job_id):
+            return {"id": job_id, "description": "A job"}
+
+        def close(self):
+            pass
+
+    class FakeProvider:
+        def score(self, prompt):
+            prompts.append(prompt)
+            return ('{"score": 80, "recommendation": "APPLY", '
+                    '"strengths": [], "gaps": [], "needs_confirmation": [], '
+                    '"hard_requirements_missing": [], "career_value": "High", '
+                    '"reasoning": "matches"}')
+
+    with caplog.at_level("WARNING"):
+        result = main.run_score(
+            config_path=config_path,
+            job_id="j1",
+            dry_run=True,
+            client_factory=lambda _: FakeClient(),
+            provider_factory=lambda _: FakeProvider(),
+        )
+
+    assert result.processed == 1
+    assert "CV CONTENT" in prompts[0]
+    assert "Unable to load candidate profile" in caplog.text
+
+
 def test_score_forwards_flags_and_emits_once(monkeypatch, tmp_path):
     calls = {}
     config_path = _config(tmp_path)

@@ -191,6 +191,19 @@ marker: "[AI_JOB_SCORE_V1]"
 
 The CLI reads provider credentials from environment variables when a provider needs them. Do not place tokens or secrets in YAML.
 
+### Prompt context budgets
+
+The scorer bounds each local context section before constructing the provider prompt:
+
+- candidate profile: 12,000 characters by default;
+- optional candidate CV: 16,000 characters by default.
+
+Set `PROMPT_PROFILE_BUDGET` or `PROMPT_CV_BUDGET` to a positive integer to override a
+budget for one run. When a section is clipped, the default marker `\n[... content truncated ...]`
+is appended; override it with `PROMPT_TRUNCATE_MARKER`. The marker counts toward the section's
+budget. If a profile or CV is missing, a directory, or unreadable, the scorer logs a warning and
+continues with the context that could be loaded. It does not expose file contents in the warning.
+
 ## Hermes Docker wrapper script
 
 When Hermes is running in Docker, point `hermes_executable` at the copied Hermes Docker wrapper script. The example `scripts/hermes-docker-wrapper.example.sh` runs:

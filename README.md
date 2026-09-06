@@ -25,6 +25,13 @@ The optional `candidate_cv_path` points to a private, local CV file (for example
 `/DATA/AppData/jobtrail/candidate-cv.md`). When configured, its contents are included
 alongside the candidate profile in the provider prompt. Keep the CV outside version control.
 
+Prompt context is bounded before it is sent to the provider. The profile defaults to a
+12,000-character budget and the CV defaults to 16,000 characters. Override these values
+for a run with the positive integer environment variables `PROMPT_PROFILE_BUDGET` and
+`PROMPT_CV_BUDGET`. Oversized sections receive a clear marker; customize it with
+`PROMPT_TRUNCATE_MARKER` (default: `\n[... content truncated ...]`). A missing, directory,
+or unreadable profile/CV logs a warning and the scorer continues with any remaining context.
+
 The CLI never stores API keys in configuration. Provider credentials are read from environment variables.
 Never commit `config.yaml`, candidate profiles, CVs, credentials, or other secrets.
 For Compose, override the example mounts with `SCORER_CONFIG_PATH` and

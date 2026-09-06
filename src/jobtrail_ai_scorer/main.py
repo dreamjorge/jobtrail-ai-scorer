@@ -1,4 +1,5 @@
 """Command-line entry point for scoring JobTrail jobs."""
+import logging
 from pathlib import Path
 from typing import Callable
 
@@ -6,6 +7,7 @@ import typer
 
 from .config import AppConfig, load_config
 from .jobtrail import JobTrailClient
+from .prompt_budget import LoadStatus, PromptBudget
 from .scoring import ScoreRunResult, score_jobs
 from .providers import (
     HermesProvider, HermesProviderConfig,
@@ -13,6 +15,7 @@ from .providers import (
 )
 
 app = typer.Typer(help="Score JobTrail jobs with a configured AI provider.")
+logger = logging.getLogger(__name__)
 
 
 @app.callback()
@@ -47,9 +50,18 @@ def run_score(*, config_path: Path, limit: int | None = None, job_id: str | None
     config = load_config(config_path)
     if provider_name:
         config = config.model_copy(update={"provider": provider_name})
-    profile = config.candidate_profile_path.read_text()
+    prompt_budget = PromptBudget.from_env()
+    profile, profile_status = prompt_budget.load_optional_text(
+        config.candidate_profile_path, prompt_budget.profile_budget_chars
+    )
+    _warn_if_unavailable("profile", profile_status)
     if config.candidate_cv_path is not None:
-        profile += f"\n\nCandidate CV:\n{config.candidate_cv_path.read_text()}"
+        cv, cv_status = prompt_budget.load_optional_text(
+            config.candidate_cv_path, prompt_budget.cv_budget_chars
+        )
+        _warn_if_unavailable("CV", cv_status)
+        if cv_status in ("loaded", "truncated"):
+            profile += f"\n\nCandidate CV:\n{cv}"
     client = (client_factory or (lambda url: JobTrailClient(url)))(str(config.jobtrail_base_url))
     provider = (provider_factory or _make_provider)(config)
     try:
@@ -71,6 +83,15 @@ def run_score(*, config_path: Path, limit: int | None = None, job_id: str | None
             typer.echo(f"FAIL {outcome.job_id}: {outcome.reason}")
     typer.echo(f"processed={result.processed} skipped={result.skipped} failed={result.failed}")
     return result
+
+
+def _warn_if_unavailable(section: str, status: LoadStatus) -> None:
+    if status in ("missing", "unreadable"):
+        logger.warning(
+            "Unable to load candidate %s (%s); continuing without it",
+            section,
+            status,
+        )
 
 
 @app.command()
