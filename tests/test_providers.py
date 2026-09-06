@@ -30,9 +30,8 @@ def test_hermes_provider_returns_raw_model_text(monkeypatch):
     assert HermesProvider(config).score("prompt") == '{"score": 80}'
     assert calls == [
         (
-            (["hermes", "--profile", "local-profile"],),
+            (["hermes", "--profile", "local-profile", "-z", "prompt", "--cli"],),
             {
-                "input": "prompt",
                 "capture_output": True,
                 "check": False,
                 "text": True,
@@ -66,6 +65,26 @@ def test_hermes_provider_wraps_timeout(monkeypatch):
 
     with pytest.raises(ProviderProcessError, match="timed out"):
         HermesProvider(HermesProviderConfig(executable="hermes", profile="test")).score("prompt")
+
+
+def test_hermes_provider_timeout_does_not_chain_prompt_bearing_error(monkeypatch):
+    private_prompt = "PRIVATE candidate prompt"
+
+    def time_out(*args, **kwargs):
+        raise subprocess.TimeoutExpired(
+            cmd=["hermes", "--profile", "test", "-z", private_prompt, "--cli"],
+            timeout=60,
+        )
+
+    monkeypatch.setattr(subprocess, "run", time_out)
+
+    with pytest.raises(ProviderProcessError, match="Hermes process timed out") as error:
+        HermesProvider(HermesProviderConfig(executable="hermes", profile="test")).score(
+            private_prompt
+        )
+
+    assert private_prompt not in str(error.value)
+    assert error.value.__cause__ is None
 
 
 def test_openai_compatible_provider_uses_explicit_configured_boundary(monkeypatch):

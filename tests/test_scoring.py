@@ -3,7 +3,7 @@ from dataclasses import dataclass, field
 
 import pytest
 
-from jobtrail_ai_scorer.scoring import ScoreOutcome, score_jobs
+from jobtrail_ai_scorer.scoring import ScoreOutcome, render_prompt, score_jobs
 
 
 VALID_SCORE = {
@@ -61,6 +61,36 @@ def full_job(job_id: str, description: str = "Job description", notes=None) -> d
         "company": "Example Co",
         "notes": [] if notes is None else notes,
     }
+
+
+def test_render_prompt_enumerates_strict_score_result_contract():
+    prompt = render_prompt(full_job("j1"), "Generic profile")
+
+    expected_keys = (
+        "score",
+        "recommendation",
+        "strengths",
+        "gaps",
+        "needs_confirmation",
+        "hard_requirements_missing",
+        "career_value",
+        "reasoning",
+    )
+    for key in expected_keys:
+        assert key in prompt
+
+    for literal in ("PRIORITY_APPLY", "APPLY", "REVIEW", "SKIP"):
+        assert literal in prompt
+
+    for literal in ("High", "Medium", "Low"):
+        assert literal in prompt
+
+    prompt_lower = prompt.lower()
+    assert "no extra fields" in prompt_lower
+    assert "score must be an integer 0-100" in prompt_lower
+    assert "strengths, gaps, needs_confirmation, and hard_requirements_missing" in prompt_lower
+    assert "arrays of strings" in prompt_lower
+    assert "reasoning must be a non-empty string" in prompt_lower
 
 
 def test_empty_description_is_skipped_without_fetching_full_record():

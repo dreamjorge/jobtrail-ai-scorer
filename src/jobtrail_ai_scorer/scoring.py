@@ -68,7 +68,15 @@ def render_prompt(job: dict[str, Any], candidate_profile: str) -> str:
     job_json = json.dumps(job_data, sort_keys=True, default=str)
     return (
         "Evaluate this job against the candidate profile. Return JSON only matching "
-        "the configured score schema.\n\n"
+        "the configured score schema. Use exactly these keys and no extra fields: "
+        "score, recommendation, strengths, gaps, needs_confirmation, "
+        "hard_requirements_missing, career_value, reasoning. "
+        "score must be an integer 0-100. "
+        "recommendation must be one of PRIORITY_APPLY, APPLY, REVIEW, SKIP. "
+        "strengths, gaps, needs_confirmation, and hard_requirements_missing "
+        "must be arrays of strings. "
+        "career_value must be one of High, Medium, Low. "
+        "reasoning must be a non-empty string.\n\n"
         f"Candidate profile:\n{candidate_profile}\n\n"
         f"Job:\n{job_json}\n"
     )

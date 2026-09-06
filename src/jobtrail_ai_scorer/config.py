@@ -12,7 +12,14 @@ class AppConfig(BaseModel):
 
     jobtrail_base_url: AnyHttpUrl
     candidate_profile_path: Path
+    candidate_cv_path: Path | None = None
     provider: Literal["hermes", "openai_compatible"] = "hermes"
+    hermes_executable: str = "hermes"
+    hermes_profile: str = "default"
+    openai_endpoint: str = "http://localhost:8000/v1/chat/completions"
+    openai_model: str = "default"
+    openai_api_key_env: str = "OPENAI_API_KEY"
+    provider_timeout_seconds: float = 60.0
     marker: str = "[AI_JOB_SCORE_V1]"
 
     @field_validator("marker")

@@ -48,6 +48,8 @@ def run_score(*, config_path: Path, limit: int | None = None, job_id: str | None
     if provider_name:
         config = config.model_copy(update={"provider": provider_name})
     profile = config.candidate_profile_path.read_text()
+    if config.candidate_cv_path is not None:
+        profile += f"\n\nCandidate CV:\n{config.candidate_cv_path.read_text()}"
     client = (client_factory or (lambda url: JobTrailClient(url)))(str(config.jobtrail_base_url))
     provider = (provider_factory or _make_provider)(config)
     try:
