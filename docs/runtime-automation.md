@@ -60,10 +60,10 @@ branch served the run. Discovery errors are surfaced on stderr with the original
 
 ### Disabling discovery
 
-`--container` always defaults to `jobtrail-backend-1` regardless of
-`JOBTRAIL_DISCOVER_CONTAINER`, so leaving that variable unset does **not**
-disable discovery: the launcher still probes the published port and then that
-default container name, and exits `2` if neither is reachable.
+Leaving `--container` unset does **not** disable discovery: it falls back to
+`JOBTRAIL_DISCOVER_CONTAINER` if set, else `jobtrail-backend-1`, and the
+launcher still probes the published port and then that container name,
+exiting `2` if neither is reachable.
 
 To make an existing systemd unit that already exports
 `JOBTRAIL_BASE_URL=http://<host>:8000` use that URL as-is, pass

@@ -19,11 +19,13 @@ failure as "start empty and try again next write".
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import json
 import os
 from pathlib import Path
 import time
-from typing import Callable, Iterable, Mapping
+from typing import Callable, Iterable, Iterator, Mapping
 
 
 # Default path lives outside the repository under the runtime logs directory.
@@ -59,6 +61,48 @@ class SeenCache:
         self._load()
 
     # --- public API ---------------------------------------------------------
+
+    @contextlib.contextmanager
+    def transaction(self) -> Iterator[None]:
+        """Serialize a check/import/mark sequence across overlapping processes.
+
+        Without this, two overlapping runs (scheduled and manual, or two
+        scheduled runs that ran long) can both load a snapshot, both see an
+        offer as unseen, both import it, and then whichever ``save()`` calls
+        ``os.replace`` last silently drops the other's newly-marked entries
+        (the per-writer unique tmp file only prevents interleaved bytes
+        within one write, not this lost-update race across two writes).
+        This holds an advisory POSIX lock on a sibling ``.lock`` file (never
+        the ``.json`` payload itself, so reads/writes stay a simple
+        tmp+rename swap) for the caller's whole check-import-mark block, and
+        reloads the in-memory entries under the lock so this process sees
+        whatever the previous lock holder just wrote.
+
+        Locking failures degrade to a no-op (matching this module's "cache
+        failures must never crash a run" contract): callers are no worse off
+        than before this method existed.
+        """
+
+        lock_path = self._path.with_name(self._path.name + ".lock")
+        fd: int | None = None
+        try:
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        except OSError:
+            if fd is not None:
+                os.close(fd)
+            yield
+            return
+        try:
+            self._load()
+            yield
+        finally:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            os.close(fd)
 
     def should_skip(
         self,

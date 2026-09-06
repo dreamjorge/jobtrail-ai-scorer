@@ -333,11 +333,53 @@ def test_default_scorer_preserves_direct_cli_job_id_invocation(monkeypatch):
                 "--job-id",
                 "j1",
                 "--force",
+                "--base-url",
+                "http://127.0.0.1:8000",
             ],
             True,
         )
     ]
     assert result.scored == 1
+
+
+def test_default_scorer_propagates_discovered_base_url(monkeypatch):
+    """The scorer subprocess must target the URL this run actually used.
+
+    Regression: the discovered/resolved base_url was applied to the search
+    and import HTTP calls but never reached the scorer subprocess, which
+    would otherwise silently read the (possibly stale) jobtrail_base_url
+    committed in its own YAML config.
+    """
+
+    gateway = FakeJobTrail()
+    calls = []
+
+    def run(args, *, check):
+        calls.append(args)
+        gateway.jobs["j1"]["notes"] = [{"body": '[AI_JOB_SCORE_V1]\\n{"score":81}'}]
+
+    monkeypatch.setattr("jobtrail_ai_scorer.automation.subprocess.run", run)
+    JobSearchAutomation(gateway).run(
+        config=AutomationConfig(
+            scorer_config_path="safe/config.yaml",
+            scorer_command="jobtrail-ai-scorer",
+            base_url="http://discovered-host:8000",
+        )
+    )
+
+    assert calls == [
+        [
+            "jobtrail-ai-scorer",
+            "score",
+            "--config",
+            "safe/config.yaml",
+            "--job-id",
+            "j1",
+            "--force",
+            "--base-url",
+            "http://discovered-host:8000",
+        ]
+    ]
 
 
 def test_failed_scorer_cannot_select_or_notify_old_high_marker():

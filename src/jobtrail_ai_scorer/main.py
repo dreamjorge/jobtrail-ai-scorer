@@ -53,11 +53,18 @@ def _make_provider(config: AppConfig) -> object:
 
 def run_score(*, config_path: Path, limit: int | None = None, job_id: str | None = None,
               dry_run: bool = False, force: bool = False, marker: str | None = None,
-              provider_name: str | None = None, client_factory: ClientFactory | None = None,
+              provider_name: str | None = None, base_url: str | None = None,
+              client_factory: ClientFactory | None = None,
               provider_factory: ProviderFactory | None = None) -> ScoreRunResult:
     config = load_config(config_path)
     if provider_name:
         config = config.model_copy(update={"provider": provider_name})
+    if base_url:
+        # Lets a caller that already resolved the live backend (e.g. the
+        # discovery-aware automation launcher) override the static YAML
+        # value, instead of every scored job silently targeting whatever
+        # jobtrail_base_url happens to be committed in the config file.
+        config = config.model_copy(update={"jobtrail_base_url": base_url})
     prompt_budget = PromptBudget.from_env()
     profile, profile_status = prompt_budget.load_optional_text(
         config.candidate_profile_path, prompt_budget.profile_budget_chars
@@ -178,10 +185,16 @@ def _warn_if_unavailable(section: str, status: LoadStatus) -> None:
 def score(limit: int | None = typer.Option(None), job_id: str | None = typer.Option(None),
           dry_run: bool = typer.Option(False, "--dry-run"), force: bool = typer.Option(False),
           marker: str | None = typer.Option(None), provider: str | None = typer.Option(None),
+          base_url: str | None = typer.Option(
+              None, "--base-url",
+              help="Override the config's jobtrail_base_url (e.g. with a "
+                   "discovery-resolved URL) instead of using the YAML value.",
+          ),
           config: Path = typer.Option(Path("config.yaml"), "--config")) -> None:
     """Score eligible jobs and save validated score notes."""
     result = run_score(config_path=config, limit=limit, job_id=job_id, dry_run=dry_run,
-                       force=force, marker=marker, provider_name=provider)
+                       force=force, marker=marker, provider_name=provider,
+                       base_url=base_url)
     if result.failed:
         raise typer.Exit(code=1)
 

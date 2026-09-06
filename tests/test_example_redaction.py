@@ -34,12 +34,12 @@ DOCKER_COMPOSE = ROOT / "docker-compose.yml"
 # repo-wide ``*.example.*`` glob. Recursive (``rglob``) so example files
 # under any subdirectory (e.g. ``prompts/`` or ``scripts/legacy/``) are
 # scanned too, not just the immediate contents of ``scripts/``.
-_IGNORED_DIR_PARTS = {".git", ".venv", "node_modules", "build", "dist"}
+_IGNORED_DIR_PARTS = {".git", ".venv", "__pycache__", "node_modules", "build", "dist"}
 _EXAMPLE_GLOB = tuple(
     sorted(
         p
         for p in ROOT.rglob("*.example.*")
-        if not _IGNORED_DIR_PARTS.intersection(p.parts)
+        if not _IGNORED_DIR_PARTS.intersection(p.parts) and p.suffix != ".pyc"
     )
 )
 EXAMPLES_AND_TEMPLATES = tuple(

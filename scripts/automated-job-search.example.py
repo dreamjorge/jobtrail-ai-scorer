@@ -79,11 +79,12 @@ def main() -> int:
     )
     parser.add_argument(
         "--container",
-        default=DISCOVER_DEFAULT_CONTAINER,
+        default=None,
         help=(
             "Docker container name to inspect as fallback when the published port "
-            "is unreachable (default: %(default)s). Discovery is on by default; "
-            "pass --no-discover to use JOBTRAIL_BASE_URL instead."
+            "is unreachable. Defaults to JOBTRAIL_DISCOVER_CONTAINER if set, else "
+            f"{DISCOVER_DEFAULT_CONTAINER!r}. Discovery is on by default; pass "
+            "--no-discover to use JOBTRAIL_BASE_URL instead."
         ),
     )
     parser.add_argument(
@@ -133,12 +134,16 @@ def main() -> int:
         base_url = config.base_url
         source = "static"
     else:
+        # Only the explicit CLI flag should override JOBTRAIL_DISCOVER_CONTAINER;
+        # argparse's own default must never clobber an env-configured value
+        # that the operator relied on when omitting --container.
+        container = args.container or config.discover_container or DISCOVER_DEFAULT_CONTAINER
         discovery_config = AutomationConfig(
-            **{**config.__dict__, "discover_container": args.container}
+            **{**config.__dict__, "discover_container": container}
         )
         try:
             base_url, source = resolve_automation_base_url(
-                discovery_config, container_name=args.container
+                discovery_config, container_name=container
             )
         except BackendDiscoveryError as error:
             print(f"backend discovery failed: {error}", file=sys.stderr)

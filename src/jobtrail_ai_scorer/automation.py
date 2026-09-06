@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 from dataclasses import dataclass
 import json
 import os
@@ -322,6 +323,7 @@ class JobTrailAutomation:
         self.seen_cache = seen_cache
         self._scorer_command = "jobtrail-ai-scorer"
         self._whatsapp_command = ""
+        self.base_url = AutomationConfig.base_url
         # Scorer subprocess invocations are idempotent (the CLI runs with
         # ``--force``) so retry is safe. The default policy bounds attempts
         # and total backoff so a wedged provider cannot block a run forever.
@@ -337,6 +339,12 @@ class JobTrailAutomation:
         # (default or injected) in a single ``retry_call`` with
         # ``_scorer_retry_policy``. Retrying here too would nest attempts
         # (up to max_attempts**2) and silently exceed the documented policy.
+        #
+        # ``--base-url`` propagates the URL this run actually searched and
+        # imported against (``self.base_url``, set from the resolved
+        # ``AutomationConfig.base_url`` in ``run()``) so the scorer targets
+        # the same backend instead of falling back to whatever static
+        # ``jobtrail_base_url`` is committed in the scorer's own YAML config.
         subprocess.run(
             [
                 *shlex.split(self._scorer_command),
@@ -346,6 +354,8 @@ class JobTrailAutomation:
                 "--job-id",
                 job_id,
                 "--force",
+                "--base-url",
+                self.base_url,
             ],
             check=True,
         )
@@ -375,14 +385,25 @@ class JobTrailAutomation:
                 searched += len(jobs)
                 for job in jobs:
                     try:
-                        if self._is_cached(job, config=config, failures=failures):
-                            continue
-                        result = self.gateway.import_job(map_jobspy_job(job))
-                        job_id = result.get("id")
-                        if job_id is not None and str(job_id) not in ids:
-                            ids.append(str(job_id))
-                            imported += 1
-                        self._record_seen(job, failures=failures)
+                        # Hold the seen-cache lock across the whole
+                        # check/import/mark sequence (not just each call in
+                        # isolation) so an overlapping run can never import
+                        # the same offer twice or drop this run's mark; see
+                        # SeenCache.transaction.
+                        cache_txn = (
+                            self.seen_cache.transaction()
+                            if self.seen_cache is not None
+                            else contextlib.nullcontext()
+                        )
+                        with cache_txn:
+                            if self._is_cached(job, config=config, failures=failures):
+                                continue
+                            result = self.gateway.import_job(map_jobspy_job(job))
+                            job_id = result.get("id")
+                            if job_id is not None and str(job_id) not in ids:
+                                ids.append(str(job_id))
+                                imported += 1
+                            self._record_seen(job, failures=failures)
                     except Exception as exc:
                         failures.append(_format_failure("import", exc))
             except Exception as exc:
