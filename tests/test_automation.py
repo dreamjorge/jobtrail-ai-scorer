@@ -1,4 +1,5 @@
 import json
+import re
 
 import httpx
 import pytest
@@ -233,30 +234,48 @@ def test_selected_notification_contains_job_and_score_data(monkeypatch):
     original_summary = automation.build_notification_summary
     summary_args = []
 
-    def capture_summary(job, score):
+    def capture_summary(job, score, **_kwargs):
         summary_args.append((job, score))
-        return original_summary(job, score)
+        return original_summary(job, score, **_kwargs)
 
     monkeypatch.setattr(automation, "build_notification_summary", capture_summary)
     JobSearchAutomation(gateway, scorer=scorer, notifier=notifier).run(
         config=AutomationConfig(
-            scorer_config_path="safe/config.yaml", notify_enabled=True
+            base_url="http://jobtrail.example.com",
+            scorer_config_path="safe/config.yaml",
+            notify_enabled=True,
         )
     )
 
     assert summary_args[0][0] is gateway.jobs["j1"]
     assert summary_args[0][1]["score"] == 91
     message = json.loads(notifier.messages[0])
-    assert message == {
-        "title": "Python Engineer",
-        "company": "Acme",
-        "location": "Queretaro",
-        "jobUrl": "https://jobs.test/1",
-        "score": 91,
-        "recommendation": "PRIORITY_APPLY",
-        "strengths": ["Python"],
-        "gaps": ["None"],
+    assert set(message) == {
+        "title",
+        "company",
+        "location",
+        "score",
+        "recommendation",
+        "recommendationLabel",
+        "strengths",
+        "gaps",
+        "jobUrl",
+        "jobTrailLink",
+        "runId",
     }
+    assert message["title"] == "Python Engineer"
+    assert message["company"] == "Acme"
+    assert message["location"] == "Queretaro"
+    assert message["jobUrl"] == "https://jobs.test/1"
+    assert message["score"] == 91
+    assert message["recommendation"] == "PRIORITY_APPLY"
+    assert message["recommendationLabel"] == "Priority Apply"
+    assert message["strengths"] == ["Python"]
+    assert message["gaps"] == ["None"]
+    assert message["jobTrailLink"] == "http://jobtrail.example.com/jobs/j1"
+    import re as _re
+
+    assert _re.match(r"^\d{4}-\d{2}-\d{2}-\d{4}-[a-f0-9]{6}$", message["runId"])
 
 
 def test_no_notification_when_score_below_threshold():
@@ -346,6 +365,7 @@ def test_failed_scorer_cannot_select_or_notify_old_high_marker():
 def test_notification_summary_allowlist_and_bounded_text():
     summary = build_notification_summary(
         {
+            "id": "j1",
             "position": "Visible title",
             "company": "Visible company",
             "location": "Visible location",
@@ -362,6 +382,7 @@ def test_notification_summary_allowlist_and_bounded_text():
             "gaps": ["G" * 300],
             "reasoning": "FORBIDDEN REASONING",
         },
+        base_url="https://jobtrail.example.com",
     )
 
     assert set(summary) == {
@@ -370,13 +391,20 @@ def test_notification_summary_allowlist_and_bounded_text():
         "location",
         "score",
         "recommendation",
+        "recommendationLabel",
         "strengths",
         "gaps",
         "jobUrl",
+        "jobTrailLink",
+        "runId",
     }
     assert "FORBIDDEN" not in json.dumps(summary)
+    assert "description" not in json.dumps(summary).lower()
+    assert "candidate_profile" not in json.dumps(summary).lower()
+    assert "prompt" not in json.dumps(summary).lower()
     assert len(summary["strengths"][0]) <= 200
     assert len(summary["gaps"][0]) <= 200
+    assert summary["jobTrailLink"] == "https://jobtrail.example.com/jobs/j1"
 
 
 class _FakeProbe:
@@ -850,6 +878,9 @@ def test_automation_no_notification_when_nothing_to_report():
     assert notifier_off.messages == []
 
 
+_RUN_ID_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}-\d{4}-[a-f0-9]{6}$")
+
+
 def test_automation_failure_summary_is_bounded_and_safe():
     """The failure summary exposes only abstract labels, no sensitive content."""
 
@@ -873,3 +904,99 @@ def test_automation_failure_summary_is_bounded_and_safe():
         assert isinstance(label, str)
         assert "sensitive" not in label
         assert "description" not in label.lower()
+
+
+# --- NotificationBuilder end-to-end wiring -------------------------------
+
+
+
+def test_compose_notification_includes_three_new_fields_in_run():
+    """``JobTrailAutomation.run`` exposes jobTrailLink, recommendationLabel, and runId."""
+
+    gateway = FakeJobTrail()
+    scorer = FakeScorer()
+    scorer.jobs = gateway.jobs
+    notifier = FakeNotifier()
+
+    JobSearchAutomation(gateway, scorer=scorer, notifier=notifier).run(
+        config=AutomationConfig(
+            base_url="http://jobtrail.example.com",
+            scorer_config_path="safe/config.yaml",
+            notify_enabled=True,
+        )
+    )
+
+    assert len(notifier.messages) == 1
+    message = json.loads(notifier.messages[0])
+    # The three new fields are present and stable.
+    assert message["jobTrailLink"].endswith("/jobs/j1")
+    assert message["jobTrailLink"].startswith("http://jobtrail.example.com")
+    assert message["recommendationLabel"] in {"Apply", "Priority Apply", "Review", "Skip"}
+    assert _RUN_ID_PATTERN.match(message["runId"])
+
+
+def test_compose_notification_link_uses_whatsapp_short_url_base(monkeypatch):
+    """The run path honors WHATSAPP_SHORT_URL_BASE via NotificationBuilder.from_env."""
+
+    monkeypatch.setenv("WHATSAPP_SHORT_URL_BASE", "https://sho.rt")
+    gateway = FakeJobTrail()
+    scorer = FakeScorer()
+    scorer.jobs = gateway.jobs
+    notifier = FakeNotifier()
+
+    JobSearchAutomation(gateway, scorer=scorer, notifier=notifier).run(
+        config=AutomationConfig(
+            base_url="http://jobtrail.example.com",
+            scorer_config_path="safe/config.yaml",
+            notify_enabled=True,
+        )
+    )
+
+    message = json.loads(notifier.messages[0])
+    assert message["jobTrailLink"].startswith("https://sho.rt/")
+    assert message["jobTrailLink"].endswith("/jobs/j1")
+    assert "jobtrail.example.com" not in message["jobTrailLink"]
+
+
+def test_compose_notification_redacts_sensitive_substrings_in_run():
+    """CV/profile/prompt/credential substrings never reach the notifier."""
+
+    gateway = FakeJobTrail()
+
+    def score(job_id, config_path):
+        # Inject sentinels in the strengths/gaps so the scrub step is exercised
+        # through the full run pipeline.
+        gateway.jobs[job_id]["notes"] = [
+            {
+                "body": (
+                    "[AI_JOB_SCORE_V1]\n"
+                    + json.dumps(
+                        {
+                            "score": 91,
+                            "recommendation": "PRIORITY_APPLY",
+                            "strengths": ["PROMPT_SENTINEL contained"],
+                            "gaps": ["RESUME_SENTINEL contained"],
+                            "reasoning": "PROFILE_SENTINEL reasoning",
+                        }
+                    )
+                )
+            }
+        ]
+
+    notifier = FakeNotifier()
+    JobSearchAutomation(gateway, scorer=score, notifier=notifier).run(
+        config=AutomationConfig(
+            base_url="http://jobtrail.example.com",
+            scorer_config_path="safe/config.yaml",
+            notify_enabled=True,
+        )
+    )
+
+    rendered = notifier.messages[0]
+    for sentinel in (
+        "RESUME_SENTINEL",
+        "PROFILE_SENTINEL",
+        "PROMPT_SENTINEL",
+        "CREDENTIAL_SENTINEL",
+    ):
+        assert sentinel not in rendered

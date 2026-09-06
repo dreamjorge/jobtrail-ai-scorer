@@ -18,6 +18,7 @@ from .discover import (  # noqa: F401  (re-exported on purpose)
 )
 from .retry import RetryPolicy, classify_retryable, retry_call
 from .seen_cache import SeenCache
+from .notify import NotificationBuilder, recommendation_label
 
 
 DEFAULT_TERMS = (
@@ -164,28 +165,27 @@ def parse_score_note(notes: Any) -> dict[str, Any] | None:
 
 
 def build_notification_summary(
-    job: Mapping[str, Any], score: Mapping[str, Any]
+    job: Mapping[str, Any],
+    score: Mapping[str, Any],
+    *,
+    base_url: str = "",
 ) -> dict[str, Any]:
-    """Build a bounded notification from explicitly allowlisted fields."""
+    """Build a bounded notification from explicitly allowlisted fields.
 
-    def text(value: Any, limit: int = 200) -> str:
-        return str(value or "")[:limit]
+    The legacy 8-field summary is preserved for callers that do not pass a
+    ``base_url``. When ``base_url`` is provided, the new
+    :class:`NotificationBuilder` is used so the summary also exposes
+    ``jobTrailLink``, ``recommendationLabel``, and ``runId``. The CV/profile/
+    prompt/credential redaction contract is enforced inside the builder.
+    """
 
-    def items(value: Any) -> list[str]:
-        if not isinstance(value, list):
-            return []
-        return [text(item) for item in value[:5]]
-
-    return {
-        "title": text(job.get("position", job.get("title"))),
-        "company": text(job.get("company")),
-        "location": text(job.get("location")),
-        "score": score.get("score"),
-        "recommendation": text(score.get("recommendation")),
-        "strengths": items(score.get("strengths")),
-        "gaps": items(score.get("gaps")),
-        "jobUrl": text(job.get("jobUrl", job.get("job_url"))),
-    }
+    builder = NotificationBuilder.from_env(base_url=base_url)
+    summary = builder.build(score=score, job=job)
+    if "recommendationLabel" not in summary:
+        # Defensive fallback for the no-base-url path so the legacy callers
+        # still get a stable, normalized recommendation label.
+        summary["recommendationLabel"] = recommendation_label(score.get("recommendation"))
+    return summary
 
 
 class AutomationGateway(Protocol):
@@ -367,6 +367,7 @@ class JobTrailAutomation:
         scored_ids: list[str] = []
         self._scorer_command = config.scorer_command
         self._whatsapp_command = config.whatsapp_command
+        self.base_url = config.base_url
         searched = imported = scored = 0
         for payload in search_payloads(config):
             try:
@@ -434,6 +435,7 @@ class JobTrailAutomation:
             failures=tuple(failures),
             notify_enabled=config.notify_enabled,
             notify_on_failure=config.notify_on_failure,
+            base_url=self.base_url,
         )
         if notification_body is not None:
             try:
@@ -451,6 +453,7 @@ class JobTrailAutomation:
         failures: tuple[str, ...],
         notify_enabled: bool,
         notify_on_failure: bool,
+        base_url: str = "",
     ) -> str | None:
         """Assemble the WhatsApp helper message from the run's outcome.
 
@@ -459,12 +462,22 @@ class JobTrailAutomation:
         - ``notify_on_failure`` is set and at least one failure was recorded.
         When both apply, the failure summary is appended on a separate line so
         the best-match JSON remains diff-friendly.
+
+        The best-match payload is now produced by
+        :class:`NotificationBuilder` so the daily summary exposes
+        ``jobTrailLink``, ``recommendationLabel``, and ``runId``. The
+        optional ``WHATSAPP_SHORT_URL_BASE`` env var rewrites the
+        JobTrail host while preserving the trailing ``/jobs/<id>`` path.
         """
 
         match_body: str | None = None
         if best is not None and notify_enabled:
             match_body = json.dumps(
-                build_notification_summary(best_job or {}, best_score or {}),
+                build_notification_summary(
+                    best_job or {},
+                    best_score or {},
+                    base_url=base_url,
+                ),
                 ensure_ascii=False,
                 sort_keys=True,
             )

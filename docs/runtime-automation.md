@@ -6,7 +6,7 @@ Run `scripts/automated-job-search.example.py` from an operator-controlled schedu
 
 Defaults are safe and bounded: `JOBTRAIL_BASE_URL=http://127.0.0.1:8000`, `JOB_SEARCH_RESULTS_WANTED=10`, `JOB_SEARCH_HOURS_OLD=72`, `JOB_SEARCH_MAX_SCORE=10`, and `JOB_SCORE_THRESHOLD=80`. Override `JOB_SEARCH_SITES`, `JOB_SEARCH_TERMS`, `JOB_SEARCH_LOCATIONS` (semicolon-separated), `SCORER_COMMAND`, and `WHATSAPP_NOTIFY_COMMAND` as needed.
 
-Set `WHATSAPP_NOTIFY_COMMAND=./notify-whatsapp-via-hermes.local.sh` (the helper accepts the summary on stdin), then set `WHATSAPP_NOTIFY_ENABLED=1` only when the configured Hermes notification helper is ready. At most one summary is sent per run, and only for the highest validated score at or above the threshold. The summary contains title, company, location, score, recommendation, strengths, gaps, and URL only. This workflow writes `[AI_JOB_SCORE_V1]` notes and sends WhatsApp when enabled, but **never applies to jobs automatically**. It must not expose descriptions, profiles, prompts, notes, credentials, or secrets.
+Set `WHATSAPP_NOTIFY_COMMAND=./notify-whatsapp-via-hermes.local.sh` (the helper accepts the summary on stdin), then set `WHATSAPP_NOTIFY_ENABLED=1` only when the configured Hermes notification helper is ready. At most one summary is sent per run, and only for the highest validated score at or above the threshold. The summary contains title, company, location, score, recommendation, recommendation label, strengths, gaps, the external job URL, the JobTrail link, and the run identifier only. See [Daily WhatsApp summary fields](#daily-whatsapp-summary-fields) for the contract and the optional `WHATSAPP_SHORT_URL_BASE` shortener. This workflow writes `[AI_JOB_SCORE_V1]` notes and sends WhatsApp when enabled, but **never applies to jobs automatically**. It must not expose descriptions, profiles, prompts, notes, credentials, or secrets.
 
 Use these examples to run JobTrail AI Scorer from a local scheduler while keeping private runtime files out of the repository. Copy the example files, edit only local ignored copies, and dry-run first before allowing writes to JobTrail notes.
 
@@ -130,6 +130,65 @@ Operators can grep the summary for `:retryable`, `:exhausted`, or `:terminal`
 to distinguish transient blips from persistent failures. The summary never
 includes exception messages, descriptions, profiles, prompts, or credentials.
 
+## Daily WhatsApp summary fields
+
+Every best-match notification produced by `JobTrailAutomation.run` is built by
+`jobtrail_ai_scorer.notify.NotificationBuilder`. The rendered summary exposes
+exactly the allowlisted fields below, in this order, with no extra keys:
+
+| Field | Source | Notes |
+| --- | --- | --- |
+| `title` | `job.position` / `job.title` | Clipped to `MAX_TEXT_LENGTH` (200) characters. |
+| `company` | `job.company` | Clipped. |
+| `location` | `job.location` | Clipped. |
+| `score` | `score.score` | The integer validated by `ScoreResult`. |
+| `recommendation` | `score.recommendation` | Always one of `PRIORITY_APPLY`, `APPLY`, `REVIEW`, `SKIP`; defaults to `APPLY` when missing or unknown. |
+| `recommendationLabel` | derived | Human-readable label (`"Priority Apply"`, `"Apply"`, `"Review"`, `"Skip"`). |
+| `strengths` | `score.strengths` | First `MAX_LIST_ITEMS` (5) entries, each clipped. |
+| `gaps` | `score.gaps` | First `MAX_LIST_ITEMS` (5) entries, each clipped. |
+| `jobUrl` | `job.jobUrl` / `job.job_url` | External apply URL. |
+| `jobTrailLink` | derived | `base_url` (after `JOBTRAIL_BASE_URL` resolution) joined with `/jobs/<id>`, percent-encoded. Omitted when the job has no id. |
+| `runId` | derived | `YYYY-MM-DD-HHMM-<6-char hex>` for the daily run; deterministic for the same stamp + seed. |
+
+### URL shortener (opt-in)
+
+Set `WHATSAPP_SHORT_URL_BASE=https://sho.rt` (or another HTTPS host) to
+rewrite the JobTrail host while preserving the trailing `/jobs/<id>` path.
+The shortener is strictly opt-in: when the environment variable is unset
+or empty, the unshortened `jobTrailLink` is rendered verbatim. A trailing
+slash on `WHATSAPP_SHORT_URL_BASE` is tolerated without doubling the path.
+
+### Redaction guarantees
+
+`NotificationBuilder` scrubs every emitted string against the public
+`FORBIDDEN_TOKENS` tuple (private runtime paths plus the `RESUME_SENTINEL`,
+`PROFILE_SENTINEL`, `PROMPT_SENTINEL`, and `CREDENTIAL_SENTINEL` test-visible
+sentinels). Real CV / profile / prompt / description / notes / reasoning /
+credential values are never copied into the rendered summary because only
+the allowlisted fields are emitted. The redaction is defensive: any string
+that *does* end up in an allowlisted field is run through the scrub step
+so a regression that leaks a sensitive substring is caught and replaced
+with `[REDACTED]` before the helper message reaches WhatsApp.
+
+### Tests
+
+`tests/test_notify.py` asserts:
+
+* the three new fields are always present when the corresponding source data
+  is available;
+* `runId` matches `^\d{4}-\d{2}-\d{2}-\d{4}-[a-f0-9]{6}$`;
+* the recommendation is normalized to one of the four allowed values, with
+  `APPLY` as the default;
+* the allowlist is closed — no extra fields ever appear;
+* every forbidden CV / profile / prompt / credential sentinel is stripped
+  from the rendered output;
+* `WHATSAPP_SHORT_URL_BASE` (set or unset) rewrites the JobTrail link
+  correctly and tolerates a trailing slash.
+
+`tests/test_automation.py` covers the end-to-end wiring through
+`JobTrailAutomation.run` so the contract is guaranteed across the
+orchestration boundary, not just in unit tests.
+
 ### WHATSAPP_NOTIFY_ON_FAILURE opt-in
 
 `WHATSAPP_NOTIFY_ON_FAILURE=1` (or `true`/`yes`/`on`) appends a bounded
@@ -205,6 +264,25 @@ budget for one run. When a section is clipped, the default marker `\n[... conten
 is appended; override it with `PROMPT_TRUNCATE_MARKER`. The marker counts toward the section's
 budget. If a profile or CV is missing, a directory, or unreadable, the scorer logs a warning and
 continues with the context that could be loaded. It does not expose file contents in the warning.
+
+### Per-section token estimate and budget warning
+
+Every `score` run emits exactly one `prompt_tokens_estimate={...}` line with a per-section
+breakdown (`profile`, `cv`, `job`, `schema`, `instructions`, `total`). The estimate uses a
+deterministic, dependency-free approximation:
+
+- `PROMPT_TOKEN_ESTIMATOR=chars4` (default) rounds `len(text) / 4` up.
+- `PROMPT_TOKEN_ESTIMATOR=words` splits on whitespace and counts tokens.
+
+The estimate is reproducible for the same input so subsequent runs and CI logs can diff the
+breakdown. The job section uses the same JSON serialization the provider receives, with notes
+stripped. No external token counter or network call is involved.
+
+Set `PROMPT_TOKEN_BUDGET` to a positive integer to enable the optional budget check. When
+`total` exceeds the budget the scorer prints an extra `prompt_token_budget={"budget": N,
+"total": M}` warning line in the same run. When the variable is unset, empty, or the total
+fits, no warning is emitted. The warning never aborts the run and never embeds prompt,
+profile, CV, or description content.
 
 ## Hermes Docker wrapper script
 

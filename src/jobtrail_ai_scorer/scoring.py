@@ -14,6 +14,28 @@ from .providers.base import ScoreProvider
 CURRENT_MARKER = "[AI_JOB_SCORE_V1]"
 LEGACY_MARKER = "[HERMES_JOB_SCORE_V1]"
 
+PROMPT_INSTRUCTIONS = (
+    "Evaluate this job against the candidate profile. "
+)
+PROMPT_SCHEMA = (
+    "Return JSON only matching the configured score schema. Use exactly these keys "
+    "and no extra fields: score, recommendation, strengths, gaps, needs_confirmation, "
+    "hard_requirements_missing, career_value, reasoning. "
+    "score must be an integer 0-100. "
+    "recommendation must be one of PRIORITY_APPLY, APPLY, REVIEW, SKIP. "
+    "strengths, gaps, needs_confirmation, and hard_requirements_missing "
+    "must be arrays of strings. "
+    "career_value must be one of High, Medium, Low. "
+    "reasoning must be a non-empty string."
+)
+
+
+def serialize_job(job: dict[str, Any]) -> str:
+    """Return the deterministic JSON serialization of ``job`` (excluding notes)."""
+
+    job_data = {key: value for key, value in job.items() if key != "notes"}
+    return json.dumps(job_data, sort_keys=True, default=str)
+
 
 class JobTrailGateway(Protocol):
     """The small JobTrail boundary required by the scoring workflow."""
@@ -64,19 +86,9 @@ def should_score(
 def render_prompt(job: dict[str, Any], candidate_profile: str) -> str:
     """Render a deterministic provider prompt from a job and local profile."""
 
-    job_data = {key: value for key, value in job.items() if key != "notes"}
-    job_json = json.dumps(job_data, sort_keys=True, default=str)
+    job_json = serialize_job(job)
     return (
-        "Evaluate this job against the candidate profile. Return JSON only matching "
-        "the configured score schema. Use exactly these keys and no extra fields: "
-        "score, recommendation, strengths, gaps, needs_confirmation, "
-        "hard_requirements_missing, career_value, reasoning. "
-        "score must be an integer 0-100. "
-        "recommendation must be one of PRIORITY_APPLY, APPLY, REVIEW, SKIP. "
-        "strengths, gaps, needs_confirmation, and hard_requirements_missing "
-        "must be arrays of strings. "
-        "career_value must be one of High, Medium, Low. "
-        "reasoning must be a non-empty string.\n\n"
+        f"{PROMPT_INSTRUCTIONS}{PROMPT_SCHEMA}\n\n"
         f"Candidate profile:\n{candidate_profile}\n\n"
         f"Job:\n{job_json}\n"
     )
