@@ -1,4 +1,15 @@
 #!/usr/bin/env bash
+# DEPRECATED — do not use in production.
+# ---------------------------------------------------------------------------
+# Filename:    scripts/legacy/run-scorer.example.sh
+# Status:      Deprecated dry-run batch wrapper.
+# Replacement: scripts/automated-job-search.example.py
+#              (canonical orchestration entry point for the real flow).
+# Target removal date: 2026-06-01
+# Rationale:   The repo now ships a single canonical automation launcher.
+#              This script is kept only as a historical reference for
+#              operators migrating from the original dry-run-first setup.
+# ---------------------------------------------------------------------------
 set -euo pipefail
 
 : "${SCORER_CONFIG_PATH:?SCORER_CONFIG_PATH must be set}"

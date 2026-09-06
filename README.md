@@ -65,6 +65,15 @@ optional WhatsApp notification through Hermes, dynamic backend URL discovery
 maintenance rules, and the strict opt-in purge helper that removes the
 historical runtime duplicate of the config example.
 
+The canonical real-path flow lives at the root of `scripts/`
+(`automated-job-search.example.py`, `hermes-docker-wrapper.example.sh`,
+`notify-whatsapp-via-hermes.example.sh`) plus the strict opt-in
+`_purge_runtime_example.py` helper. The historical dry-run wrappers
+(`run-scorer.example.sh`, `hermes-score-jobs.sh`) are grouped under
+[`scripts/legacy/`](scripts/legacy/README.md) with a `DEPRECATED` header and a
+target removal date; do not use them in production. See the
+[legacy README](scripts/legacy/README.md) for the replacement mapping.
+
 ## Automated JobTrail search
 
 Run `scripts/automated-job-search.example.py` with required `SCORER_CONFIG_PATH`.

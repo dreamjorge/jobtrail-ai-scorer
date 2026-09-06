@@ -10,6 +10,14 @@ Set `WHATSAPP_NOTIFY_COMMAND=./notify-whatsapp-via-hermes.local.sh` (the helper 
 
 Use these examples to run JobTrail AI Scorer from a local scheduler while keeping private runtime files out of the repository. Copy the example files, edit only local ignored copies, and dry-run first before allowing writes to JobTrail notes.
 
+> **Deprecation note.** The historical dry-run wrappers
+> `scripts/run-scorer.example.sh` and `scripts/hermes-score-jobs.sh` have been
+> moved under [`scripts/legacy/`](scripts/legacy/README.md) with a
+> `DEPRECATED` header. Do not use them in production; the canonical real-path
+> flow is `scripts/automated-job-search.example.py`. See
+> [`scripts/legacy/README.md`](scripts/legacy/README.md) for the replacement
+> mapping and target removal date.
+
 ## Backend URL resolution
 
 The systemd service must reach the JobTrail backend. Instead of baking a private
@@ -339,6 +347,14 @@ docker exec "$HERMES_CONTAINER" "$HERMES_BIN" "$@"
 Configure `HERMES_CONTAINER` and `HERMES_BIN` in the scheduler environment if your container name or Hermes path differs.
 
 ## Runner usage
+
+> **Deprecated.** The `run-scorer.example.sh` runner was moved under
+> [`scripts/legacy/`](scripts/legacy/README.md) in Issue #8 and is kept only
+> as a historical reference. New scheduler units must drive
+> `scripts/automated-job-search.example.py` directly. The guidance below is
+> retained verbatim so existing operators can keep their local `run-scorer.local.sh`
+> copies running until they migrate; the wrapper itself is marked
+> `DEPRECATED` and will be removed.
 
 Start with dry-run mode:
 
