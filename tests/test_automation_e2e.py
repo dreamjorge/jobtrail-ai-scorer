@@ -306,7 +306,7 @@ def test_partial_failure_continues_run(server, state):
     assert result.selected["company"] == "Beta Inc"
     assert result.selected["score"] == 88
     assert any(
-        failure.startswith("import:exhausted") and "HTTPStatusError" in failure
+        failure.startswith("import:retryable") and "HTTPStatusError" in failure
         for failure in result.failures
     ), result.failures
 

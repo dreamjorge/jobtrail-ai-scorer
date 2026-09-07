@@ -844,50 +844,65 @@ def test_whatsapp_notify_on_failure_sends_summary_even_without_match(monkeypatch
 # --- Triangulation: additional retry wiring cases ----------------------------
 
 
-def test_automation_import_retries_on_5xx_then_succeeds():
-    """Transient 5xx import errors are retried by the HTTP client."""
+@pytest.mark.parametrize(
+    "error",
+    [
+        httpx.HTTPStatusError(
+            "transient",
+            request=httpx.Request("POST", "http://test/import"),
+            response=httpx.Response(
+                503, request=httpx.Request("POST", "http://test/import")
+            ),
+        ),
+        TimeoutError("timed out"),
+        ConnectionError("connection lost"),
+    ],
+    ids=["5xx", "timeout", "connection"],
+)
+def test_automation_import_failure_is_not_retried_and_is_partial(error):
+    """A lost import response must not cause a duplicate POST."""
 
-    class _FlakyImportHTTPClient:
+    class _FailedImportHTTPClient:
         def __init__(self) -> None:
-            self.import_failures = 2
             self.posts: list[tuple[str, dict]] = []
 
         def post(self, path, *, json):
             self.posts.append((path, json))
-            if path.endswith("/import") and self.import_failures > 0:
-                self.import_failures -= 1
-                request = httpx.Request("POST", "http://test/import")
-                response = httpx.Response(503, request=request)
-                raise httpx.HTTPStatusError(
-                    "transient", request=request, response=response
-                )
-            if path.endswith("/search"):
-                return FakeResponse(
-                    [{"id": "x", "site": "indeed", "title": "T", "company": "C"}]
-                )
-            # Use a stable id so the same job is de-duplicated by ``ids``.
-            return FakeResponse({"id": "j1"})
+            if path.endswith("/import"):
+                raise error
+            return FakeResponse(
+                [{"id": "x", "site": "indeed", "title": "T", "company": "C"}]
+            )
 
-        def get(self, path):
-            return FakeResponse({"id": "j1", "notes": []})
-
-    recorder = _FlakyImportHTTPClient()
+    recorder = _FailedImportHTTPClient()
     client = JobTrailHTTPClient("http://test", client=recorder)
-    scorer = FakeScorer()
-    scorer.jobs = {"j1": {"id": "j1", "notes": []}}
-
-    result = JobSearchAutomation(client, scorer=scorer).run(
+    result = JobSearchAutomation(client).run(
         config=AutomationConfig(
-            scorer_config_path="safe/config.yaml",
-            locations=("Queretaro",),  # single location to keep the test focused
+            scorer_config_path="safe/config.yaml", locations=("Queretaro",)
         )
     )
 
-    # Both transient 5xx responses were absorbed by the retry helper; the
-    # eventual success was recorded as one imported job.
-    assert recorder.import_failures == 0
-    assert result.failures == ()
-    assert result.imported == 1
+    assert [path for path, _ in recorder.posts].count("/api/discover/import") == 1
+    assert result.searched == 1
+    assert result.imported == 0
+    assert result.failures and result.failures[0].startswith("import:")
+    assert type(error).__name__ in result.failures[0]
+
+
+def test_automation_get_retries_on_transient_failure():
+    class _FlakyGetHTTPClient:
+        attempts = 0
+
+        def get(self, path):
+            self.attempts += 1
+            if self.attempts < 3:
+                raise httpx.ReadTimeout("transient")
+            return FakeResponse({"id": "j1", "notes": []})
+
+    recorder = _FlakyGetHTTPClient()
+    client = JobTrailHTTPClient("http://test", client=recorder)
+    assert client.get_job("j1") == {"id": "j1", "notes": []}
+    assert recorder.attempts == 3
 
 
 def test_automation_no_notification_when_nothing_to_report():

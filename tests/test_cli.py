@@ -1,5 +1,6 @@
 """Focused tests for the public scorer command."""
 import pytest
+from pydantic import ValidationError
 
 typer = pytest.importorskip("typer")  # noqa: E402
 from typer.testing import CliRunner  # noqa: E402
@@ -106,6 +107,57 @@ def test_run_score_warns_and_continues_when_profile_is_missing(caplog, tmp_path)
     assert result.processed == 1
     assert "CV CONTENT" in prompts[0]
     assert "Unable to load candidate profile" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("override", "invalid_value", "field"),
+    [
+        ("provider_name", "not-a-provider", "provider"),
+        ("base_url", "not-a-url", "jobtrail_base_url"),
+    ],
+)
+def test_run_score_revalidates_overrides(tmp_path, override, invalid_value, field):
+    config_path = _config(tmp_path)
+
+    with pytest.raises(ValidationError, match=field):
+        main.run_score(
+            config_path=config_path,
+            **{override: invalid_value},
+            client_factory=lambda _: pytest.fail("invalid config reached client"),
+            provider_factory=lambda _: pytest.fail("invalid config reached provider"),
+        )
+
+
+def test_run_score_uses_validated_overrides(tmp_path):
+    config_path = _config(tmp_path)
+    seen = {}
+
+    class FakeClient:
+        def close(self):
+            pass
+
+    def client_factory(url):
+        seen["url"] = url
+        return FakeClient()
+
+    def provider_factory(config):
+        seen["provider"] = config.provider
+        return object()
+
+    main.run_score(
+        config_path=config_path,
+        provider_name="openai_compatible",
+        base_url="https://jobs.example.test",
+        job_id="j1",
+        dry_run=True,
+        client_factory=client_factory,
+        provider_factory=provider_factory,
+    )
+
+    assert seen == {
+        "url": "https://jobs.example.test/",
+        "provider": "openai_compatible",
+    }
 
 
 def test_score_forwards_flags_and_emits_once(monkeypatch, tmp_path):

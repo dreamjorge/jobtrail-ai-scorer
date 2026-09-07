@@ -208,8 +208,8 @@ class JobTrailHTTPClient:
     ) -> None:
         self._client = client or httpx.Client(base_url=base_url.rstrip("/"), timeout=30)
         self._owned = client is None
-        # Retry is applied only to idempotent operations (search and import).
-        # ``get_job`` is a plain GET and benefits from the same bounded retry.
+        # Retry is applied only to idempotent operations (search and GET).
+        # Import is a non-idempotent POST and is deliberately never retried.
         self._retry_policy = retry_policy or RetryPolicy()
         self._retry_sleep = retry_sleep
 
@@ -217,14 +217,16 @@ class JobTrailHTTPClient:
         if self._owned:
             self._client.close()
 
-    def _post(self, path: str, payload: dict[str, Any]) -> Any:
-        def _do_post() -> Any:
-            response = self._client.post(path, json=payload)
-            response.raise_for_status()
-            return response.json()
+    def _post_once(self, path: str, payload: dict[str, Any]) -> Any:
+        response = self._client.post(path, json=payload)
+        response.raise_for_status()
+        return response.json()
 
+    def _post(self, path: str, payload: dict[str, Any]) -> Any:
         return retry_call(
-            _do_post,
+            self._post_once,
+            path,
+            payload,
             policy=self._retry_policy,
             sleep=self._retry_sleep,
             label=f"POST {path}",
@@ -239,7 +241,7 @@ class JobTrailHTTPClient:
         )
 
     def import_job(self, payload: dict[str, Any]) -> dict[str, Any]:
-        result = self._post("/api/discover/import", payload)
+        result = self._post_once("/api/discover/import", payload)
         return result if isinstance(result, dict) else {"id": result}
 
     def get_job(self, job_id: str) -> dict[str, Any]:

@@ -92,10 +92,12 @@ path with `JOBTRAIL_SEEN_CACHE_PATH`. Pass `--reset-seen-cache` (or set
 Corruption, missing parent directories, or permission errors degrade to an
 empty cache and never crash the run.
 
-Idempotent network calls (search, import, scorer subprocess, JobTrail reads)
+Idempotent network calls (search, scorer subprocess, JobTrail reads)
 are wrapped in a bounded retry helper. HTTP `5xx` and transient transport
 errors are retried with exponential backoff (default 3 attempts, 0.5–8s
-capped); HTTP `4xx` and configuration errors are terminal and recorded
+capped). The non-idempotent `POST /api/discover/import` and note POSTs are
+attempted only once; no import retry opt-in is provided without a verified
+idempotency-key contract. HTTP `4xx` and configuration errors are terminal and recorded
 without retries. Failures carry `retryable`, `exhausted`, or `terminal`
 classifications on `AutomationRun.failures` so operators can distinguish
 transient blips from persistent failures. Each retry attempt is logged with
