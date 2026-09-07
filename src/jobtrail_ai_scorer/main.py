@@ -57,14 +57,17 @@ def run_score(*, config_path: Path, limit: int | None = None, job_id: str | None
               client_factory: ClientFactory | None = None,
               provider_factory: ProviderFactory | None = None) -> ScoreRunResult:
     config = load_config(config_path)
-    if provider_name:
-        config = config.model_copy(update={"provider": provider_name})
-    if base_url:
+    overrides = {}
+    if provider_name is not None:
+        overrides["provider"] = provider_name
+    if base_url is not None:
         # Lets a caller that already resolved the live backend (e.g. the
         # discovery-aware automation launcher) override the static YAML
         # value, instead of every scored job silently targeting whatever
         # jobtrail_base_url happens to be committed in the config file.
-        config = config.model_copy(update={"jobtrail_base_url": base_url})
+        overrides["jobtrail_base_url"] = base_url
+    if overrides:
+        config = type(config).model_validate({**config.model_dump(), **overrides})
     prompt_budget = PromptBudget.from_env()
     profile, profile_status = prompt_budget.load_optional_text(
         config.candidate_profile_path, prompt_budget.profile_budget_chars
