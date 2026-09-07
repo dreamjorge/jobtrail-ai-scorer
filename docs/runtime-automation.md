@@ -101,10 +101,13 @@ never sees offers that the cache reports as already-seen within the TTL.
 
 ## Bounded retries with backoff
 
-Idempotent network calls (`/api/discover/search`, `/api/discover/import`,
-`GET /api/jobs/...`, and the local scorer subprocess) are wrapped in a
-bounded retry helper (`jobtrail_ai_scorer.retry`). Retries are skipped for
-operations that could produce duplicate side effects (`POST /api/jobs/.../notes`).
+Idempotent network calls (`/api/discover/search`, `GET /api/jobs/...`, and the
+local scorer subprocess) are wrapped in a bounded retry helper
+(`jobtrail_ai_scorer.retry`). `POST /api/discover/import` is non-idempotent, so a
+lost response must not trigger a duplicate import and it is attempted only once.
+Retries are also skipped for operations that could produce duplicate side effects
+(`POST /api/jobs/.../notes`). There is no import retry opt-in because no verified
+idempotency-key contract exists.
 
 The retry helper uses an exponential schedule with a hard cap:
 
@@ -118,10 +121,11 @@ The retry helper uses an exponential schedule with a hard cap:
 
 The helper classifies each exception before deciding whether to retry:
 
-- **Retryable (retried):** HTTP `5xx`, network/timeout failures,
-  `CalledProcessError` from the scorer subprocess. The previous attempt's
-  delay is logged with the structured prefix `retry:` so operators can grep
-  the journal.
+- **Retryable (normally retried):** HTTP `5xx`, network/timeout failures,
+  and `CalledProcessError` from the scorer subprocess. The non-idempotent
+  import endpoint is classified from the same exception types but is not
+  retried. For retried operations, the previous attempt's delay is logged
+  with the structured prefix `retry:` so operators can grep the journal.
 - **Exhausted:** every retry attempt failed; the helper re-raises the last
   exception with `retry_metadata={"attempts": N, "classification": "exhausted"}`.
   The orchestration records it on `AutomationRun.failures` as
@@ -447,9 +451,9 @@ The suite asserts five invariant contracts required by Issue #11:
 2. **Dedup-skip-second-search** — a second run with the same
    `SeenCache` skips offers already imported within the TTL window;
    `imported == 0`, `scored == 0`, and no WhatsApp message is captured.
-3. **Partial failure** — a transient 5xx on one import is retried by
-   the bounded retry helper, surfaced as `import:exhausted:...` on the
-   run summary, and does not stop the remaining offers from completing.
+3. **Partial failure** — a transient 5xx, timeout, or connection error on one
+   import is attempted once, surfaced as an `import:...` failure on the run
+   summary, and does not stop the remaining offers from completing.
    When `notify_on_failure=True`, the bounded failure summary is the
    only message the WhatsApp helper receives.
 4. **Redaction** — sentinel substrings in the scorer's
