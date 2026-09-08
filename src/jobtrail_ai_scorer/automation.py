@@ -24,6 +24,7 @@ from .sources import (
     NormalizedJob,
     SourceAdapter,
     SourceSearchRequest,
+    build_ats_adapters,
     normalize_jobspy_job,
 )
 from .notify import NotificationBuilder, recommendation_label
@@ -111,6 +112,106 @@ def _parse_search_profiles(raw: str) -> tuple[SearchProfile, ...]:
 
 
 @dataclass(frozen=True)
+class AtsBoardConfig:
+    """Configuration parsed from the ``JOB_ATS_BOARDS`` env var.
+
+    Empty board lists mean "no ATS adapters for this provider". When
+    ``JOB_ATS_BOARDS`` is unset, :attr:`AutomationConfig.ats_boards` is
+    ``None`` and no ATS adapters are constructed. ``results_wanted`` is
+    bounded to the closed interval ``[1, 200]`` and defaults to ``25``.
+    """
+
+    lever_boards: tuple[str, ...] = ()
+    greenhouse_boards: tuple[str, ...] = ()
+    results_wanted: int = 25
+
+
+_ATS_BOARD_KEYS = frozenset(
+    {"lever_boards", "greenhouse_boards", "results_wanted"}
+)
+_ATS_DEFAULT_RESULTS = 25
+_ATS_MIN_RESULTS = 1
+_ATS_MAX_RESULTS = 200
+
+
+def _validate_ats_board_list(value: Any, *, provider: str) -> tuple[str, ...]:
+    """Validate one ``lever_boards``/``greenhouse_boards`` list entry."""
+
+    if not isinstance(value, list):
+        raise ValueError(f"JOB_ATS_BOARDS {provider} must be a list")
+    seen: set[str] = set()
+    boards: list[str] = []
+    for entry in value:
+        if not isinstance(entry, str):
+            raise ValueError(
+                f"JOB_ATS_BOARDS {provider} entries must be strings"
+            )
+        token = entry.strip()
+        if not token:
+            raise ValueError(
+                f"JOB_ATS_BOARDS {provider} entries must be non-blank"
+            )
+        if token in seen:
+            raise ValueError(
+                f"JOB_ATS_BOARDS {provider} entries must be unique"
+            )
+        seen.add(token)
+        boards.append(token)
+    return tuple(boards)
+
+
+def parse_ats_boards(raw: str) -> AtsBoardConfig:
+    """Parse the ``JOB_ATS_BOARDS`` env var into an :class:`AtsBoardConfig`.
+
+    The parser uses a closed allowlist of keys (``lever_boards``,
+    ``greenhouse_boards``, ``results_wanted``) and raises ``ValueError``
+    for any unknown key, non-object payload, blank or duplicate board
+    token, or out-of-bounds ``results_wanted``. ``results_wanted``
+    defaults to ``25`` and must satisfy ``1 <= results_wanted <= 200``.
+    """
+
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError("JOB_ATS_BOARDS must be valid JSON") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError("JOB_ATS_BOARDS must be a JSON object")
+    unknown = set(parsed) - _ATS_BOARD_KEYS
+    if unknown:
+        raise ValueError("JOB_ATS_BOARDS contains unknown keys")
+
+    lever_boards = (
+        _validate_ats_board_list(parsed["lever_boards"], provider="lever_boards")
+        if "lever_boards" in parsed
+        else ()
+    )
+    greenhouse_boards = (
+        _validate_ats_board_list(
+            parsed["greenhouse_boards"], provider="greenhouse_boards"
+        )
+        if "greenhouse_boards" in parsed
+        else ()
+    )
+
+    raw_results = parsed.get("results_wanted", _ATS_DEFAULT_RESULTS)
+    # ``bool`` is a subclass of ``int`` in Python; reject it explicitly
+    # so True/False cannot satisfy a strict "must be int" contract.
+    if isinstance(raw_results, bool) or not isinstance(raw_results, int):
+        raise ValueError("JOB_ATS_BOARDS results_wanted must be an int")
+    if raw_results < _ATS_MIN_RESULTS or raw_results > _ATS_MAX_RESULTS:
+        raise ValueError(
+            f"JOB_ATS_BOARDS results_wanted must be between "
+            f"{_ATS_MIN_RESULTS} and {_ATS_MAX_RESULTS}"
+        )
+
+    return AtsBoardConfig(
+        lever_boards=lever_boards,
+        greenhouse_boards=greenhouse_boards,
+        results_wanted=raw_results,
+    )
+
+
+@dataclass(frozen=True)
 class AutomationConfig:
     base_url: str = "http://127.0.0.1:8000"
     sites: tuple[str, ...] = ("linkedin", "indeed")
@@ -127,6 +228,7 @@ class AutomationConfig:
     notify_on_failure: bool = False
     whatsapp_command: str = ""
     discover_container: str | None = None
+    ats_boards: AtsBoardConfig | None = None
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "AutomationConfig":
@@ -146,6 +248,11 @@ class AutomationConfig:
             if "JOB_SEARCH_PROFILES" in e
             else ()
         )
+        ats_boards = (
+            parse_ats_boards(e["JOB_ATS_BOARDS"])
+            if "JOB_ATS_BOARDS" in e
+            else None
+        )
         return cls(
             base_url=e.get("JOBTRAIL_BASE_URL", cls.base_url),
             sites=split("JOB_SEARCH_SITES", "linkedin,indeed", ","),
@@ -162,6 +269,7 @@ class AutomationConfig:
             notify_on_failure=truthy("WHATSAPP_NOTIFY_ON_FAILURE", "0"),
             whatsapp_command=e.get("WHATSAPP_NOTIFY_COMMAND", ""),
             discover_container=discover_container,
+            ats_boards=ats_boards,
         )
 
 
@@ -414,6 +522,7 @@ class JobTrailAutomation:
         retry_policy: RetryPolicy | None = None,
         retry_sleep: Callable[[float], None] | None = None,
         source_adapters: tuple[SourceAdapter, ...] | None = None,
+        ats_boards: AtsBoardConfig | None = None,
     ) -> None:
         self.gateway, self.scorer, self.notifier = (
             gateway,
@@ -438,9 +547,21 @@ class JobTrailAutomation:
             max_delay=8.0,
         )
         self._scorer_retry_sleep = retry_sleep
-        self.source_adapters = (
-            (JobSpySourceAdapter(gateway),) if source_adapters is None else source_adapters
-        )
+        # Default ``source_adapters`` preserves the historical
+        # ``(JobSpySourceAdapter(gateway),)`` tuple when no ATS boards are
+        # configured. When ``ats_boards`` is supplied, the factory appends
+        # any concrete Lever/Greenhouse adapters (PR-B/PR-C); PR-A only
+        # wires the factory so it currently returns an empty tuple and the
+        # default stays identical for callers that do not opt in.
+        if source_adapters is None:
+            if ats_boards is None:
+                source_adapters = (JobSpySourceAdapter(gateway),)
+            else:
+                source_adapters = (
+                    JobSpySourceAdapter(gateway),
+                    *build_ats_adapters(ats_boards),
+                )
+        self.source_adapters = source_adapters
 
     def _score(self, job_id: str, config_path: str) -> None:
         # No retry here: ``run()`` already wraps every call to ``self.scorer``

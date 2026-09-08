@@ -494,6 +494,27 @@ def test_automation_run_profile_counts_defaults_empty():
     assert automation.AutomationRun().profile_counts == {}
 
 
+def test_automation_default_source_adapters_unchanged_when_no_ats_boards():
+    """When JOB_ATS_BOARDS is unset, the default ``source_adapters`` tuple
+    must remain exactly ``(JobSpySourceAdapter(gateway),)`` — the plumbing
+    change in PR-A must not silently add or remove adapters when no ATS
+    boards are configured.
+    """
+
+    from jobtrail_ai_scorer.sources import JobSpySourceAdapter
+
+    gateway = FakeJobTrail()
+    instance = JobSearchAutomation(gateway)
+
+    # ``JobSpySourceAdapter`` does not implement ``__eq__``; assert on shape
+    # and wiring instead of object identity.
+    adapters = instance.source_adapters
+    assert len(adapters) == 1
+    assert isinstance(adapters[0], JobSpySourceAdapter)
+    assert adapters[0].gateway is gateway
+    assert adapters[0].name == "jobspy"
+
+
 def test_automation_adzuna_adapter_exception_does_not_block_jobspy_import():
     """An ``AdzunaSourceAdapter`` that raises during ``search`` must be
     caught at the orchestrator as a ``search:`` failure while the
