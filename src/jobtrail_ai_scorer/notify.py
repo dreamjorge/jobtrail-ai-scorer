@@ -83,6 +83,7 @@ ALLOWED_FIELDS: frozenset[str] = frozenset(
         "jobUrl",
         "jobTrailLink",
         "runId",
+        "searchProfiles",
     }
 )
 
@@ -301,6 +302,9 @@ class NotificationBuilder:
             "gaps": _clip_items(score_map.get("gaps")),
             "jobUrl": _clip_text(job_map.get("jobUrl", job_map.get("job_url"))),
         }
+        search_profiles = _clip_items(score_map.get("searchProfiles"))
+        if search_profiles:
+            summary["searchProfiles"] = search_profiles
         job_id = job_map.get("id") or job_map.get("_id")
         link = self._build_job_trail_link(job_id)
         if link:

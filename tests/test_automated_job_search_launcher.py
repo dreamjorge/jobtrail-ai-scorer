@@ -10,6 +10,7 @@ from __future__ import annotations
 import importlib.util
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -35,6 +36,51 @@ def launcher():
 
 class _StopAfterCapture(Exception):
     """Raised once the discovery call args are captured, to short-circuit main()."""
+
+
+def test_final_output_includes_profile_counts(monkeypatch, capsys, launcher) -> None:
+    class FakeGateway:
+        def __init__(self, base_url):
+            self.base_url = base_url
+
+        def close(self):
+            pass
+
+    class FakeAutomation:
+        def __init__(self, gateway, *, seen_cache=None):
+            self.gateway = gateway
+            self.seen_cache = seen_cache
+
+        def run(self, *, config):
+            return SimpleNamespace(
+                searched=1,
+                imported=1,
+                scored=1,
+                selected={"title": "Python Engineer"},
+                failures=(),
+                profile_counts={
+                    "python": {
+                        "searched": 1,
+                        "imported": 1,
+                        "duplicates": 0,
+                        "failures": 0,
+                    }
+                },
+            )
+
+    monkeypatch.setattr(launcher, "JobTrailHTTPClient", FakeGateway)
+    monkeypatch.setattr(launcher, "JobSearchAutomation", FakeAutomation)
+    monkeypatch.setattr(launcher, "_build_seen_cache", lambda args: None)
+    monkeypatch.setenv("SCORER_CONFIG_PATH", "safe/config.yaml")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["automated-job-search.example.py", "--no-discover"],
+    )
+
+    assert launcher.main() == 0
+    output = capsys.readouterr().out
+    assert "'profile_counts': {'python':" in output
 
 
 def test_container_env_var_is_honored_when_flag_omitted(

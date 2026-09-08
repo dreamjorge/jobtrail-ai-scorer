@@ -4,9 +4,9 @@
 
 Run `scripts/automated-job-search.example.py` from an operator-controlled scheduler. It searches LinkedIn and Indeed for the combined Python/C++/MATLAB/backend/API/database/automation/CI/CD/Docker/LLM/agent profile in Queretaro and globally remote roles, imports new results, and scores at most 10 imported jobs. `SCORER_CONFIG_PATH` is required.
 
-Defaults are safe and bounded: `JOBTRAIL_BASE_URL=http://127.0.0.1:8000`, `JOB_SEARCH_RESULTS_WANTED=10`, `JOB_SEARCH_HOURS_OLD=72`, `JOB_SEARCH_MAX_SCORE=10`, and `JOB_SCORE_THRESHOLD=80`. Override `JOB_SEARCH_SITES`, `JOB_SEARCH_TERMS`, `JOB_SEARCH_LOCATIONS` (semicolon-separated), `SCORER_COMMAND`, and `WHATSAPP_NOTIFY_COMMAND` as needed.
+Defaults are safe and bounded: `JOBTRAIL_BASE_URL=http://127.0.0.1:8000`, `JOB_SEARCH_RESULTS_WANTED=10`, `JOB_SEARCH_HOURS_OLD=72`, `JOB_SEARCH_MAX_SCORE=10`, and `JOB_SCORE_THRESHOLD=80`. Override `JOB_SEARCH_SITES`, `JOB_SEARCH_TERMS`, `JOB_SEARCH_LOCATIONS` (semicolon-separated), `SCORER_COMMAND`, and `WHATSAPP_NOTIFY_COMMAND` as needed. Optional `JOB_SEARCH_PROFILES` is a JSON array for multiple public search profiles; omit it to use the legacy single-search `JOB_SEARCH_*` fallback.
 
-Set `WHATSAPP_NOTIFY_COMMAND=./notify-whatsapp-via-hermes.local.sh` (the helper accepts the summary on stdin), then set `WHATSAPP_NOTIFY_ENABLED=1` only when the configured Hermes notification helper is ready. At most one summary is sent per run, and only for the highest validated score at or above the threshold. The summary contains title, company, location, score, recommendation, recommendation label, strengths, gaps, the external job URL, the JobTrail link, and the run identifier only. See [Daily WhatsApp summary fields](#daily-whatsapp-summary-fields) for the contract and the optional `WHATSAPP_SHORT_URL_BASE` shortener. This workflow writes `[AI_JOB_SCORE_V1]` notes and sends WhatsApp when enabled, but **never applies to jobs automatically**. It must not expose descriptions, profiles, prompts, notes, credentials, or secrets.
+Set `WHATSAPP_NOTIFY_COMMAND=./notify-whatsapp-via-hermes.local.sh` (the helper accepts the summary on stdin), then set `WHATSAPP_NOTIFY_ENABLED=1` only when the configured Hermes notification helper is ready. At most one summary is sent per run, and only for the highest validated score at or above the threshold. The summary contains title, company, location, score, recommendation, recommendation label, strengths, gaps, the external job URL, the JobTrail link, and the run identifier, plus optional selected public `searchProfiles` names only when profile provenance exists. See [Daily WhatsApp summary fields](#daily-whatsapp-summary-fields) for the contract and the optional `WHATSAPP_SHORT_URL_BASE` shortener. This workflow writes `[AI_JOB_SCORE_V1]` notes and sends WhatsApp when enabled, but **never applies to jobs automatically**. It must not expose descriptions, profiles, prompts, notes, credentials, or secrets.
 
 Use these examples to run JobTrail AI Scorer from a local scheduler while keeping private runtime files out of the repository. Copy the example files, edit only local ignored copies, and dry-run first before allowing writes to JobTrail notes.
 
@@ -70,6 +70,30 @@ To make an existing systemd unit that already exports
 `--no-discover` (or `--base-url`) explicitly in the unit definition — this is
 the only way to skip the published-port and Docker probes.
 
+
+## Search profiles
+
+`JOB_SEARCH_PROFILES` may define several public search profiles in a JSON array. Allowed keys are exactly:
+
+- `name` (required, non-blank, unique): public label used for per-profile counts and optional notification provenance.
+- `search_terms`: terms for that profile; defaults to `JOB_SEARCH_TERMS` when omitted.
+- `sites`: list of existing supported source site names; defaults to `JOB_SEARCH_SITES` when omitted.
+- `locations`: list of locations; defaults to `JOB_SEARCH_LOCATIONS` when omitted.
+- `results_wanted`: integer result limit; defaults to `JOB_SEARCH_RESULTS_WANTED` when omitted.
+- `hours_old`: integer recency window; defaults to `JOB_SEARCH_HOURS_OLD` when omitted.
+
+Example:
+
+```json
+[
+  {"name": "python", "search_terms": "python backend", "sites": ["linkedin"], "locations": ["remote"], "results_wanted": 5},
+  {"name": "automation", "search_terms": "ci cd automation"}
+]
+```
+
+The JSON is configuration only: it must not contain secrets, credentials, private filesystem paths, CV/profile text, provider prompts, or new source-provider definitions. `sites` only selects among the source providers already supported by the automation boundary. If `JOB_SEARCH_PROFILES` is unset, the launcher preserves the legacy single-profile behavior using `JOB_SEARCH_SITES`, `JOB_SEARCH_TERMS`, and `JOB_SEARCH_LOCATIONS`.
+
+The final launcher output includes `profile_counts` with `searched`, `imported`, `duplicates`, and `failures` per profile when profiles are configured; it is `{}` for the legacy fallback.
 
 ## Pre-import deduplication (seen cache)
 
@@ -146,7 +170,9 @@ includes exception messages, descriptions, profiles, prompts, or credentials.
 
 Every best-match notification produced by `JobTrailAutomation.run` is built by
 `jobtrail_ai_scorer.notify.NotificationBuilder`. The rendered summary exposes
-exactly the allowlisted fields below, in this order, with no extra keys:
+only the allowlisted fields below. Legacy required fields remain present when
+source data is available; optional fields may be omitted when their source data is
+absent:
 
 | Field | Source | Notes |
 | --- | --- | --- |
@@ -161,6 +187,7 @@ exactly the allowlisted fields below, in this order, with no extra keys:
 | `jobUrl` | `job.jobUrl` / `job.job_url` | External apply URL. |
 | `jobTrailLink` | derived | `base_url` (after `JOBTRAIL_BASE_URL` resolution) joined with `/jobs/<id>`, percent-encoded. Omitted when the job has no id. |
 | `runId` | derived | `YYYY-MM-DD-HHMM-<6-char hex>` for the daily run; deterministic for the same stamp + seed. |
+| `searchProfiles` | selected profile provenance | Optional public profile names for the selected job only; first 5 entries, each clipped to 200 characters and scrubbed like every other string. |
 
 ### URL shortener (opt-in)
 

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import contextlib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
 import os
 import shlex
@@ -366,6 +366,7 @@ class AutomationRun:
     scored: int = 0
     failures: tuple[str, ...] = ()
     selected: dict[str, Any] | None = None
+    profile_counts: dict[str, dict[str, int]] = field(default_factory=dict)
 
 
 def _format_failure(stage: str, exc: BaseException, *, job_id: str | None = None) -> str:
@@ -486,11 +487,30 @@ class JobTrailAutomation:
         self._whatsapp_command = config.whatsapp_command
         self.base_url = config.base_url
         searched = imported = scored = 0
+        count_profiles = bool(config.search_profiles)
+        profile_counts: dict[str, dict[str, int]] = (
+            {
+                profile.name: {
+                    "searched": 0,
+                    "imported": 0,
+                    "duplicates": 0,
+                    "failures": 0,
+                }
+                for profile in config.search_profiles
+            }
+            if count_profiles
+            else {}
+        )
+        imported_by_identity: dict[tuple[str, str], str] = {}
+        profiles_by_job_id: dict[str, list[str]] = {}
         for adapter in self.source_adapters:
             for request in source_search_requests(config):
+                profile_name = request.profile_name
                 try:
                     jobs = adapter.search(request)
                     searched += len(jobs)
+                    if count_profiles:
+                        profile_counts[profile_name]["searched"] += len(jobs)
                     for job in jobs:
                         try:
                             # Hold the seen-cache lock across the whole
@@ -504,22 +524,47 @@ class JobTrailAutomation:
                                 else contextlib.nullcontext()
                             )
                             with cache_txn:
+                                identity = self._cache_identity(job)
+                                if count_profiles and identity in imported_by_identity:
+                                    profile_counts[profile_name]["duplicates"] += 1
+                                    winning_job_id = imported_by_identity[identity]
+                                    self._append_profile_provenance(
+                                        profiles_by_job_id,
+                                        winning_job_id,
+                                        profile_name,
+                                    )
+                                    continue
                                 if self._is_cached(
                                     job,
                                     hours_old=request.hours_old,
                                     failures=failures,
                                 ):
                                     continue
-                                result = self.gateway.import_job(job.to_import_payload())
+                                import_payload = job.to_import_payload()
+                                result = self.gateway.import_job(import_payload)
                                 job_id = result.get("id")
                                 if job_id is not None and str(job_id) not in ids:
-                                    ids.append(str(job_id))
+                                    job_id_str = str(job_id)
+                                    ids.append(job_id_str)
                                     imported += 1
+                                    if count_profiles:
+                                        profile_counts[profile_name]["imported"] += 1
+                                        if identity is not None:
+                                            imported_by_identity[identity] = job_id_str
+                                        self._append_profile_provenance(
+                                            profiles_by_job_id,
+                                            job_id_str,
+                                            profile_name,
+                                        )
                                 self._record_seen(job, failures=failures)
                         except Exception as exc:
                             failures.append(_format_failure("import", exc))
+                            if count_profiles:
+                                profile_counts[profile_name]["failures"] += 1
                 except Exception as exc:
                     failures.append(_format_failure("search", exc))
+                    if count_profiles:
+                        profile_counts[profile_name]["failures"] += 1
         for job_id in ids[: config.max_score]:
             try:
                 retry_call(
@@ -537,6 +582,7 @@ class JobTrailAutomation:
         best = None
         best_job = None
         best_score = None
+        best_job_id = None
         for job_id in scored_ids:
             try:
                 job = self.gateway.get_job(job_id)
@@ -558,9 +604,12 @@ class JobTrailAutomation:
                     }
                     best_job = job
                     best_score = score
+                    best_job_id = job_id
             except Exception as exc:
                 failures.append(_format_failure("read", exc, job_id=job_id))
 
+        if best is not None and best_job_id in profiles_by_job_id:
+            best["searchProfiles"] = list(profiles_by_job_id[best_job_id])
         notification_body = self._compose_notification(
             best=best,
             best_job=best_job,
@@ -575,7 +624,14 @@ class JobTrailAutomation:
                 self.notifier(notification_body)
             except Exception:
                 failures.append("notify")
-        return AutomationRun(searched, imported, scored, tuple(failures), best)
+        return AutomationRun(
+            searched,
+            imported,
+            scored,
+            tuple(failures),
+            best,
+            profile_counts,
+        )
 
     @staticmethod
     def _compose_notification(
@@ -605,10 +661,13 @@ class JobTrailAutomation:
 
         match_body: str | None = None
         if best is not None and notify_enabled:
+            score_for_notification = dict(best_score or {})
+            if best.get("searchProfiles"):
+                score_for_notification["searchProfiles"] = best["searchProfiles"]
             match_body = json.dumps(
                 build_notification_summary(
                     best_job or {},
-                    best_score or {},
+                    score_for_notification,
                     base_url=base_url,
                 ),
                 ensure_ascii=False,
@@ -625,6 +684,24 @@ class JobTrailAutomation:
             return f"{match_body}\n{failure_body}"
         return match_body or failure_body
 
+    @staticmethod
+    def _normalized_identity(
+        source: Any, source_job_id: Any
+    ) -> tuple[str, str] | None:
+        if not isinstance(source, str) or not source.strip():
+            return None
+        if not isinstance(source_job_id, str) or not source_job_id.strip():
+            return None
+        return source.strip().lower(), source_job_id.strip().lower()
+
+    @staticmethod
+    def _append_profile_provenance(
+        profiles_by_job_id: dict[str, list[str]], job_id: str, profile_name: str
+    ) -> None:
+        profiles = profiles_by_job_id.setdefault(job_id, [])
+        if profile_name not in profiles:
+            profiles.append(profile_name)
+
     # --- seen-cache helpers -----------------------------------------------
 
     def _cache_identity(
@@ -640,11 +717,7 @@ class JobTrailAutomation:
             mapped = map_jobspy_job(job)
             source = mapped.get("source")
             source_job_id = mapped.get("sourceJobId")
-        if not isinstance(source, str) or not source:
-            return None
-        if not isinstance(source_job_id, str) or not source_job_id:
-            return None
-        return source, source_job_id
+        return self._normalized_identity(source, source_job_id)
 
     def _is_cached(
         self,
