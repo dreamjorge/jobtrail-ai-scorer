@@ -98,9 +98,8 @@ def build_ats_adapters(
     default ``source_adapters`` tuple without importing each adapter module
     directly.
 
-    PR-B wires the ``LeverSourceAdapter`` when ``ats_boards.lever_boards``
-    is non-empty. The Greenhouse adapter lands in PR-C and is intentionally
-    not wired here.
+    The ``LeverSourceAdapter`` and ``GreenhouseSourceAdapter`` are appended
+    in that order when their respective board lists are non-empty.
     """
 
     if ats_boards is None:
@@ -115,6 +114,10 @@ def build_ats_adapters(
         from .lever import LeverSourceAdapter
 
         adapters.append(LeverSourceAdapter(boards=ats_boards.lever_boards))
+    if ats_boards.greenhouse_boards:
+        from .greenhouse import GreenhouseSourceAdapter
+
+        adapters.append(GreenhouseSourceAdapter(boards=ats_boards.greenhouse_boards))
     return tuple(adapters)
 
 
@@ -125,11 +128,13 @@ def build_ats_adapters(
 from .adzuna import AdzunaSourceAdapter  # noqa: E402
 from .jobspy import JobSpySourceAdapter, normalize_jobspy_job  # noqa: E402
 from .lever import LeverSourceAdapter  # noqa: E402
+from .greenhouse import GreenhouseSourceAdapter  # noqa: E402
 
 __all__ = [
     "AdzunaSourceAdapter",
     "JobSpySourceAdapter",
     "LeverSourceAdapter",
+    "GreenhouseSourceAdapter",
     "NormalizedJob",
     "SearchGateway",
     "SourceAdapter",

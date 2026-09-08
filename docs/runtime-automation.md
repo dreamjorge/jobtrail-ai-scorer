@@ -280,8 +280,8 @@ The adapter reuses the project's `RetryPolicy` and `retry_call`:
 ### Orchestrator integration
 
 `build_ats_adapters(ats_boards)` constructs the
-`LeverSourceAdapter` whenever `ats_boards.lever_boards` is non-empty.
-Greenhouse support (PR-C) is intentionally not wired in this release.
+`LeverSourceAdapter` whenever `ats_boards.lever_boards` is non-empty and
+`GreenhouseSourceAdapter` whenever `ats_boards.greenhouse_boards` is non-empty.
 The factory is the single entry point so
 `JobTrailAutomation` can build its default `source_adapters` tuple
 without importing each adapter module directly.
@@ -745,3 +745,19 @@ python3 scripts/runtime_clean.py \\
   --target /absolute/runtime-root/scorer-python.backup-automation-20260906T172527Z
 # review the listed plan, then add --yes
 ```
+
+## Optional Greenhouse source
+
+`GreenhouseSourceAdapter` is enabled when `JOB_ATS_BOARDS.greenhouse_boards`
+is non-empty. It issues one request per board to:
+
+```text
+GET https://boards-api.greenhouse.io/v1/boards/<board>/jobs?content=true
+```
+
+Board scope wins over search terms and locations. Results are capped globally by
+`results_wanted`, malformed rows are skipped, and normalized jobs retain the
+board slug, profile name, HTML-stripped content, remote heuristic, and UTC
+retrieval timestamp. `4xx` responses are terminal; `5xx` and transport errors
+use bounded retries. A failed Greenhouse search is recorded without blocking
+JobSpy or Lever adapters.
