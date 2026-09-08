@@ -19,6 +19,7 @@ from jobtrail_ai_scorer.automation import (
     search_payloads,
 )
 from jobtrail_ai_scorer.seen_cache import SeenCache
+from jobtrail_ai_scorer.sources import NormalizedJob
 
 
 class FakeJobTrail:
@@ -207,6 +208,158 @@ def test_http_client_url_encodes_job_id():
 
     assert client.get_job("j/1") == {"id": "j/1"}
     assert recorder.path == "/api/jobs/j%2F1"
+
+
+def test_automation_can_import_normalized_jobs_from_source_adapter():
+    class FakeSourceAdapter:
+        name = "custom"
+
+        def __init__(self):
+            self.requests = []
+
+        def search(self, request):
+            self.requests.append(request)
+            return [
+                NormalizedJob(
+                    source="custom",
+                    source_job_id="custom-1",
+                    title="Adapter Engineer",
+                    company="Adapter Co",
+                    description="adapter job",
+                    source_url="https://jobs.test/custom-1",
+                    location=request.location,
+                    remote=request.is_remote,
+                    search_profile=request.profile_name,
+                )
+            ]
+
+    gateway = FakeJobTrail()
+    scorer = FakeScorer()
+    scorer.jobs = gateway.jobs
+    adapter = FakeSourceAdapter()
+
+    result = JobSearchAutomation(
+        gateway, scorer=scorer, source_adapters=(adapter,)
+    ).run(
+        config=AutomationConfig(
+            scorer_config_path="safe/config.yaml",
+            locations=("remote",),
+            sites=("custom-site",),
+        )
+    )
+
+    assert gateway.searches == []
+    assert len(adapter.requests) == 1
+    assert adapter.requests[0].sites == ("custom-site",)
+    assert adapter.requests[0].location == "remote"
+    assert adapter.requests[0].is_remote is True
+    assert gateway.imported == [
+        {
+            "source": "custom",
+            "sourceJobId": "custom-1",
+            "company": "Adapter Co",
+            "position": "Adapter Engineer",
+            "description": "adapter job",
+            "jobUrl": "https://jobs.test/custom-1",
+            "location": "remote",
+            "remote": True,
+            "searchProfile": "default",
+        }
+    ]
+    assert scorer.calls == [("j1", "safe/config.yaml")]
+    assert result.searched == 1
+    assert result.imported == 1
+    assert result.scored == 1
+    assert result.failures == ()
+
+
+def test_automation_seen_cache_uses_normalized_job_identity(tmp_path):
+    class PayloadAliasJob(NormalizedJob):
+        def to_import_payload(self):
+            payload = super().to_import_payload()
+            payload["sourceJobId"] = "payload-alias"
+            return payload
+
+    class FakeSourceAdapter:
+        name = "custom"
+
+        def search(self, request):
+            return [
+                PayloadAliasJob(
+                    source="custom",
+                    source_job_id="canonical-1",
+                    title="Adapter Engineer",
+                )
+            ]
+
+    cache = SeenCache(tmp_path / "seen.json", clock=_CacheClock(1_000.0))
+    cache.mark_seen("custom", "canonical-1")
+    gateway = FakeJobTrail()
+    scorer = FakeScorer()
+    scorer.jobs = gateway.jobs
+
+    result = JobSearchAutomation(
+        gateway,
+        scorer=scorer,
+        seen_cache=cache,
+        source_adapters=(FakeSourceAdapter(),),
+    ).run(
+        config=AutomationConfig(
+            scorer_config_path="safe/config.yaml",
+            locations=("remote",),
+        )
+    )
+
+    assert gateway.imported == []
+    assert result.searched == 1
+    assert result.imported == 0
+    assert result.scored == 0
+    assert result.failures == ()
+
+
+def test_automation_source_adapter_failure_is_partial():
+    class PartiallyFailingSourceAdapter:
+        name = "partial"
+
+        def search(self, request):
+            if request.location == "Queretaro":
+                raise RuntimeError("provider unavailable")
+            return [
+                NormalizedJob(
+                    source="partial",
+                    source_job_id="partial-1",
+                    title="Recovered Engineer",
+                    location=request.location,
+                )
+            ]
+
+    gateway = FakeJobTrail()
+    scorer = FakeScorer()
+    scorer.jobs = gateway.jobs
+
+    result = JobSearchAutomation(
+        gateway,
+        scorer=scorer,
+        source_adapters=(PartiallyFailingSourceAdapter(),),
+    ).run(
+        config=AutomationConfig(
+            scorer_config_path="safe/config.yaml",
+            locations=("Queretaro", "remote"),
+        )
+    )
+
+    assert gateway.imported == [
+        {
+            "source": "partial",
+            "sourceJobId": "partial-1",
+            "position": "Recovered Engineer",
+            "location": "remote",
+        }
+    ]
+    assert result.searched == 1
+    assert result.imported == 1
+    assert result.scored == 1
+    assert result.failures == ("search:terminal:RuntimeError",)
 
 
 def test_run_scores_real_mode_and_notifies_once_for_best_match():

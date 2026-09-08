@@ -19,8 +19,14 @@ from .discover import (  # noqa: F401  (re-exported on purpose)
 )
 from .retry import RetryPolicy, classify_retryable, retry_call
 from .seen_cache import SeenCache
+from .sources import (
+    JobSpySourceAdapter,
+    NormalizedJob,
+    SourceAdapter,
+    SourceSearchRequest,
+    normalize_jobspy_job,
+)
 from .notify import NotificationBuilder, recommendation_label
-from .sources import normalize_jobspy_job
 
 
 DEFAULT_TERMS = (
@@ -114,18 +120,22 @@ def merge_resolved_base_url(
     return AutomationConfig(**overrides)
 
 
-def search_payloads(config: AutomationConfig) -> list[dict[str, Any]]:
+def source_search_requests(config: AutomationConfig) -> list[SourceSearchRequest]:
     return [
-        {
-            "sites": list(config.sites),
-            "searchTerm": config.search_terms,
-            "location": location,
-            "resultsWanted": config.results_wanted,
-            "hoursOld": config.hours_old,
-            "isRemote": location.strip().lower() == "remote",
-        }
+        SourceSearchRequest(
+            sites=config.sites,
+            search_term=config.search_terms,
+            location=location,
+            results_wanted=config.results_wanted,
+            hours_old=config.hours_old,
+            is_remote=location.strip().lower() == "remote",
+        )
         for location in config.locations
     ]
+
+
+def search_payloads(config: AutomationConfig) -> list[dict[str, Any]]:
+    return [request.to_jobspy_payload() for request in source_search_requests(config)]
 
 
 def map_jobspy_job(job: Mapping[str, Any]) -> dict[str, Any]:
@@ -294,6 +304,7 @@ class JobTrailAutomation:
         seen_cache: SeenCache | None = None,
         retry_policy: RetryPolicy | None = None,
         retry_sleep: Callable[[float], None] | None = None,
+        source_adapters: tuple[SourceAdapter, ...] | None = None,
     ) -> None:
         self.gateway, self.scorer, self.notifier = (
             gateway,
@@ -318,6 +329,9 @@ class JobTrailAutomation:
             max_delay=8.0,
         )
         self._scorer_retry_sleep = retry_sleep
+        self.source_adapters = (
+            (JobSpySourceAdapter(gateway),) if source_adapters is None else source_adapters
+        )
 
     def _score(self, job_id: str, config_path: str) -> None:
         # No retry here: ``run()`` already wraps every call to ``self.scorer``
@@ -364,35 +378,36 @@ class JobTrailAutomation:
         self._whatsapp_command = config.whatsapp_command
         self.base_url = config.base_url
         searched = imported = scored = 0
-        for payload in search_payloads(config):
-            try:
-                jobs = self.gateway.search(payload)
-                searched += len(jobs)
-                for job in jobs:
-                    try:
-                        # Hold the seen-cache lock across the whole
-                        # check/import/mark sequence (not just each call in
-                        # isolation) so an overlapping run can never import
-                        # the same offer twice or drop this run's mark; see
-                        # SeenCache.transaction.
-                        cache_txn = (
-                            self.seen_cache.transaction()
-                            if self.seen_cache is not None
-                            else contextlib.nullcontext()
-                        )
-                        with cache_txn:
-                            if self._is_cached(job, config=config, failures=failures):
-                                continue
-                            result = self.gateway.import_job(map_jobspy_job(job))
-                            job_id = result.get("id")
-                            if job_id is not None and str(job_id) not in ids:
-                                ids.append(str(job_id))
-                                imported += 1
-                            self._record_seen(job, failures=failures)
-                    except Exception as exc:
-                        failures.append(_format_failure("import", exc))
-            except Exception as exc:
-                failures.append(_format_failure("search", exc))
+        for adapter in self.source_adapters:
+            for request in source_search_requests(config):
+                try:
+                    jobs = adapter.search(request)
+                    searched += len(jobs)
+                    for job in jobs:
+                        try:
+                            # Hold the seen-cache lock across the whole
+                            # check/import/mark sequence (not just each call in
+                            # isolation) so an overlapping run can never import
+                            # the same offer twice or drop this run's mark; see
+                            # SeenCache.transaction.
+                            cache_txn = (
+                                self.seen_cache.transaction()
+                                if self.seen_cache is not None
+                                else contextlib.nullcontext()
+                            )
+                            with cache_txn:
+                                if self._is_cached(job, config=config, failures=failures):
+                                    continue
+                                result = self.gateway.import_job(job.to_import_payload())
+                                job_id = result.get("id")
+                                if job_id is not None and str(job_id) not in ids:
+                                    ids.append(str(job_id))
+                                    imported += 1
+                                self._record_seen(job, failures=failures)
+                        except Exception as exc:
+                            failures.append(_format_failure("import", exc))
+                except Exception as exc:
+                    failures.append(_format_failure("search", exc))
         for job_id in ids[: config.max_score]:
             try:
                 retry_call(
@@ -500,15 +515,19 @@ class JobTrailAutomation:
 
     # --- seen-cache helpers -----------------------------------------------
 
-    def _cache_identity(self, job: Mapping[str, Any]) -> tuple[str, str] | None:
+    def _cache_identity(
+        self, job: NormalizedJob | Mapping[str, Any]
+    ) -> tuple[str, str] | None:
         """Return ``(source, sourceJobId)`` for the cache key, or None."""
 
-        # Apply the same mapper the import path uses; the raw search result has
-        # ``site``/``id``, but the cache keys must match what we send to
-        # ``/api/discover/import`` (i.e. ``source``/``sourceJobId``).
-        mapped = map_jobspy_job(job)
-        source = mapped.get("source")
-        source_job_id = mapped.get("sourceJobId")
+        if isinstance(job, NormalizedJob):
+            source, source_job_id = job.identity
+        else:
+            # Preserve the legacy raw JobSpy mapping fallback for callers that
+            # still pass mapping-shaped jobs through the cache helpers.
+            mapped = map_jobspy_job(job)
+            source = mapped.get("source")
+            source_job_id = mapped.get("sourceJobId")
         if not isinstance(source, str) or not source:
             return None
         if not isinstance(source_job_id, str) or not source_job_id:
@@ -517,7 +536,7 @@ class JobTrailAutomation:
 
     def _is_cached(
         self,
-        job: Mapping[str, Any],
+        job: NormalizedJob | Mapping[str, Any],
         *,
         config: AutomationConfig,
         failures: list[str],
@@ -545,7 +564,7 @@ class JobTrailAutomation:
 
     def _record_seen(
         self,
-        job: Mapping[str, Any],
+        job: NormalizedJob | Mapping[str, Any],
         *,
         failures: list[str],
     ) -> None:
