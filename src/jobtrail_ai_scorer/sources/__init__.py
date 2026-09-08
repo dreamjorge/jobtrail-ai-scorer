@@ -1,8 +1,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Mapping, Protocol
+from typing import TYPE_CHECKING, Any, Mapping, Protocol
 
+
+if TYPE_CHECKING:
+    # ``AtsBoardConfig`` lives in ``jobtrail_ai_scorer.automation``; importing it
+    # at runtime would create a circular import because ``automation`` already
+    # imports from this module. The forward reference is enough for type
+    # checking; ``build_ats_adapters`` only inspects the value at runtime.
+    from ..automation import AtsBoardConfig
 
 
 @dataclass(frozen=True)
@@ -79,43 +86,35 @@ class SearchGateway(Protocol):
     def search(self, payload: dict[str, Any]) -> list[Mapping[str, Any]]: ...
 
 
-def normalize_jobspy_job(
-    job: Mapping[str, Any], *, profile_name: str | None = None
-) -> NormalizedJob:
-    return NormalizedJob(
-        source=job.get("site"),
-        source_job_id=job.get("id"),
-        title=job.get("title"),
-        company=job.get("company"),
-        description=job.get("description"),
-        source_url=job.get("job_url"),
-        location=job.get("location"),
-        remote=job.get("is_remote"),
-        salary_min=job.get("min_amount"),
-        salary_max=job.get("max_amount"),
-        salary_currency=job.get("currency"),
-        job_type=job.get("job_type"),
-        search_profile=profile_name,
-    )
+def build_ats_adapters(
+    ats_boards: "AtsBoardConfig | None",
+) -> tuple[SourceAdapter, ...]:
+    """Build ATS source adapters from the parsed ``JOB_ATS_BOARDS`` config.
 
+    Returns an empty tuple whenever ``ats_boards`` is ``None`` or contains no
+    configured boards (both ``lever_boards`` and ``greenhouse_boards`` empty).
+    The factory is the single entry point so
+    :class:`jobtrail_ai_scorer.automation.JobTrailAutomation` can build its
+    default ``source_adapters`` tuple without importing each adapter module
+    directly.
 
-class JobSpySourceAdapter:
-    name = "jobspy"
+    PR-A only wires the factory; concrete ``LeverSourceAdapter`` and
+    ``GreenhouseSourceAdapter`` instances are appended in PR-B and PR-C.
+    """
 
-    def __init__(self, gateway: SearchGateway) -> None:
-        self.gateway = gateway
-
-    def search(self, request: SourceSearchRequest) -> list[NormalizedJob]:
-        return [
-            normalize_jobspy_job(job, profile_name=request.profile_name)
-            for job in self.gateway.search(request.to_jobspy_payload())
-        ]
+    if ats_boards is None:
+        return ()
+    if not ats_boards.lever_boards and not ats_boards.greenhouse_boards:
+        return ()
+    return ()
 
 
 # Imported here so the types above (NormalizedJob, SourceSearchRequest) are
-# already defined when ``adzuna`` is loaded; otherwise a circular import
-# would occur because ``adzuna`` re-imports those names from this package.
+# already defined when ``adzuna`` and ``jobspy`` are loaded; otherwise a
+# circular import would occur because those modules re-import those names
+# from this package.
 from .adzuna import AdzunaSourceAdapter  # noqa: E402
+from .jobspy import JobSpySourceAdapter, normalize_jobspy_job  # noqa: E402
 
 __all__ = [
     "AdzunaSourceAdapter",
@@ -124,5 +123,6 @@ __all__ = [
     "SearchGateway",
     "SourceAdapter",
     "SourceSearchRequest",
+    "build_ats_adapters",
     "normalize_jobspy_job",
 ]
