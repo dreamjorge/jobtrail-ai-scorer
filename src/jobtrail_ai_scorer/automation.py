@@ -59,8 +59,9 @@ def _optional_strings(value: Any, *, key: str) -> tuple[str, ...] | None:
         return None
     if not isinstance(value, list):
         raise ValueError(f"JOB_SEARCH_PROFILES {key} must be a list")
-    items = tuple(str(item).strip() for item in value if str(item).strip())
-    return items
+    if not all(isinstance(item, str) for item in value):
+        raise ValueError(f"JOB_SEARCH_PROFILES {key} entries must be strings")
+    return tuple(item.strip() for item in value if item.strip())
 
 
 def _parse_search_profiles(raw: str) -> tuple[SearchProfile, ...]:
@@ -503,7 +504,11 @@ class JobTrailAutomation:
                                 else contextlib.nullcontext()
                             )
                             with cache_txn:
-                                if self._is_cached(job, config=config, failures=failures):
+                                if self._is_cached(
+                                    job,
+                                    hours_old=request.hours_old,
+                                    failures=failures,
+                                ):
                                     continue
                                 result = self.gateway.import_job(job.to_import_payload())
                                 job_id = result.get("id")
@@ -645,7 +650,7 @@ class JobTrailAutomation:
         self,
         job: NormalizedJob | Mapping[str, Any],
         *,
-        config: AutomationConfig,
+        hours_old: int,
         failures: list[str],
     ) -> bool:
         """Return True when the offer should be skipped due to the cache."""
@@ -660,7 +665,7 @@ class JobTrailAutomation:
             return self.seen_cache.should_skip(
                 source,
                 source_job_id,
-                hours_old=config.hours_old,
+                hours_old=hours_old,
             )
         except Exception as exc:  # pragma: no cover - defensive guard
             # Cache failures must never crash a run; surface only the

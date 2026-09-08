@@ -144,8 +144,21 @@ def test_automation_config_parses_search_profiles_from_env():
         json.dumps([{"name": "   "}]),
         json.dumps([{"name": "python"}, {"name": "python"}]),
         json.dumps([{"name": "python", "unexpected": True}]),
+        json.dumps([{"name": "python", "sites": [None]}]),
+        json.dumps([{"name": "python", "sites": [123]}]),
+        json.dumps([{"name": "python", "locations": [{"city": "remote"}]}]),
     ],
-    ids=["invalid-json", "non-list", "non-object", "blank-name", "duplicate", "unknown-key"],
+    ids=[
+        "invalid-json",
+        "non-list",
+        "non-object",
+        "blank-name",
+        "duplicate",
+        "unknown-key",
+        "null-site",
+        "numeric-site",
+        "object-location",
+    ],
 )
 def test_automation_config_rejects_invalid_search_profiles(raw_profiles):
     with pytest.raises(ValueError):
@@ -819,6 +832,34 @@ def test_automation_skips_offers_already_in_seen_cache(tmp_path):
     assert result.imported == 0
     assert result.scored == 0
     assert result.searched == 1  # search still runs; cache filters at import time
+
+
+def test_profile_hours_old_override_controls_seen_cache_ttl(tmp_path):
+    clock = _CacheClock(1_000.0)
+    cache = SeenCache(tmp_path / "seen.json", clock=clock)
+    cache.mark_seen("indeed", "source-1")
+    clock.t += 49 * 3600
+    gateway = FakeJobTrail()
+    scorer = FakeScorer()
+    scorer.jobs = gateway.jobs
+
+    result = JobSearchAutomation(gateway, scorer=scorer, seen_cache=cache).run(
+        config=AutomationConfig(
+            scorer_config_path="safe/config.yaml",
+            hours_old=72,
+            search_profiles=(
+                automation.SearchProfile(
+                    name="recent",
+                    locations=("Queretaro",),
+                    hours_old=24,
+                ),
+            ),
+        )
+    )
+
+    assert result.searched == 1
+    assert result.imported == 1
+    assert gateway.imported != []
 
 
 def test_automation_records_imported_offers_in_seen_cache(tmp_path):
