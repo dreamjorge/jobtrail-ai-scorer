@@ -584,6 +584,92 @@ def test_automation_deduplicates_imports_across_profiles_and_counts_provenance()
     assert result.selected["searchProfiles"] == ["python", "backend"]
 
 
+def test_automation_deduplicates_profiles_before_seen_cache_skip(tmp_path):
+    class SharedJobAdapter:
+        name = "profiles"
+
+        def search(self, request):
+            return [
+                NormalizedJob(
+                    source=" Indeed ",
+                    source_job_id=" SHARED-1 ",
+                    title="Shared Engineer",
+                    search_profile=request.profile_name,
+                )
+            ]
+
+    cache = SeenCache(tmp_path / "seen.json", clock=_CacheClock(1_000.0))
+    gateway = FakeJobTrail()
+    scorer = FakeScorer()
+    scorer.jobs = gateway.jobs
+
+    result = JobSearchAutomation(
+        gateway,
+        scorer=scorer,
+        seen_cache=cache,
+        source_adapters=(SharedJobAdapter(),),
+    ).run(
+        config=AutomationConfig(
+            scorer_config_path="safe/config.yaml",
+            locations=("remote",),
+            search_profiles=(
+                automation.SearchProfile(name="python", locations=("remote",)),
+                automation.SearchProfile(name="backend", locations=("remote",)),
+            ),
+        )
+    )
+
+    assert len(gateway.imported) == 1
+    assert result.imported == 1
+    assert result.profile_counts == {
+        "python": {"searched": 1, "imported": 1, "duplicates": 0, "failures": 0},
+        "backend": {"searched": 1, "imported": 0, "duplicates": 1, "failures": 0},
+    }
+    assert result.selected["searchProfiles"] == ["python", "backend"]
+    assert cache.should_skip("indeed", "shared-1", hours_old=72) is True
+
+
+def test_automation_stale_cache_hit_does_not_invent_profile_provenance(tmp_path):
+    class CachedJobAdapter:
+        name = "profiles"
+
+        def search(self, request):
+            return [
+                NormalizedJob(
+                    source=" Indeed ",
+                    source_job_id=" CACHED-1 ",
+                    title="Already Seen Engineer",
+                    search_profile=request.profile_name,
+                )
+            ]
+
+    cache = SeenCache(tmp_path / "seen.json", clock=_CacheClock(1_000.0))
+    cache.mark_seen("indeed", "cached-1")
+    gateway = FakeJobTrail()
+
+    result = JobSearchAutomation(
+        gateway,
+        seen_cache=cache,
+        source_adapters=(CachedJobAdapter(),),
+    ).run(
+        config=AutomationConfig(
+            scorer_config_path="safe/config.yaml",
+            locations=("remote",),
+            search_profiles=(
+                automation.SearchProfile(name="python", locations=("remote",)),
+            ),
+        )
+    )
+
+    assert gateway.imported == []
+    assert result.imported == 0
+    assert result.scored == 0
+    assert result.selected is None
+    assert result.profile_counts == {
+        "python": {"searched": 1, "imported": 0, "duplicates": 0, "failures": 0}
+    }
+
+
 def test_automation_profile_failure_is_counted_and_other_profiles_continue():
     class FailingProfileAdapter:
         name = "profiles"

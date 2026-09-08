@@ -524,14 +524,7 @@ class JobTrailAutomation:
                                 else contextlib.nullcontext()
                             )
                             with cache_txn:
-                                if self._is_cached(
-                                    job,
-                                    hours_old=request.hours_old,
-                                    failures=failures,
-                                ):
-                                    continue
-                                import_payload = job.to_import_payload()
-                                identity = self._import_identity(import_payload)
+                                identity = self._cache_identity(job)
                                 if count_profiles and identity in imported_by_identity:
                                     profile_counts[profile_name]["duplicates"] += 1
                                     winning_job_id = imported_by_identity[identity]
@@ -541,6 +534,13 @@ class JobTrailAutomation:
                                         profile_name,
                                     )
                                     continue
+                                if self._is_cached(
+                                    job,
+                                    hours_old=request.hours_old,
+                                    failures=failures,
+                                ):
+                                    continue
+                                import_payload = job.to_import_payload()
                                 result = self.gateway.import_job(import_payload)
                                 job_id = result.get("id")
                                 if job_id is not None and str(job_id) not in ids:
@@ -682,9 +682,9 @@ class JobTrailAutomation:
         return match_body or failure_body
 
     @staticmethod
-    def _import_identity(payload: Mapping[str, Any]) -> tuple[str, str] | None:
-        source = payload.get("source")
-        source_job_id = payload.get("sourceJobId")
+    def _normalized_identity(
+        source: Any, source_job_id: Any
+    ) -> tuple[str, str] | None:
         if not isinstance(source, str) or not source.strip():
             return None
         if not isinstance(source_job_id, str) or not source_job_id.strip():
@@ -714,11 +714,7 @@ class JobTrailAutomation:
             mapped = map_jobspy_job(job)
             source = mapped.get("source")
             source_job_id = mapped.get("sourceJobId")
-        if not isinstance(source, str) or not source:
-            return None
-        if not isinstance(source_job_id, str) or not source_job_id:
-            return None
-        return source, source_job_id
+        return self._normalized_identity(source, source_job_id)
 
     def _is_cached(
         self,
