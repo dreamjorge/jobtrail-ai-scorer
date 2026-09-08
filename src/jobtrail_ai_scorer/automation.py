@@ -35,6 +35,81 @@ DEFAULT_TERMS = (
 
 
 @dataclass(frozen=True)
+class SearchProfile:
+    name: str
+    search_terms: str | None = None
+    sites: tuple[str, ...] | None = None
+    locations: tuple[str, ...] | None = None
+    results_wanted: int | None = None
+    hours_old: int | None = None
+
+
+_SEARCH_PROFILE_KEYS = {
+    "name",
+    "search_terms",
+    "sites",
+    "locations",
+    "results_wanted",
+    "hours_old",
+}
+
+
+def _optional_strings(value: Any, *, key: str) -> tuple[str, ...] | None:
+    if value is None:
+        return None
+    if not isinstance(value, list):
+        raise ValueError(f"JOB_SEARCH_PROFILES {key} must be a list")
+    items = tuple(str(item).strip() for item in value if str(item).strip())
+    return items
+
+
+def _parse_search_profiles(raw: str) -> tuple[SearchProfile, ...]:
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError("JOB_SEARCH_PROFILES must be valid JSON") from exc
+    if not isinstance(parsed, list):
+        raise ValueError("JOB_SEARCH_PROFILES must be a JSON list")
+
+    profiles: list[SearchProfile] = []
+    names: set[str] = set()
+    for entry in parsed:
+        if not isinstance(entry, dict):
+            raise ValueError("JOB_SEARCH_PROFILES entries must be objects")
+        unknown = set(entry) - _SEARCH_PROFILE_KEYS
+        if unknown:
+            raise ValueError("JOB_SEARCH_PROFILES contains unknown keys")
+        name = str(entry.get("name", "")).strip()
+        if not name:
+            raise ValueError("JOB_SEARCH_PROFILES entries require non-blank names")
+        if name in names:
+            raise ValueError("JOB_SEARCH_PROFILES entries require unique names")
+        names.add(name)
+        search_terms = entry.get("search_terms")
+        if search_terms is not None:
+            search_terms = str(search_terms)
+        profiles.append(
+            SearchProfile(
+                name=name,
+                search_terms=search_terms,
+                sites=_optional_strings(entry.get("sites"), key="sites"),
+                locations=_optional_strings(entry.get("locations"), key="locations"),
+                results_wanted=(
+                    int(entry["results_wanted"])
+                    if entry.get("results_wanted") is not None
+                    else None
+                ),
+                hours_old=(
+                    int(entry["hours_old"])
+                    if entry.get("hours_old") is not None
+                    else None
+                ),
+            )
+        )
+    return tuple(profiles)
+
+
+@dataclass(frozen=True)
 class AutomationConfig:
     base_url: str = "http://127.0.0.1:8000"
     sites: tuple[str, ...] = ("linkedin", "indeed")
@@ -42,6 +117,7 @@ class AutomationConfig:
     locations: tuple[str, ...] = ("Queretaro", "remote")
     results_wanted: int = 10
     hours_old: int = 72
+    search_profiles: tuple[SearchProfile, ...] = ()
     max_score: int = 10
     score_threshold: int = 80
     scorer_command: str = "jobtrail-ai-scorer"
@@ -64,6 +140,11 @@ class AutomationConfig:
             return e.get(key, default).strip().lower() in {"1", "true", "yes", "on"}
 
         discover_container = e.get("JOBTRAIL_DISCOVER_CONTAINER", "").strip() or None
+        search_profiles = (
+            _parse_search_profiles(e["JOB_SEARCH_PROFILES"])
+            if "JOB_SEARCH_PROFILES" in e
+            else ()
+        )
         return cls(
             base_url=e.get("JOBTRAIL_BASE_URL", cls.base_url),
             sites=split("JOB_SEARCH_SITES", "linkedin,indeed", ","),
@@ -71,6 +152,7 @@ class AutomationConfig:
             locations=split("JOB_SEARCH_LOCATIONS", "Queretaro;remote", ";"),
             results_wanted=int(e.get("JOB_SEARCH_RESULTS_WANTED", "10")),
             hours_old=int(e.get("JOB_SEARCH_HOURS_OLD", "72")),
+            search_profiles=search_profiles,
             max_score=int(e.get("JOB_SEARCH_MAX_SCORE", "10")),
             score_threshold=int(e.get("JOB_SCORE_THRESHOLD", "80")),
             scorer_command=e.get("SCORER_COMMAND", "jobtrail-ai-scorer"),
@@ -121,17 +203,42 @@ def merge_resolved_base_url(
 
 
 def source_search_requests(config: AutomationConfig) -> list[SourceSearchRequest]:
-    return [
-        SourceSearchRequest(
-            sites=config.sites,
-            search_term=config.search_terms,
-            location=location,
-            results_wanted=config.results_wanted,
-            hours_old=config.hours_old,
-            is_remote=location.strip().lower() == "remote",
-        )
-        for location in config.locations
-    ]
+    if not config.search_profiles:
+        return [
+            SourceSearchRequest(
+                sites=config.sites,
+                search_term=config.search_terms,
+                location=location,
+                results_wanted=config.results_wanted,
+                hours_old=config.hours_old,
+                is_remote=location.strip().lower() == "remote",
+            )
+            for location in config.locations
+        ]
+
+    requests: list[SourceSearchRequest] = []
+    for profile in config.search_profiles:
+        for location in profile.locations or config.locations:
+            requests.append(
+                SourceSearchRequest(
+                    sites=profile.sites or config.sites,
+                    search_term=profile.search_terms or config.search_terms,
+                    location=location,
+                    results_wanted=(
+                        profile.results_wanted
+                        if profile.results_wanted is not None
+                        else config.results_wanted
+                    ),
+                    hours_old=(
+                        profile.hours_old
+                        if profile.hours_old is not None
+                        else config.hours_old
+                    ),
+                    is_remote=location.strip().lower() == "remote",
+                    profile_name=profile.name,
+                )
+            )
+    return requests
 
 
 def search_payloads(config: AutomationConfig) -> list[dict[str, Any]]:

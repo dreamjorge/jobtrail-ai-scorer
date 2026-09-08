@@ -17,6 +17,7 @@ from jobtrail_ai_scorer.automation import (
     parse_score_note,
     resolve_automation_base_url,
     search_payloads,
+    source_search_requests,
 )
 from jobtrail_ai_scorer.seen_cache import SeenCache
 from jobtrail_ai_scorer.sources import NormalizedJob
@@ -85,6 +86,120 @@ def test_search_payloads_split_sites_and_locations():
     config = AutomationConfig.from_env({})
     payloads = search_payloads(config)
     assert payloads == [
+        {
+            "sites": ["linkedin", "indeed"],
+            "searchTerm": config.search_terms,
+            "location": "Queretaro",
+            "resultsWanted": 10,
+            "hoursOld": 72,
+            "isRemote": False,
+        },
+        {
+            "sites": ["linkedin", "indeed"],
+            "searchTerm": config.search_terms,
+            "location": "remote",
+            "resultsWanted": 10,
+            "hoursOld": 72,
+            "isRemote": True,
+        },
+    ]
+
+
+def test_automation_config_parses_search_profiles_from_env():
+    config = AutomationConfig.from_env(
+        {
+            "JOB_SEARCH_PROFILES": json.dumps(
+                [
+                    {
+                        "name": "python",
+                        "search_terms": "python backend",
+                        "sites": ["linkedin"],
+                        "locations": ["remote"],
+                        "results_wanted": 5,
+                        "hours_old": 24,
+                    }
+                ]
+            )
+        }
+    )
+
+    assert config.search_profiles == (
+        automation.SearchProfile(
+            name="python",
+            search_terms="python backend",
+            sites=("linkedin",),
+            locations=("remote",),
+            results_wanted=5,
+            hours_old=24,
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "raw_profiles",
+    [
+        "not-json",
+        json.dumps({"name": "python"}),
+        json.dumps(["python"]),
+        json.dumps([{"name": "   "}]),
+        json.dumps([{"name": "python"}, {"name": "python"}]),
+        json.dumps([{"name": "python", "unexpected": True}]),
+    ],
+    ids=["invalid-json", "non-list", "non-object", "blank-name", "duplicate", "unknown-key"],
+)
+def test_automation_config_rejects_invalid_search_profiles(raw_profiles):
+    with pytest.raises(ValueError):
+        AutomationConfig.from_env({"JOB_SEARCH_PROFILES": raw_profiles})
+
+
+def test_source_search_requests_expand_profiles_in_deterministic_order():
+    config = AutomationConfig(
+        sites=("indeed",),
+        search_terms="global terms",
+        locations=("Queretaro", "remote"),
+        results_wanted=10,
+        hours_old=72,
+        search_profiles=(
+            automation.SearchProfile(
+                name="python",
+                search_terms="python backend",
+                sites=("linkedin",),
+                locations=("remote", "Monterrey"),
+                results_wanted=5,
+            ),
+            automation.SearchProfile(name="fallback"),
+        ),
+    )
+
+    requests = source_search_requests(config)
+
+    assert [request.profile_name for request in requests] == [
+        "python",
+        "python",
+        "fallback",
+        "fallback",
+    ]
+    assert [request.location for request in requests] == [
+        "remote",
+        "Monterrey",
+        "Queretaro",
+        "remote",
+    ]
+    assert [(request.search_term, request.sites) for request in requests] == [
+        ("python backend", ("linkedin",)),
+        ("python backend", ("linkedin",)),
+        ("global terms", ("indeed",)),
+        ("global terms", ("indeed",)),
+    ]
+    assert [request.results_wanted for request in requests] == [5, 5, 10, 10]
+    assert [request.hours_old for request in requests] == [72, 72, 72, 72]
+    assert [request.is_remote for request in requests] == [True, False, False, True]
+
+
+def test_search_payloads_preserves_legacy_default_without_profiles():
+    config = AutomationConfig.from_env({})
+
+    assert search_payloads(config) == [
         {
             "sites": ["linkedin", "indeed"],
             "searchTerm": config.search_terms,
