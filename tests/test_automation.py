@@ -19,6 +19,7 @@ from jobtrail_ai_scorer.automation import (
     resolve_automation_base_url,
     search_payloads,
     source_search_requests,
+    ats_source_search_requests,
 )
 from jobtrail_ai_scorer.seen_cache import SeenCache
 from jobtrail_ai_scorer.sources import JobSpySourceAdapter, NormalizedJob
@@ -208,6 +209,28 @@ def test_source_search_requests_expand_profiles_in_deterministic_order():
     assert [request.results_wanted for request in requests] == [5, 5, 10, 10]
     assert [request.hours_old for request in requests] == [72, 72, 72, 72]
     assert [request.is_remote for request in requests] == [True, False, False, True]
+
+
+def test_ats_source_search_requests_use_one_profile_request_and_ats_cap():
+    config = AutomationConfig(
+        locations=("remote", "Toronto"),
+        results_wanted=3,
+        ats_boards=AtsBoardConfig(
+            greenhouse_boards=("acme",), results_wanted=17
+        ),
+        search_profiles=(
+            automation.SearchProfile(
+                name="python", locations=("remote", "Toronto")
+            ),
+            automation.SearchProfile(name="backend"),
+        ),
+    )
+
+    requests = ats_source_search_requests(config)
+
+    assert [request.profile_name for request in requests] == ["python", "backend"]
+    assert [request.location for request in requests] == ["remote", "remote"]
+    assert [request.results_wanted for request in requests] == [17, 17]
 
 
 def test_search_payloads_preserves_legacy_default_without_profiles():
