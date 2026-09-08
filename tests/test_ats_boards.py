@@ -239,15 +239,12 @@ def test_build_ats_adapters_returns_empty_tuple_when_ats_boards_is_none():
     assert isinstance(adapters, tuple)
 
 
-def test_build_ats_adapters_returns_empty_tuple_when_all_boards_empty_in_pr_a():
-    """PR-A wires the factory but does not yet construct concrete
-    ``LeverSourceAdapter`` / ``GreenhouseSourceAdapter`` instances (those
-    land in PR-B/PR-C). Even with boards configured, the factory therefore
-    returns an empty tuple, matching the design's staged rollout."""
+def test_build_ats_adapters_returns_lever_adapter_when_lever_boards_configured():
+    """Configured Lever boards construct a Lever adapter."""
     boards = AtsBoardConfig(lever_boards=("acme",), greenhouse_boards=())
     adapters = build_ats_adapters(boards)
-    assert adapters == ()
-    assert all(isinstance(adapter, SourceAdapter) or adapter is None for adapter in adapters)
+    assert len(adapters) == 1
+    assert adapters[0].name == "lever"
 
 
 def test_automation_config_rejects_invalid_ats_boards_from_env():
