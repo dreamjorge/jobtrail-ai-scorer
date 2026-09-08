@@ -17,6 +17,7 @@ from jobtrail_ai_scorer.automation import (
     parse_score_note,
     resolve_automation_base_url,
     search_payloads,
+    source_search_requests,
 )
 from jobtrail_ai_scorer.seen_cache import SeenCache
 from jobtrail_ai_scorer.sources import NormalizedJob
@@ -85,6 +86,133 @@ def test_search_payloads_split_sites_and_locations():
     config = AutomationConfig.from_env({})
     payloads = search_payloads(config)
     assert payloads == [
+        {
+            "sites": ["linkedin", "indeed"],
+            "searchTerm": config.search_terms,
+            "location": "Queretaro",
+            "resultsWanted": 10,
+            "hoursOld": 72,
+            "isRemote": False,
+        },
+        {
+            "sites": ["linkedin", "indeed"],
+            "searchTerm": config.search_terms,
+            "location": "remote",
+            "resultsWanted": 10,
+            "hoursOld": 72,
+            "isRemote": True,
+        },
+    ]
+
+
+def test_automation_config_parses_search_profiles_from_env():
+    config = AutomationConfig.from_env(
+        {
+            "JOB_SEARCH_PROFILES": json.dumps(
+                [
+                    {
+                        "name": "python",
+                        "search_terms": "python backend",
+                        "sites": ["linkedin"],
+                        "locations": ["remote"],
+                        "results_wanted": 5,
+                        "hours_old": 24,
+                    }
+                ]
+            )
+        }
+    )
+
+    assert config.search_profiles == (
+        automation.SearchProfile(
+            name="python",
+            search_terms="python backend",
+            sites=("linkedin",),
+            locations=("remote",),
+            results_wanted=5,
+            hours_old=24,
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "raw_profiles",
+    [
+        "not-json",
+        json.dumps({"name": "python"}),
+        json.dumps(["python"]),
+        json.dumps([{"name": "   "}]),
+        json.dumps([{"name": "python"}, {"name": "python"}]),
+        json.dumps([{"name": "python", "unexpected": True}]),
+        json.dumps([{"name": "python", "sites": [None]}]),
+        json.dumps([{"name": "python", "sites": [123]}]),
+        json.dumps([{"name": "python", "locations": [{"city": "remote"}]}]),
+    ],
+    ids=[
+        "invalid-json",
+        "non-list",
+        "non-object",
+        "blank-name",
+        "duplicate",
+        "unknown-key",
+        "null-site",
+        "numeric-site",
+        "object-location",
+    ],
+)
+def test_automation_config_rejects_invalid_search_profiles(raw_profiles):
+    with pytest.raises(ValueError):
+        AutomationConfig.from_env({"JOB_SEARCH_PROFILES": raw_profiles})
+
+
+def test_source_search_requests_expand_profiles_in_deterministic_order():
+    config = AutomationConfig(
+        sites=("indeed",),
+        search_terms="global terms",
+        locations=("Queretaro", "remote"),
+        results_wanted=10,
+        hours_old=72,
+        search_profiles=(
+            automation.SearchProfile(
+                name="python",
+                search_terms="python backend",
+                sites=("linkedin",),
+                locations=("remote", "Monterrey"),
+                results_wanted=5,
+            ),
+            automation.SearchProfile(name="fallback"),
+        ),
+    )
+
+    requests = source_search_requests(config)
+
+    assert [request.profile_name for request in requests] == [
+        "python",
+        "python",
+        "fallback",
+        "fallback",
+    ]
+    assert [request.location for request in requests] == [
+        "remote",
+        "Monterrey",
+        "Queretaro",
+        "remote",
+    ]
+    assert [(request.search_term, request.sites) for request in requests] == [
+        ("python backend", ("linkedin",)),
+        ("python backend", ("linkedin",)),
+        ("global terms", ("indeed",)),
+        ("global terms", ("indeed",)),
+    ]
+    assert [request.results_wanted for request in requests] == [5, 5, 10, 10]
+    assert [request.hours_old for request in requests] == [72, 72, 72, 72]
+    assert [request.is_remote for request in requests] == [True, False, False, True]
+
+
+def test_search_payloads_preserves_legacy_default_without_profiles():
+    config = AutomationConfig.from_env({})
+
+    assert search_payloads(config) == [
         {
             "sites": ["linkedin", "indeed"],
             "searchTerm": config.search_terms,
@@ -362,6 +490,239 @@ def test_automation_source_adapter_failure_is_partial():
     assert result.failures == ("search:terminal:RuntimeError",)
 
 
+def test_automation_run_profile_counts_defaults_empty():
+    assert automation.AutomationRun().profile_counts == {}
+
+
+def test_automation_deduplicates_imports_across_profiles_and_counts_provenance():
+    class ProfileDedupeAdapter:
+        name = "profiles"
+
+        def __init__(self):
+            self.requests = []
+
+        def search(self, request):
+            self.requests.append(request)
+            if request.profile_name == "python":
+                return [
+                    NormalizedJob(
+                        source="Indeed",
+                        source_job_id=" SHARED-1 ",
+                        title="Python Engineer",
+                        company="Acme",
+                        location=request.location,
+                        search_profile=request.profile_name,
+                    ),
+                    NormalizedJob(
+                        source="indeed",
+                        source_job_id="python-only",
+                        title="Python API Engineer",
+                        search_profile=request.profile_name,
+                    ),
+                ]
+            return [
+                NormalizedJob(
+                    source=" indeed ",
+                    source_job_id="shared-1",
+                    title="Duplicate Python Engineer",
+                    search_profile=request.profile_name,
+                )
+            ]
+
+    class SequentialJobTrail(FakeJobTrail):
+        def import_job(self, payload):
+            self.imported.append(payload)
+            job_id = f"j{len(self.imported)}"
+            self.jobs[job_id] = {**payload, "id": job_id, "notes": []}
+            return {"id": job_id}
+
+    gateway = SequentialJobTrail()
+    scorer = FakeScorer()
+    scorer.jobs = gateway.jobs
+    adapter = ProfileDedupeAdapter()
+
+    result = JobSearchAutomation(
+        gateway,
+        scorer=scorer,
+        source_adapters=(adapter,),
+    ).run(
+        config=AutomationConfig(
+            scorer_config_path="safe/config.yaml",
+            locations=("remote",),
+            search_profiles=(
+                automation.SearchProfile(name="python", locations=("remote",)),
+                automation.SearchProfile(name="backend", locations=("remote",)),
+            ),
+        )
+    )
+
+    assert [request.profile_name for request in adapter.requests] == ["python", "backend"]
+    assert gateway.imported == [
+        {
+            "source": "Indeed",
+            "sourceJobId": " SHARED-1 ",
+            "company": "Acme",
+            "position": "Python Engineer",
+            "location": "remote",
+            "searchProfile": "python",
+        },
+        {
+            "source": "indeed",
+            "sourceJobId": "python-only",
+            "position": "Python API Engineer",
+            "searchProfile": "python",
+        },
+    ]
+    assert result.searched == 3
+    assert result.imported == 2
+    assert result.scored == 2
+    assert result.failures == ()
+    assert result.profile_counts == {
+        "python": {"searched": 2, "imported": 2, "duplicates": 0, "failures": 0},
+        "backend": {"searched": 1, "imported": 0, "duplicates": 1, "failures": 0},
+    }
+    assert result.selected["searchProfiles"] == ["python", "backend"]
+
+
+def test_automation_deduplicates_profiles_before_seen_cache_skip(tmp_path):
+    class SharedJobAdapter:
+        name = "profiles"
+
+        def search(self, request):
+            return [
+                NormalizedJob(
+                    source=" Indeed ",
+                    source_job_id=" SHARED-1 ",
+                    title="Shared Engineer",
+                    search_profile=request.profile_name,
+                )
+            ]
+
+    cache = SeenCache(tmp_path / "seen.json", clock=_CacheClock(1_000.0))
+    gateway = FakeJobTrail()
+    scorer = FakeScorer()
+    scorer.jobs = gateway.jobs
+
+    result = JobSearchAutomation(
+        gateway,
+        scorer=scorer,
+        seen_cache=cache,
+        source_adapters=(SharedJobAdapter(),),
+    ).run(
+        config=AutomationConfig(
+            scorer_config_path="safe/config.yaml",
+            locations=("remote",),
+            search_profiles=(
+                automation.SearchProfile(name="python", locations=("remote",)),
+                automation.SearchProfile(name="backend", locations=("remote",)),
+            ),
+        )
+    )
+
+    assert len(gateway.imported) == 1
+    assert result.imported == 1
+    assert result.profile_counts == {
+        "python": {"searched": 1, "imported": 1, "duplicates": 0, "failures": 0},
+        "backend": {"searched": 1, "imported": 0, "duplicates": 1, "failures": 0},
+    }
+    assert result.selected["searchProfiles"] == ["python", "backend"]
+    assert cache.should_skip("indeed", "shared-1", hours_old=72) is True
+
+
+def test_automation_stale_cache_hit_does_not_invent_profile_provenance(tmp_path):
+    class CachedJobAdapter:
+        name = "profiles"
+
+        def search(self, request):
+            return [
+                NormalizedJob(
+                    source=" Indeed ",
+                    source_job_id=" CACHED-1 ",
+                    title="Already Seen Engineer",
+                    search_profile=request.profile_name,
+                )
+            ]
+
+    cache = SeenCache(tmp_path / "seen.json", clock=_CacheClock(1_000.0))
+    cache.mark_seen("indeed", "cached-1")
+    gateway = FakeJobTrail()
+
+    result = JobSearchAutomation(
+        gateway,
+        seen_cache=cache,
+        source_adapters=(CachedJobAdapter(),),
+    ).run(
+        config=AutomationConfig(
+            scorer_config_path="safe/config.yaml",
+            locations=("remote",),
+            search_profiles=(
+                automation.SearchProfile(name="python", locations=("remote",)),
+            ),
+        )
+    )
+
+    assert gateway.imported == []
+    assert result.imported == 0
+    assert result.scored == 0
+    assert result.selected is None
+    assert result.profile_counts == {
+        "python": {"searched": 1, "imported": 0, "duplicates": 0, "failures": 0}
+    }
+
+
+def test_automation_profile_failure_is_counted_and_other_profiles_continue():
+    class FailingProfileAdapter:
+        name = "profiles"
+
+        def search(self, request):
+            if request.profile_name == "broken":
+                raise RuntimeError("profile unavailable")
+            return [
+                NormalizedJob(
+                    source="indeed",
+                    source_job_id="ok-1",
+                    title="Recovered Engineer",
+                    search_profile=request.profile_name,
+                )
+            ]
+
+    gateway = FakeJobTrail()
+    scorer = FakeScorer()
+    scorer.jobs = gateway.jobs
+
+    result = JobSearchAutomation(
+        gateway,
+        scorer=scorer,
+        source_adapters=(FailingProfileAdapter(),),
+    ).run(
+        config=AutomationConfig(
+            scorer_config_path="safe/config.yaml",
+            locations=("remote",),
+            search_profiles=(
+                automation.SearchProfile(name="broken", locations=("remote",)),
+                automation.SearchProfile(name="healthy", locations=("remote",)),
+            ),
+        )
+    )
+
+    assert gateway.imported == [
+        {
+            "source": "indeed",
+            "sourceJobId": "ok-1",
+            "position": "Recovered Engineer",
+            "searchProfile": "healthy",
+        }
+    ]
+    assert result.searched == 1
+    assert result.imported == 1
+    assert result.scored == 1
+    assert result.failures == ("search:terminal:RuntimeError",)
+    assert result.profile_counts == {
+        "broken": {"searched": 0, "imported": 0, "duplicates": 0, "failures": 1},
+        "healthy": {"searched": 1, "imported": 1, "duplicates": 0, "failures": 0},
+    }
+
+
 def test_run_scores_real_mode_and_notifies_once_for_best_match():
     gateway = FakeJobTrail()
     scorer = FakeScorer()
@@ -377,6 +738,48 @@ def test_run_scores_real_mode_and_notifies_once_for_best_match():
     assert result.selected["score"] == 91
     assert "good" not in notifier.messages[0]
     assert "candidate" not in notifier.messages[0].lower()
+
+
+def test_selected_notification_includes_public_search_profiles():
+    class SameJobProfileAdapter:
+        def search(self, request):
+            return [
+                NormalizedJob(
+                    source="indeed",
+                    source_job_id="source-1",
+                    title="Python Engineer",
+                    company="Acme",
+                    description="good",
+                    source_url="https://jobs.test/1",
+                    location="Remote",
+                )
+            ]
+
+    gateway = FakeJobTrail()
+    scorer = FakeScorer()
+    scorer.jobs = gateway.jobs
+    notifier = FakeNotifier()
+
+    result = JobSearchAutomation(
+        gateway,
+        scorer=scorer,
+        notifier=notifier,
+        source_adapters=(SameJobProfileAdapter(),),
+    ).run(
+        config=AutomationConfig(
+            search_profiles=(
+                automation.SearchProfile(name="python"),
+                automation.SearchProfile(name="backend"),
+            ),
+            base_url="http://jobtrail.example.com",
+            scorer_config_path="safe/config.yaml",
+            notify_enabled=True,
+        )
+    )
+
+    assert result.selected["searchProfiles"] == ["python", "backend"]
+    message = json.loads(notifier.messages[0])
+    assert message["searchProfiles"] == ["python", "backend"]
 
 
 def test_selected_notification_contains_job_and_score_data(monkeypatch):
@@ -704,6 +1107,34 @@ def test_automation_skips_offers_already_in_seen_cache(tmp_path):
     assert result.imported == 0
     assert result.scored == 0
     assert result.searched == 1  # search still runs; cache filters at import time
+
+
+def test_profile_hours_old_override_controls_seen_cache_ttl(tmp_path):
+    clock = _CacheClock(1_000.0)
+    cache = SeenCache(tmp_path / "seen.json", clock=clock)
+    cache.mark_seen("indeed", "source-1")
+    clock.t += 49 * 3600
+    gateway = FakeJobTrail()
+    scorer = FakeScorer()
+    scorer.jobs = gateway.jobs
+
+    result = JobSearchAutomation(gateway, scorer=scorer, seen_cache=cache).run(
+        config=AutomationConfig(
+            scorer_config_path="safe/config.yaml",
+            hours_old=72,
+            search_profiles=(
+                automation.SearchProfile(
+                    name="recent",
+                    locations=("Queretaro",),
+                    hours_old=24,
+                ),
+            ),
+        )
+    )
+
+    assert result.searched == 1
+    assert result.imported == 1
+    assert gateway.imported != []
 
 
 def test_automation_records_imported_offers_in_seen_cache(tmp_path):

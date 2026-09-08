@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import contextlib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
 import os
 import shlex
@@ -35,6 +35,82 @@ DEFAULT_TERMS = (
 
 
 @dataclass(frozen=True)
+class SearchProfile:
+    name: str
+    search_terms: str | None = None
+    sites: tuple[str, ...] | None = None
+    locations: tuple[str, ...] | None = None
+    results_wanted: int | None = None
+    hours_old: int | None = None
+
+
+_SEARCH_PROFILE_KEYS = {
+    "name",
+    "search_terms",
+    "sites",
+    "locations",
+    "results_wanted",
+    "hours_old",
+}
+
+
+def _optional_strings(value: Any, *, key: str) -> tuple[str, ...] | None:
+    if value is None:
+        return None
+    if not isinstance(value, list):
+        raise ValueError(f"JOB_SEARCH_PROFILES {key} must be a list")
+    if not all(isinstance(item, str) for item in value):
+        raise ValueError(f"JOB_SEARCH_PROFILES {key} entries must be strings")
+    return tuple(item.strip() for item in value if item.strip())
+
+
+def _parse_search_profiles(raw: str) -> tuple[SearchProfile, ...]:
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError("JOB_SEARCH_PROFILES must be valid JSON") from exc
+    if not isinstance(parsed, list):
+        raise ValueError("JOB_SEARCH_PROFILES must be a JSON list")
+
+    profiles: list[SearchProfile] = []
+    names: set[str] = set()
+    for entry in parsed:
+        if not isinstance(entry, dict):
+            raise ValueError("JOB_SEARCH_PROFILES entries must be objects")
+        unknown = set(entry) - _SEARCH_PROFILE_KEYS
+        if unknown:
+            raise ValueError("JOB_SEARCH_PROFILES contains unknown keys")
+        name = str(entry.get("name", "")).strip()
+        if not name:
+            raise ValueError("JOB_SEARCH_PROFILES entries require non-blank names")
+        if name in names:
+            raise ValueError("JOB_SEARCH_PROFILES entries require unique names")
+        names.add(name)
+        search_terms = entry.get("search_terms")
+        if search_terms is not None:
+            search_terms = str(search_terms)
+        profiles.append(
+            SearchProfile(
+                name=name,
+                search_terms=search_terms,
+                sites=_optional_strings(entry.get("sites"), key="sites"),
+                locations=_optional_strings(entry.get("locations"), key="locations"),
+                results_wanted=(
+                    int(entry["results_wanted"])
+                    if entry.get("results_wanted") is not None
+                    else None
+                ),
+                hours_old=(
+                    int(entry["hours_old"])
+                    if entry.get("hours_old") is not None
+                    else None
+                ),
+            )
+        )
+    return tuple(profiles)
+
+
+@dataclass(frozen=True)
 class AutomationConfig:
     base_url: str = "http://127.0.0.1:8000"
     sites: tuple[str, ...] = ("linkedin", "indeed")
@@ -42,6 +118,7 @@ class AutomationConfig:
     locations: tuple[str, ...] = ("Queretaro", "remote")
     results_wanted: int = 10
     hours_old: int = 72
+    search_profiles: tuple[SearchProfile, ...] = ()
     max_score: int = 10
     score_threshold: int = 80
     scorer_command: str = "jobtrail-ai-scorer"
@@ -64,6 +141,11 @@ class AutomationConfig:
             return e.get(key, default).strip().lower() in {"1", "true", "yes", "on"}
 
         discover_container = e.get("JOBTRAIL_DISCOVER_CONTAINER", "").strip() or None
+        search_profiles = (
+            _parse_search_profiles(e["JOB_SEARCH_PROFILES"])
+            if "JOB_SEARCH_PROFILES" in e
+            else ()
+        )
         return cls(
             base_url=e.get("JOBTRAIL_BASE_URL", cls.base_url),
             sites=split("JOB_SEARCH_SITES", "linkedin,indeed", ","),
@@ -71,6 +153,7 @@ class AutomationConfig:
             locations=split("JOB_SEARCH_LOCATIONS", "Queretaro;remote", ";"),
             results_wanted=int(e.get("JOB_SEARCH_RESULTS_WANTED", "10")),
             hours_old=int(e.get("JOB_SEARCH_HOURS_OLD", "72")),
+            search_profiles=search_profiles,
             max_score=int(e.get("JOB_SEARCH_MAX_SCORE", "10")),
             score_threshold=int(e.get("JOB_SCORE_THRESHOLD", "80")),
             scorer_command=e.get("SCORER_COMMAND", "jobtrail-ai-scorer"),
@@ -121,17 +204,42 @@ def merge_resolved_base_url(
 
 
 def source_search_requests(config: AutomationConfig) -> list[SourceSearchRequest]:
-    return [
-        SourceSearchRequest(
-            sites=config.sites,
-            search_term=config.search_terms,
-            location=location,
-            results_wanted=config.results_wanted,
-            hours_old=config.hours_old,
-            is_remote=location.strip().lower() == "remote",
-        )
-        for location in config.locations
-    ]
+    if not config.search_profiles:
+        return [
+            SourceSearchRequest(
+                sites=config.sites,
+                search_term=config.search_terms,
+                location=location,
+                results_wanted=config.results_wanted,
+                hours_old=config.hours_old,
+                is_remote=location.strip().lower() == "remote",
+            )
+            for location in config.locations
+        ]
+
+    requests: list[SourceSearchRequest] = []
+    for profile in config.search_profiles:
+        for location in profile.locations or config.locations:
+            requests.append(
+                SourceSearchRequest(
+                    sites=profile.sites or config.sites,
+                    search_term=profile.search_terms or config.search_terms,
+                    location=location,
+                    results_wanted=(
+                        profile.results_wanted
+                        if profile.results_wanted is not None
+                        else config.results_wanted
+                    ),
+                    hours_old=(
+                        profile.hours_old
+                        if profile.hours_old is not None
+                        else config.hours_old
+                    ),
+                    is_remote=location.strip().lower() == "remote",
+                    profile_name=profile.name,
+                )
+            )
+    return requests
 
 
 def search_payloads(config: AutomationConfig) -> list[dict[str, Any]]:
@@ -258,6 +366,7 @@ class AutomationRun:
     scored: int = 0
     failures: tuple[str, ...] = ()
     selected: dict[str, Any] | None = None
+    profile_counts: dict[str, dict[str, int]] = field(default_factory=dict)
 
 
 def _format_failure(stage: str, exc: BaseException, *, job_id: str | None = None) -> str:
@@ -378,11 +487,30 @@ class JobTrailAutomation:
         self._whatsapp_command = config.whatsapp_command
         self.base_url = config.base_url
         searched = imported = scored = 0
+        count_profiles = bool(config.search_profiles)
+        profile_counts: dict[str, dict[str, int]] = (
+            {
+                profile.name: {
+                    "searched": 0,
+                    "imported": 0,
+                    "duplicates": 0,
+                    "failures": 0,
+                }
+                for profile in config.search_profiles
+            }
+            if count_profiles
+            else {}
+        )
+        imported_by_identity: dict[tuple[str, str], str] = {}
+        profiles_by_job_id: dict[str, list[str]] = {}
         for adapter in self.source_adapters:
             for request in source_search_requests(config):
+                profile_name = request.profile_name
                 try:
                     jobs = adapter.search(request)
                     searched += len(jobs)
+                    if count_profiles:
+                        profile_counts[profile_name]["searched"] += len(jobs)
                     for job in jobs:
                         try:
                             # Hold the seen-cache lock across the whole
@@ -396,18 +524,47 @@ class JobTrailAutomation:
                                 else contextlib.nullcontext()
                             )
                             with cache_txn:
-                                if self._is_cached(job, config=config, failures=failures):
+                                identity = self._cache_identity(job)
+                                if count_profiles and identity in imported_by_identity:
+                                    profile_counts[profile_name]["duplicates"] += 1
+                                    winning_job_id = imported_by_identity[identity]
+                                    self._append_profile_provenance(
+                                        profiles_by_job_id,
+                                        winning_job_id,
+                                        profile_name,
+                                    )
                                     continue
-                                result = self.gateway.import_job(job.to_import_payload())
+                                if self._is_cached(
+                                    job,
+                                    hours_old=request.hours_old,
+                                    failures=failures,
+                                ):
+                                    continue
+                                import_payload = job.to_import_payload()
+                                result = self.gateway.import_job(import_payload)
                                 job_id = result.get("id")
                                 if job_id is not None and str(job_id) not in ids:
-                                    ids.append(str(job_id))
+                                    job_id_str = str(job_id)
+                                    ids.append(job_id_str)
                                     imported += 1
+                                    if count_profiles:
+                                        profile_counts[profile_name]["imported"] += 1
+                                        if identity is not None:
+                                            imported_by_identity[identity] = job_id_str
+                                        self._append_profile_provenance(
+                                            profiles_by_job_id,
+                                            job_id_str,
+                                            profile_name,
+                                        )
                                 self._record_seen(job, failures=failures)
                         except Exception as exc:
                             failures.append(_format_failure("import", exc))
+                            if count_profiles:
+                                profile_counts[profile_name]["failures"] += 1
                 except Exception as exc:
                     failures.append(_format_failure("search", exc))
+                    if count_profiles:
+                        profile_counts[profile_name]["failures"] += 1
         for job_id in ids[: config.max_score]:
             try:
                 retry_call(
@@ -425,6 +582,7 @@ class JobTrailAutomation:
         best = None
         best_job = None
         best_score = None
+        best_job_id = None
         for job_id in scored_ids:
             try:
                 job = self.gateway.get_job(job_id)
@@ -446,9 +604,12 @@ class JobTrailAutomation:
                     }
                     best_job = job
                     best_score = score
+                    best_job_id = job_id
             except Exception as exc:
                 failures.append(_format_failure("read", exc, job_id=job_id))
 
+        if best is not None and best_job_id in profiles_by_job_id:
+            best["searchProfiles"] = list(profiles_by_job_id[best_job_id])
         notification_body = self._compose_notification(
             best=best,
             best_job=best_job,
@@ -463,7 +624,14 @@ class JobTrailAutomation:
                 self.notifier(notification_body)
             except Exception:
                 failures.append("notify")
-        return AutomationRun(searched, imported, scored, tuple(failures), best)
+        return AutomationRun(
+            searched,
+            imported,
+            scored,
+            tuple(failures),
+            best,
+            profile_counts,
+        )
 
     @staticmethod
     def _compose_notification(
@@ -493,10 +661,13 @@ class JobTrailAutomation:
 
         match_body: str | None = None
         if best is not None and notify_enabled:
+            score_for_notification = dict(best_score or {})
+            if best.get("searchProfiles"):
+                score_for_notification["searchProfiles"] = best["searchProfiles"]
             match_body = json.dumps(
                 build_notification_summary(
                     best_job or {},
-                    best_score or {},
+                    score_for_notification,
                     base_url=base_url,
                 ),
                 ensure_ascii=False,
@@ -513,6 +684,24 @@ class JobTrailAutomation:
             return f"{match_body}\n{failure_body}"
         return match_body or failure_body
 
+    @staticmethod
+    def _normalized_identity(
+        source: Any, source_job_id: Any
+    ) -> tuple[str, str] | None:
+        if not isinstance(source, str) or not source.strip():
+            return None
+        if not isinstance(source_job_id, str) or not source_job_id.strip():
+            return None
+        return source.strip().lower(), source_job_id.strip().lower()
+
+    @staticmethod
+    def _append_profile_provenance(
+        profiles_by_job_id: dict[str, list[str]], job_id: str, profile_name: str
+    ) -> None:
+        profiles = profiles_by_job_id.setdefault(job_id, [])
+        if profile_name not in profiles:
+            profiles.append(profile_name)
+
     # --- seen-cache helpers -----------------------------------------------
 
     def _cache_identity(
@@ -528,17 +717,13 @@ class JobTrailAutomation:
             mapped = map_jobspy_job(job)
             source = mapped.get("source")
             source_job_id = mapped.get("sourceJobId")
-        if not isinstance(source, str) or not source:
-            return None
-        if not isinstance(source_job_id, str) or not source_job_id:
-            return None
-        return source, source_job_id
+        return self._normalized_identity(source, source_job_id)
 
     def _is_cached(
         self,
         job: NormalizedJob | Mapping[str, Any],
         *,
-        config: AutomationConfig,
+        hours_old: int,
         failures: list[str],
     ) -> bool:
         """Return True when the offer should be skipped due to the cache."""
@@ -553,7 +738,7 @@ class JobTrailAutomation:
             return self.seen_cache.should_skip(
                 source,
                 source_job_id,
-                hours_old=config.hours_old,
+                hours_old=hours_old,
             )
         except Exception as exc:  # pragma: no cover - defensive guard
             # Cache failures must never crash a run; surface only the
