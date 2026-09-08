@@ -6,6 +6,7 @@ import pytest
 
 import jobtrail_ai_scorer.automation as automation
 from jobtrail_ai_scorer.automation import (
+    AtsBoardConfig,
     AutomationConfig,
     BackendDiscoveryError,
     JobSearchAutomation,
@@ -20,7 +21,7 @@ from jobtrail_ai_scorer.automation import (
     source_search_requests,
 )
 from jobtrail_ai_scorer.seen_cache import SeenCache
-from jobtrail_ai_scorer.sources import NormalizedJob
+from jobtrail_ai_scorer.sources import JobSpySourceAdapter, NormalizedJob
 
 
 class FakeJobTrail:
@@ -1759,3 +1760,142 @@ def test_compose_notification_redacts_sensitive_substrings_in_run():
         "CREDENTIAL_SENTINEL",
     ):
         assert sentinel not in rendered
+
+
+# --- Lever adapter integration --------------------------------------------
+
+
+def test_automation_failing_lever_adapter_does_not_block_jobspy_import():
+    """A ``LeverSourceAdapter`` that raises during ``search`` must be caught
+    at the orchestrator as a ``search:`` failure while the JobSpy adapter
+    keeps importing its results.
+
+    The test wires a real :class:`LeverSourceAdapter` through an
+    :class:`httpx.MockTransport` so the integration exercises the actual
+    search() raise site rather than a hand-rolled fake.
+    """
+
+    from jobtrail_ai_scorer.retry import RetryPolicy
+    from jobtrail_ai_scorer.sources.lever import LeverSourceAdapter
+
+    def failing_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, request=request)
+
+    client = httpx.Client(transport=httpx.MockTransport(failing_handler))
+    lever_adapter = LeverSourceAdapter(
+        boards=("acme",),
+        client=client,
+        retry_policy=RetryPolicy(max_attempts=1, base_delay=0.01, max_delay=0.01),
+    )
+    try:
+        gateway = FakeJobTrail()
+        scorer = FakeScorer()
+        scorer.jobs = gateway.jobs
+
+        result = JobSearchAutomation(
+            gateway,
+            scorer=scorer,
+            source_adapters=(JobSpySourceAdapter(gateway), lever_adapter),
+        ).run(
+            config=AutomationConfig(
+                scorer_config_path="safe/config.yaml",
+                locations=("Queretaro",),
+                ats_boards=AtsBoardConfig(lever_boards=("acme",)),
+            )
+        )
+
+        # JobSpy still imported one result despite the Lever failure.
+        assert result.searched == 1
+        assert result.imported == 1
+        assert result.scored == 1
+        assert result.selected is not None
+        assert result.selected["title"] == "Python Engineer"
+        # The Lever failure is recorded on the run summary with the exception
+        # type only (no board URL or credentials leak).
+        assert any(
+            "LeverTransientError" in failure for failure in result.failures
+        )
+    finally:
+        client.close()
+
+
+def test_automation_healthy_lever_adapter_contributes_alongside_jobspy():
+    """A healthy ``LeverSourceAdapter`` alongside JobSpy must contribute its
+    results without interfering with the JobSpy pipeline."""
+
+    from jobtrail_ai_scorer.sources.lever import (
+        DEFAULT_BASE_URL,
+        LeverSourceAdapter,
+        normalize_lever_posting,
+    )
+
+    # Build a tiny payload that maps to the design contract (Lever fields are
+    # normalized via ``normalize_lever_posting`` so the test exercises the
+    # real normalization path too).
+    posting = {
+        "id": "lever-1",
+        "text": "Senior Python Developer",
+        "description": "<p>Build amazing things.</p>",
+        "applyUrl": "https://jobs.lever.co/acme/lever-1",
+        "categories": {"location": "Mexico City", "commitment": "Full-time"},
+    }
+    normalized = normalize_lever_posting(
+        posting,
+        company="acme",
+        profile_name="default",
+        retrieved_at=None,
+    )
+
+    def lever_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=[posting], request=request)
+
+    client = httpx.Client(transport=httpx.MockTransport(lever_handler))
+    lever_adapter = LeverSourceAdapter(
+        boards=("acme",), client=client, base_url=DEFAULT_BASE_URL
+    )
+
+    # ``FakeJobTrail.import_job`` returns ``j1`` for every import, so the
+    # second adapter's import would be skipped by the orchestrator's
+    # ``str(job_id) not in ids`` check. Use a subclass that hands out a
+    # fresh id per import so both adapters can be imported independently.
+    class _SequentialFakeJobTrail(FakeJobTrail):
+        def __init__(self) -> None:
+            super().__init__()
+            self._counter = 0
+
+        def import_job(self, payload):
+            self._counter += 1
+            self.imported.append(payload)
+            job_id = f"j{self._counter}"
+            self.jobs[job_id] = {**payload, "id": job_id, "notes": []}
+            return {"id": job_id}
+
+    try:
+        gateway = _SequentialFakeJobTrail()
+        scorer = FakeScorer()
+        scorer.jobs = gateway.jobs
+
+        result = JobSearchAutomation(
+            gateway,
+            scorer=scorer,
+            source_adapters=(JobSpySourceAdapter(gateway), lever_adapter),
+        ).run(
+            config=AutomationConfig(
+                scorer_config_path="safe/config.yaml",
+                locations=("Queretaro",),
+                ats_boards=AtsBoardConfig(lever_boards=("acme",)),
+            )
+        )
+
+        # Both adapters contributed their results without any failure.
+        assert result.failures == ()
+        assert result.searched == 2
+        assert result.imported == 2
+        # The Lever job is normalized through the real helper so the
+        # location includes both ``categories.location`` and
+        # ``categories.commitment``.
+        assert normalized.location == "Mexico City / Full-time"
+        assert normalized.company == "acme"
+        assert normalized.source_job_id == "lever-1"
+    finally:
+        client.close()
