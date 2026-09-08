@@ -1842,6 +1842,30 @@ def test_automation_failing_lever_adapter_does_not_block_jobspy_import():
         client.close()
 
 
+def test_automation_failing_greenhouse_adapter_does_not_block_jobspy_import():
+    from jobtrail_ai_scorer.retry import RetryPolicy
+    from jobtrail_ai_scorer.sources.greenhouse import GreenhouseSourceAdapter
+
+    client = httpx.Client(transport=httpx.MockTransport(lambda request: httpx.Response(503, request=request)))
+    adapter = GreenhouseSourceAdapter(
+        ("acme",), client=client,
+        retry_policy=RetryPolicy(max_attempts=1, base_delay=0, max_delay=0),
+    )
+    try:
+        gateway = FakeJobTrail()
+        scorer = FakeScorer()
+        scorer.jobs = gateway.jobs
+        result = JobSearchAutomation(
+            gateway, scorer=scorer,
+            source_adapters=(JobSpySourceAdapter(gateway), adapter),
+        ).run(config=AutomationConfig(scorer_config_path="safe/config.yaml"))
+        assert result.imported == 1
+        assert result.scored == 1
+        assert any("GreenhouseTransientError" in failure for failure in result.failures)
+    finally:
+        client.close()
+
+
 def test_automation_healthy_lever_adapter_contributes_alongside_jobspy():
     """A healthy ``LeverSourceAdapter`` alongside JobSpy must contribute its
     results without interfering with the JobSpy pipeline."""
