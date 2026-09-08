@@ -117,6 +117,49 @@ descriptions, profiles, CVs, raw prompts, reasoning, notes, credentials, or secr
 built from `JOBTRAIL_BASE_URL` plus `/jobs/<id>` and can be optionally rewritten through `WHATSAPP_SHORT_URL_BASE`.
 See [Runtime automation](docs/runtime-automation.md) for the full field contract and the optional shortener.
 
+### Optional Adzuna source
+
+`scripts/automated-job-search.example.py` can route a `SourceSearchRequest`
+to the optional Adzuna source when `adzuna` is included in `JOB_SEARCH_SITES`
+(or in a per-profile `sites` list). The adapter reads its configuration
+from the process environment so credentials never live in YAML or version
+control:
+
+| Variable | Required | Default | Notes |
+| --- | --- | --- | --- |
+| `ADZUNA_APP_ID` | yes (when enabled) | – | Adzuna application id. Must be set together with `ADZUNA_APP_KEY`. |
+| `ADZUNA_APP_KEY` | yes (when enabled) | – | Adzuna application key. Must be set together with `ADZUNA_APP_ID`. |
+| `ADZUNA_COUNTRY` | no | `us` | ISO 3166-1 alpha-2 lower-case country code (for example `mx`, `gb`, `de`). Interpolated into the Adzuna URL path and used to derive `salary_currency` on the normalized job. |
+| `ADZUNA_BASE_URL` | no | `https://api.adzuna.com/v1` | Override the API base URL for staging or mirrored deployments. |
+| `JOB_DISABLE_ADZUNA` | no | unset | Force-disable the source regardless of credentials. Accepts `1`, `true`, `yes`, `on`. |
+
+`AdzunaConfig.from_env` is the single entry point: production callers pass
+the resulting config to `AdzunaSourceAdapter`. The launcher never adds the
+adapter when the config is `None`, so missing credentials fall back to the
+remaining source adapters (for example JobSpy) without code changes.
+
+Disable behavior:
+
+- **Both credentials missing** — `AdzunaConfig.from_env` returns `None` and the source is silently disabled. No log line is emitted, so fresh installs never see noise.
+- **Exactly one of `ADZUNA_APP_ID` / `ADZUNA_APP_KEY` set** — `AdzunaConfig.from_env` returns `None` and emits a single `WARNING` line on the `jobtrail_ai_scorer.sources.adzuna` logger that names the exception class (`ValueError`) only. The credential value (or any substring of it) never appears in the warning.
+- **`JOB_DISABLE_ADZUNA` truthy** — `AdzunaConfig.from_env` returns `None` regardless of credentials. Useful when an operator wants to opt out without removing the variables.
+
+Secret hygiene is enforced end to end:
+
+- The partial-credential warning never contains the credential value or any substring of it.
+- HTTP errors (`AdzunaHttpError`, `AdzunaTransientError`) carry the status code and the exception class name only. The credentialed request URL (which contains `app_id=` and `app_key=` query parameters) is never embedded in the message, the failure label, or any retry metadata.
+- `AutomationRun.failures` records failures as `search:<classification>:<ExceptionType>` so operators can grep for `search:terminal:AdzunaHttpError` without seeing credentials. A misconfigured or rejected Adzuna call never blocks the remaining adapters.
+
+The adapter issues exactly one bounded GET per search request
+(`{base_url}/jobs/{country}/search/1` with `results_per_page` capped at
+`MAX_PER_PAGE` = 50). Pagination beyond that single page is intentionally
+out of scope in this release and is not opted in by any environment
+variable. See
+[Optional Adzuna source](docs/runtime-automation.md#optional-adzuna-source)
+in [Runtime automation](docs/runtime-automation.md) for the full contract
+including the bounded-page boundary, the retry/error classification, and
+how the orchestrator handles a failed Adzuna call without blocking JobSpy.
+
 ## Hermetic end-to-end tests
 
 The repository ships an in-process end-to-end suite at
