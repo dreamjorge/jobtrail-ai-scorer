@@ -1946,3 +1946,669 @@ def test_automation_healthy_lever_adapter_contributes_alongside_jobspy():
         assert normalized.source_job_id == "lever-1"
     finally:
         client.close()
+
+# --- PR-D3: Preflight + circuit breaker integration --------------------------
+#
+# These tests pin the contract for the breaker/preflight integration described
+# in the implementation plan:
+#
+# * ``AutomationConfig`` gains four breaker_* fields parsed from env vars.
+# * ``JobTrailAutomation.__init__`` accepts ``preflight_runner`` and
+#   ``circuit_breaker`` overrides; both default to ``None`` (skip) so the
+#   existing tests stay green.
+# * When the breaker is open, ``run()`` returns an empty ``AutomationRun``
+#   with a single ``breaker:open`` failure and emits at most one bounded
+#   alert. The breaker-opened run MUST NOT increment the failure counter.
+# * When preflight reports ``should_abort``, ``run()`` returns an empty
+#   ``AutomationRun`` with one ``preflight:unavailable:<name>`` failure per
+#   unavailable required check.
+# * A successful run after the breaker was open closes the breaker and
+#   schedules a recovery alert (``try_alert`` returns True afterwards).
+
+
+class _BreakerFakeClock:
+    """Deterministic clock used to drive circuit breaker state transitions."""
+
+    def __init__(self, start: float = 0.0) -> None:
+        self.now = start
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+def _make_open_breaker(tmp_path, *, threshold=1, cooldown=60.0):
+    """Build a :class:`CircuitBreaker` that is already OPEN.
+
+    The threshold is set to ``1`` so a single ``record_failure`` transitions
+    the breaker to OPEN at ``clock.now = 0``. The breaker is the production
+    implementation loaded from :mod:`jobtrail_ai_scorer.circuit_breaker`.
+    """
+
+    from jobtrail_ai_scorer.circuit_breaker import BreakerConfig, CircuitBreaker
+
+    clock = _BreakerFakeClock(start=0.0)
+    path = tmp_path / "breaker.json"
+    config = BreakerConfig(
+        failure_threshold=threshold,
+        cooldown_seconds=cooldown,
+        alert_cooldown_seconds=cooldown,
+        state_path=str(path),
+    )
+    breaker = CircuitBreaker(config, clock=clock)
+    breaker.record_failure()
+    assert breaker.should_attempt() is False
+    return breaker, clock, path
+
+
+def test_breaker_open_run_returns_empty_automation_run_with_single_failure(tmp_path):
+    """An open breaker short-circuits the run and records a single failure label."""
+
+    breaker, _clock, _path = _make_open_breaker(tmp_path)
+    gateway = FakeJobTrail()
+
+    result = JobSearchAutomation(gateway, circuit_breaker=breaker).run(
+        config=AutomationConfig(scorer_config_path="safe/config.yaml")
+    )
+
+    assert isinstance(result, automation.AutomationRun)
+    assert result.searched == 0
+    assert result.imported == 0
+    assert result.scored == 0
+    assert result.failures == ("breaker:open",)
+    assert result.selected is None
+    # The gateway was never touched: the breaker is the first gate.
+    assert gateway.searches == []
+
+
+def test_breaker_open_emits_exactly_one_alert_when_notify_on_failure(tmp_path):
+    """A breaker-opened run fires one bounded alert when notify_on_failure is on."""
+
+    breaker, _clock, _path = _make_open_breaker(tmp_path)
+    gateway = FakeJobTrail()
+    notifier = FakeNotifier()
+
+    result = JobSearchAutomation(
+        gateway,
+        circuit_breaker=breaker,
+        notifier=notifier,
+    ).run(
+        config=AutomationConfig(
+            scorer_config_path="safe/config.yaml",
+            notify_on_failure=True,
+            whatsapp_command="./notify.sh",
+        )
+    )
+
+    assert result.failures == ("breaker:open",)
+    assert len(notifier.messages) == 1
+    # The alert body is bounded JSON, not free-form text.
+    payload = json.loads(notifier.messages[0])
+    assert payload["kind"] == "breaker_open"
+    # No sensitive content sneaks into the alert.
+    serialized = json.dumps(payload).lower()
+    assert "description" not in serialized
+    assert "candidate" not in serialized
+    assert "prompt" not in serialized
+
+
+def test_breaker_open_run_does_not_increment_consecutive_failures(tmp_path):
+    """A breaker-opened run must not extend the open window via record_failure."""
+
+    breaker, _clock, _path = _make_open_breaker(tmp_path)
+    before_count = breaker.state.consecutive_failures
+    before_opened_at = breaker.state.opened_at
+    gateway = FakeJobTrail()
+
+    JobSearchAutomation(gateway, circuit_breaker=breaker).run(
+        config=AutomationConfig(scorer_config_path="safe/config.yaml")
+    )
+
+    # The breaker-opened run never records a failure, so the counter and
+    # ``opened_at`` are unchanged.
+    assert breaker.state.consecutive_failures == before_count
+    assert breaker.state.opened_at == before_opened_at
+
+
+def test_breaker_open_no_alert_when_notifications_disabled(tmp_path):
+    """No notifier call when both notify_enabled and notify_on_failure are off."""
+
+    breaker, _clock, _path = _make_open_breaker(tmp_path)
+    gateway = FakeJobTrail()
+    notifier = FakeNotifier()
+
+    result = JobSearchAutomation(
+        gateway,
+        circuit_breaker=breaker,
+        notifier=notifier,
+    ).run(
+        config=AutomationConfig(
+            scorer_config_path="safe/config.yaml",
+            notify_enabled=False,
+            notify_on_failure=False,
+        )
+    )
+
+    assert result.failures == ("breaker:open",)
+    assert notifier.messages == []
+
+
+def test_preflight_unavailable_run_returns_empty_automation_run(tmp_path):
+    """A preflight that reports ``should_abort`` short-circuits the run."""
+
+    from jobtrail_ai_scorer.preflight import (
+        PreflightReport,
+        PreflightResult,
+        STATUS_UNAVAILABLE,
+    )
+
+    gateway = FakeJobTrail()
+    scorer = FakeScorer()
+    scorer.jobs = gateway.jobs
+
+    def fake_preflight(_config):
+        return PreflightReport(
+            (
+                PreflightResult(
+                    name="jobtrail_api",
+                    status=STATUS_UNAVAILABLE,
+                    detail="timeout",
+                ),
+            )
+        )
+
+    result = JobSearchAutomation(
+        gateway,
+        scorer=scorer,
+        preflight_runner=fake_preflight,
+    ).run(
+        config=AutomationConfig(scorer_config_path="safe/config.yaml")
+    )
+
+    assert result.searched == 0
+    assert result.imported == 0
+    assert result.scored == 0
+    assert result.failures == ("preflight:unavailable:jobtrail_api",)
+    assert result.selected is None
+    # The orchestrator never reached the search/import/score stage.
+    assert gateway.searches == []
+
+
+def test_preflight_unavailable_records_all_required_unavailable_checks():
+    """Every required unavailable check surfaces a distinct failure label."""
+
+    from jobtrail_ai_scorer.preflight import (
+        PreflightReport,
+        PreflightResult,
+        STATUS_HEALTHY,
+        STATUS_UNAVAILABLE,
+    )
+
+    gateway = FakeJobTrail()
+
+    def fake_preflight(_config):
+        return PreflightReport(
+            (
+                PreflightResult(name="jobtrail_api", status=STATUS_HEALTHY),
+                PreflightResult(
+                    name="jobspy_search",
+                    status=STATUS_UNAVAILABLE,
+                    detail="timeout",
+                ),
+                PreflightResult(
+                    name="hermes_provider",
+                    status=STATUS_UNAVAILABLE,
+                    detail="missing",
+                ),
+            )
+        )
+
+    result = JobSearchAutomation(
+        gateway,
+        preflight_runner=fake_preflight,
+    ).run(
+        config=AutomationConfig(scorer_config_path="safe/config.yaml")
+    )
+
+    assert result.searched == 0
+    assert set(result.failures) == {
+        "preflight:unavailable:jobspy_search",
+        "preflight:unavailable:hermes_provider",
+    }
+
+
+def test_preflight_healthy_run_proceeds_with_pipeline():
+    """A preflight that reports healthy lets the existing pipeline run unchanged."""
+
+    from jobtrail_ai_scorer.preflight import (
+        PreflightReport,
+        PreflightResult,
+        STATUS_HEALTHY,
+    )
+
+    def fake_preflight(_config):
+        return PreflightReport(
+            (PreflightResult(name="jobtrail_api", status=STATUS_HEALTHY),)
+        )
+
+    gateway = FakeJobTrail()
+    scorer = FakeScorer()
+    scorer.jobs = gateway.jobs
+
+    result = JobSearchAutomation(
+        gateway,
+        scorer=scorer,
+        preflight_runner=fake_preflight,
+    ).run(
+        config=AutomationConfig(
+            scorer_config_path="safe/config.yaml",
+            locations=("Queretaro",),
+        )
+    )
+
+    # Existing pipeline ran: one offer imported and scored.
+    assert result.searched == 1
+    assert result.imported == 1
+    assert result.scored == 1
+    assert result.failures == ()
+
+
+def test_successful_run_after_breaker_was_open_records_success_and_recovers(tmp_path):
+    """A successful run during HALF_OPEN closes the breaker (state recovery)."""
+
+    from jobtrail_ai_scorer.circuit_breaker import BreakerConfig, CircuitBreaker
+
+    clock = _BreakerFakeClock(start=0.0)
+    path = tmp_path / "breaker.json"
+    config = BreakerConfig(
+        failure_threshold=2,
+        cooldown_seconds=60.0,
+        alert_cooldown_seconds=60.0,
+        state_path=str(path),
+    )
+    breaker = CircuitBreaker(config, clock=clock)
+    breaker.record_failure()
+    breaker.record_failure()  # opens at t=0
+    assert breaker.should_attempt() is False
+
+    gateway = FakeJobTrail()
+    scorer = FakeScorer()
+    scorer.jobs = gateway.jobs
+
+    # First run: breaker is OPEN, returns empty.
+    first = JobSearchAutomation(
+        gateway,
+        scorer=scorer,
+        circuit_breaker=breaker,
+    ).run(
+        config=AutomationConfig(scorer_config_path="safe/config.yaml")
+    )
+    assert first.failures == ("breaker:open",)
+
+    # Advance the clock past the cooldown: next call is HALF_OPEN.
+    clock.advance(61.0)
+    assert breaker.should_attempt() is True
+
+    # Second run: pipeline succeeds, record_success closes the breaker.
+    second = JobSearchAutomation(
+        gateway,
+        scorer=scorer,
+        circuit_breaker=breaker,
+    ).run(
+        config=AutomationConfig(scorer_config_path="safe/config.yaml")
+    )
+    assert second.failures == ()
+    assert breaker.state.consecutive_failures == 0
+    assert breaker.state.opened_at is None
+    # record_success resets the alert timer so the recovery alert is scheduled:
+    # the next ``try_alert`` returns True.
+    assert breaker.try_alert() is True
+
+
+def test_failed_run_after_breaker_was_open_records_failure_and_reopens(tmp_path):
+    """A failed run during HALF_OPEN reopens the breaker (no auto-alert)."""
+
+    from jobtrail_ai_scorer.circuit_breaker import BreakerConfig, CircuitBreaker
+
+    clock = _BreakerFakeClock(start=0.0)
+    path = tmp_path / "breaker.json"
+    config = BreakerConfig(
+        failure_threshold=2,
+        cooldown_seconds=60.0,
+        alert_cooldown_seconds=120.0,
+        state_path=str(path),
+    )
+    breaker = CircuitBreaker(config, clock=clock)
+    breaker.record_failure()
+    breaker.record_failure()  # opens at t=0
+    assert breaker.try_alert() is True  # initial outage alert fires
+
+    clock.advance(61.0)
+    assert breaker.should_attempt() is True
+
+    class _BrokenGateway(FakeJobTrail):
+        def search(self, payload):
+            raise RuntimeError("upstream still down")
+
+    result = JobSearchAutomation(
+        _BrokenGateway(),
+        circuit_breaker=breaker,
+    ).run(
+        config=AutomationConfig(scorer_config_path="safe/config.yaml")
+    )
+
+    assert result.failures
+    assert breaker.state.consecutive_failures >= 2
+    assert breaker.should_attempt() is False  # reopened
+    # record_failure does not stamp last_alert_at; the previous alert is still
+    # within the alert cooldown, so the next try_alert is False.
+    assert breaker.try_alert() is False
+
+
+def test_automation_config_from_env_parses_breaker_threshold():
+    """``BREAKER_FAILURE_THRESHOLD`` is parsed into an integer field."""
+
+    config = AutomationConfig.from_env({"BREAKER_FAILURE_THRESHOLD": "2"})
+    assert config.breaker_failure_threshold == 2
+
+
+def test_automation_config_from_env_parses_breaker_cooldown_seconds():
+    """``BREAKER_COOLDOWN_SECONDS`` is parsed into a float field."""
+
+    config = AutomationConfig.from_env({"BREAKER_COOLDOWN_SECONDS": "12.5"})
+    assert config.breaker_cooldown_seconds == 12.5
+
+
+def test_automation_config_from_env_parses_breaker_alert_cooldown_seconds():
+    """``BREAKER_ALERT_COOLDOWN_SECONDS`` is parsed into a float field."""
+
+    config = AutomationConfig.from_env(
+        {"BREAKER_ALERT_COOLDOWN_SECONDS": "7.5"}
+    )
+    assert config.breaker_alert_cooldown_seconds == 7.5
+
+
+def test_automation_config_from_env_parses_breaker_state_path():
+    """``BREAKER_STATE_PATH`` is parsed into a string field."""
+
+    config = AutomationConfig.from_env(
+        {"BREAKER_STATE_PATH": "/tmp/custom-breaker.json"}
+    )
+    assert config.breaker_state_path == "/tmp/custom-breaker.json"
+
+
+@pytest.mark.parametrize(
+    "env,key",
+    [
+        ({"BREAKER_FAILURE_THRESHOLD": "not-a-number"}, "BREAKER_FAILURE_THRESHOLD"),
+        ({"BREAKER_COOLDOWN_SECONDS": "not-a-float"}, "BREAKER_COOLDOWN_SECONDS"),
+        (
+            {"BREAKER_ALERT_COOLDOWN_SECONDS": "not-a-float"},
+            "BREAKER_ALERT_COOLDOWN_SECONDS",
+        ),
+    ],
+    ids=["threshold", "cooldown", "alert_cooldown"],
+)
+def test_automation_config_from_env_rejects_non_numeric_breaker_values(env, key):
+    """Non-numeric breaker env values raise ``ValueError`` from ``from_env``."""
+
+    with pytest.raises(ValueError):
+        AutomationConfig.from_env(env)
+
+
+def test_automation_config_defaults_match_breaker_design():
+    """The dataclass defaults match the design: 3 failures, 1h cooldowns.
+
+    ``breaker_state_path`` defaults to the empty string as the sentinel for
+    "not configured" so the orchestrator can skip the breaker for callers
+    that do not opt in via env or config. Setting ``BREAKER_STATE_PATH`` in
+    the environment wires the breaker to that path.
+    """
+
+    config = AutomationConfig()
+    assert config.breaker_failure_threshold == 3
+    assert config.breaker_cooldown_seconds == 3600.0
+    assert config.breaker_alert_cooldown_seconds == 3600.0
+    assert config.breaker_state_path == ""
+
+
+def test_automation_builds_breaker_from_config_when_path_is_set(tmp_path):
+    """A non-empty ``breaker_state_path`` in config builds a default CircuitBreaker."""
+
+    path = tmp_path / "auto-breaker.json"
+    gateway = FakeJobTrail()
+    scorer = FakeScorer()
+    scorer.jobs = gateway.jobs
+
+    # No ``circuit_breaker`` injection: the orchestrator should build one.
+    result = JobSearchAutomation(gateway, scorer=scorer).run(
+        config=AutomationConfig(
+            scorer_config_path="safe/config.yaml",
+            breaker_state_path=str(path),
+        )
+    )
+
+    # The breaker was CLOSED at construction, so the pipeline ran normally.
+    assert result.failures == ()
+    assert result.imported == 1
+    # The state file was created by the breaker on its first persistence.
+    assert path.exists()
+
+
+def test_automation_skips_breaker_when_state_path_is_empty():
+    """An empty ``breaker_state_path`` means "no breaker configured"."""
+
+    gateway = FakeJobTrail()
+    scorer = FakeScorer()
+    scorer.jobs = gateway.jobs
+
+    # No breaker override, empty path: the orchestrator should not build a
+    # breaker or write to the runtime path.
+    result = JobSearchAutomation(gateway, scorer=scorer).run(
+        config=AutomationConfig(scorer_config_path="safe/config.yaml")
+    )
+
+    assert result.failures == ()
+    assert result.imported == 1
+
+
+def test_breaker_open_alert_respects_alert_cooldown(tmp_path):
+    """Two consecutive breaker-opened runs in the same cooldown emit one alert total."""
+
+    from jobtrail_ai_scorer.circuit_breaker import BreakerConfig, CircuitBreaker
+
+    clock = _BreakerFakeClock(start=0.0)
+    path = tmp_path / "breaker.json"
+    config = BreakerConfig(
+        failure_threshold=1,
+        cooldown_seconds=60.0,
+        alert_cooldown_seconds=120.0,
+        state_path=str(path),
+    )
+    breaker = CircuitBreaker(config, clock=clock)
+    breaker.record_failure()  # opens at t=0
+    assert breaker.try_alert() is True  # caller consumed the first alert
+
+    gateway = FakeJobTrail()
+    notifier = FakeNotifier()
+
+    # Second invocation: try_alert returns False (within alert_cooldown),
+    # so the orchestrator does not re-notify.
+    result = JobSearchAutomation(
+        gateway,
+        circuit_breaker=breaker,
+        notifier=notifier,
+    ).run(
+        config=AutomationConfig(
+            scorer_config_path="safe/config.yaml",
+            notify_on_failure=True,
+            whatsapp_command="./notify.sh",
+        )
+    )
+
+    assert result.failures == ("breaker:open",)
+    assert notifier.messages == []
+
+
+def test_preflight_unavailable_optional_check_is_not_recorded():
+    """``required=False`` unavailable checks do not surface as failures."""
+
+    from jobtrail_ai_scorer.preflight import (
+        PreflightReport,
+        PreflightResult,
+        STATUS_UNAVAILABLE,
+    )
+
+    gateway = FakeJobTrail()
+    scorer = FakeScorer()
+    scorer.jobs = gateway.jobs
+
+    def fake_preflight(_config):
+        # ``whatsapp`` is the canonical optional check (required=False) in
+        # the production preflight factory.
+        return PreflightReport(
+            (
+                PreflightResult(
+                    name="whatsapp",
+                    status=STATUS_UNAVAILABLE,
+                    detail="missing",
+                ),
+            ),
+            required={"whatsapp": False},
+        )
+
+    result = JobSearchAutomation(
+        gateway,
+        scorer=scorer,
+        preflight_runner=fake_preflight,
+    ).run(
+        config=AutomationConfig(
+            scorer_config_path="safe/config.yaml",
+            locations=("Queretaro",),
+        )
+    )
+
+    # The optional whatsapp failure must not abort the run; the pipeline
+    # proceeds normally.
+    assert result.failures == ()
+    assert result.searched == 1
+    assert result.imported == 1
+
+
+def test_pipeline_failures_record_breaker_failure_when_no_breaker_path_set():
+    """No breaker is built when ``breaker_state_path`` is empty; legacy behavior."""
+
+    gateway = FakeJobTrail()
+
+    def boom_import(payload):
+        request = httpx.Request("POST", "http://test/import")
+        response = httpx.Response(503, request=request)
+        raise httpx.HTTPStatusError(
+            "transient", request=request, response=response
+        )
+
+    monkeypatch = pytest.MonkeyPatch()
+    try:
+        monkeypatch.setattr(gateway, "import_job", boom_import)
+        # No breaker override, empty path: the orchestrator should not
+        # build a breaker and the run should complete with an import
+        # failure label. The point of this test is to confirm no
+        # exception is raised and the run completes with the expected
+        # failure label even when there is no breaker configured.
+        result = JobSearchAutomation(gateway).run(
+            config=AutomationConfig(
+                scorer_config_path="safe/config.yaml",
+                locations=("Queretaro",),
+            )
+        )
+    finally:
+        monkeypatch.undo()
+
+    assert any(failure.startswith("import:") for failure in result.failures)
+
+
+def test_breaker_with_default_path_is_skipped_for_existing_callers():
+    """Empty ``breaker_state_path`` keeps the legacy pipeline untouched."""
+
+    gateway = FakeJobTrail()
+    scorer = FakeScorer()
+    scorer.jobs = gateway.jobs
+
+    # The breaker is wired in by the constructor injection; without it, the
+    # pipeline runs the legacy path.
+    result = JobSearchAutomation(gateway, scorer=scorer).run(
+        config=AutomationConfig(
+            scorer_config_path="safe/config.yaml",
+            locations=("Queretaro",),
+        )
+    )
+
+    assert result.failures == ()
+    assert result.imported == 1
+    assert result.scored == 1
+
+
+def test_breaker_open_with_notify_enabled_alerts_once(tmp_path):
+    """A breaker-opened run with ``notify_enabled=True`` emits one alert."""
+
+    breaker, _clock, _path = _make_open_breaker(tmp_path)
+    gateway = FakeJobTrail()
+    notifier = FakeNotifier()
+
+    result = JobSearchAutomation(
+        gateway,
+        circuit_breaker=breaker,
+        notifier=notifier,
+    ).run(
+        config=AutomationConfig(
+            scorer_config_path="safe/config.yaml",
+            notify_enabled=True,
+            whatsapp_command="./notify.sh",
+        )
+    )
+
+    assert result.failures == ("breaker:open",)
+    assert len(notifier.messages) == 1
+    payload = json.loads(notifier.messages[0])
+    assert payload["kind"] == "breaker_open"
+
+
+def test_preflight_healthy_runs_pipeline_with_injected_breaker(tmp_path):
+    """A healthy preflight does not interact with the breaker gate."""
+
+    from jobtrail_ai_scorer.circuit_breaker import CircuitBreaker
+    from jobtrail_ai_scorer.preflight import (
+        PreflightReport,
+        PreflightResult,
+        STATUS_HEALTHY,
+    )
+
+    breaker, _clock, _path = _make_open_breaker(tmp_path)
+
+    def fake_preflight(_config):
+        return PreflightReport(
+            (PreflightResult(name="jobtrail_api", status=STATUS_HEALTHY),)
+        )
+
+    gateway = FakeJobTrail()
+    scorer = FakeScorer()
+    scorer.jobs = gateway.jobs
+
+    result = JobSearchAutomation(
+        gateway,
+        scorer=scorer,
+        circuit_breaker=breaker,
+        preflight_runner=fake_preflight,
+    ).run(
+        config=AutomationConfig(
+            scorer_config_path="safe/config.yaml",
+            locations=("Queretaro",),
+        )
+    )
+
+    # Breaker is OPEN, so the breaker gate fires before preflight.
+    assert result.failures == ("breaker:open",)
+    assert result.imported == 0
+    assert result.scored == 0

@@ -245,6 +245,86 @@ UTC retrieval timestamp. Malformed rows are skipped. `4xx` errors are
 terminal; `5xx` and transport failures use bounded retries and do not block
 JobSpy or Lever results.
 
+### Preflight checks and circuit breaker (Issue #37)
+
+The daily automation can short-circuit an unhealthy run before it invests in
+search/import/score work. Two opt-in features wire the gate:
+
+- **Preflight checks** — a small set of bounded, side-effect-free probes
+  (`jobtrail_api`, `jobspy_search`, `hermes_provider`, plus `whatsapp`
+  when `WHATSAPP_NOTIFY_ENABLED=1`). When any *required* check reports
+  `unavailable`, the run returns an empty `AutomationRun` with a single
+  `preflight:unavailable:<name>` failure label per unavailable check.
+- **Persistent circuit breaker** — a JSON-backed state machine that opens
+  after `BREAKER_FAILURE_THRESHOLD` consecutive failed runs, blocks the
+  pipeline for `BREAKER_COOLDOWN_SECONDS`, and emits at most one bounded
+  WhatsApp alert per `BREAKER_ALERT_COOLDOWN_SECONDS`. A breaker-opened
+  run returns an empty `AutomationRun` with the `breaker:open` failure
+  label; the run never increments the consecutive-failure counter so the
+  alert does not extend the cooldown.
+
+The breaker is **opt-in**: omitting `BREAKER_STATE_PATH` (or leaving it
+empty) keeps the legacy pipeline unchanged. Setting it to an absolute path
+wires the breaker for that path; the file is rewritten atomically with
+`0600` permissions (mirrors the seen-cache contract).
+
+### Environment variables
+
+| Variable | Required | Default | Notes |
+| --- | --- | --- | --- |
+| `BREAKER_FAILURE_THRESHOLD` | no | `3` | Consecutive failed runs that open the breaker. Must parse as an integer; non-integer values raise `ValueError` from `AutomationConfig.from_env`. |
+| `BREAKER_COOLDOWN_SECONDS` | no | `3600.0` | Cooldown window during which an open breaker blocks the pipeline. Must parse as a float. |
+| `BREAKER_ALERT_COOLDOWN_SECONDS` | no | `3600.0` | Minimum seconds between consecutive breaker-open WhatsApp alerts. Must parse as a float. |
+| `BREAKER_STATE_PATH` | no | `""` (no breaker) | Absolute path to the JSON state file. Empty disables the breaker entirely so existing callers see no behavior change. When set, the file is created on first persistence with `0600` permissions. |
+
+### Breaker state machine
+
+```text
+CLOSED ── consecutive_failures >= threshold ──▶ OPEN (opened_at = now)
+                                                  │
+                                          cooldown_seconds elapsed
+                                                  │
+                                                  ▼
+                                             HALF_OPEN (attempts allowed)
+                                             │       │
+                                        success   failure
+                                             │       │
+                                             ▼       ▼
+                                          CLOSED   OPEN
+                                        (counter  (opened_at = now;
+                                         reset;   no auto-alert until
+                                         alert    alert_cooldown
+                                         timer    elapses)
+                                         reset)
+```
+
+- `should_attempt()` is `True` in `CLOSED`, and in `HALF_OPEN` (cooldown
+  elapsed since `opened_at`); `False` otherwise.
+- `record_failure()` increments the counter, opens the breaker at the
+  threshold, and updates `opened_at` to "now" each time the breaker is
+  (re)opened. It never fires an alert on its own.
+- `record_success()` resets the breaker to `CLOSED` (`consecutive_failures=0`,
+  `opened_at=None`) and resets the alert timer so the recovery alert
+  can fire once.
+- `try_alert()` returns `True` iff no alert has been emitted within
+  `alert_cooldown_seconds`; on `True` it stamps `last_alert_at`.
+
+### Preflight checks table
+
+| Check | Probe | Required | Timeout | Notes |
+| --- | --- | --- | --- | --- |
+| `jobtrail_api` | `GET <base_url>/api/health` (falls back to `HEAD` on 404) | yes | 2.0s | Healthy when the response is 2xx (or the head probe succeeds). |
+| `jobspy_search` | minimal `JobSpySourceAdapter.search` request | yes | 5.0s | Uses `RetryPolicy(max_attempts=1)`. |
+| `hermes_provider` | `hermes --profile <profile> --help` (returncode `== 0` ⇒ healthy) | yes | 2.0s | Defaults `hermes_executable=hermes`, `hermes_profile=default`. |
+| `whatsapp` | `os.access(<whatsapp_command>, os.X_OK)` | no (only added when `notify_enabled=True`) | 1.0s | Optional — a missing helper does not abort the run. |
+
+A corrupt or missing breaker state file degrades to a fresh `CLOSED`
+breaker so storage failures never crash the automation. A breaker-opened
+run does not increment the failure counter and does not double-notify
+within the alert cooldown. See
+[Runtime automation](docs/runtime-automation.md#preflight-checks-and-circuit-breaker)
+for the full contract and the test invariants.
+
 ## Hermetic end-to-end tests
 
 The repository ships an in-process end-to-end suite at
