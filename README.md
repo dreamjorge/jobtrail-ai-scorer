@@ -160,6 +160,91 @@ in [Runtime automation](docs/runtime-automation.md) for the full contract
 including the bounded-page boundary, the retry/error classification, and
 how the orchestrator handles a failed Adzuna call without blocking JobSpy.
 
+### Optional Lever source (PR-B)
+
+`scripts/automated-job-search.example.py` can route a `SourceSearchRequest`
+to the optional Lever source by adding Lever board slugs to
+`JOB_ATS_BOARDS.lever_boards`. Unlike Adzuna, the Lever public postings
+endpoint does not require authentication:
+
+```json
+{"lever_boards": ["acme", "globex"], "results_wanted": 25}
+```
+
+The adapter issues one bounded GET per configured board against the
+public Lever endpoint:
+
+```text
+GET https://api.lever.co/v0/postings/<board>?mode=json
+```
+
+`request.search_term` and `request.location` are intentionally ignored —
+the Lever endpoint scopes results to a single board slug and does not
+accept free-text queries. `request.profile_name` is propagated to every
+normalized job and `request.results_wanted` is the global cap across all
+boards (so a configured `results_wanted=10` never returns more than 10
+postings regardless of how many boards are configured).
+
+The public endpoint exposes a single, bounded JSON array per board.
+Multi-page or per-term filtering is intentionally out of scope; the
+adapter never paginates and never follows pagination links. When the
+board has no postings (or returns a non-list payload) the adapter treats
+the call as a partial success and returns an empty list for that board.
+
+Field translation (per the design table):
+
+| Lever field | `NormalizedJob` field |
+| --- | --- |
+| `id` | `source_job_id` |
+| `text` | `title` |
+| `description` (HTML stripped) | `description` |
+| `applyUrl` | `source_url` |
+| `categories.location` + `categories.commitment` | `location` |
+| board slug | `company` |
+| request `profile_name` | `search_profile` |
+| adapter clock (UTC ISO-8601) | `retrieved_at` |
+
+Error semantics:
+
+- `4xx` responses raise `LeverHttpError` immediately (terminal, no retry).
+  The exception carries `status_code` and `board` so the orchestrator can
+  classify the failure as `search:terminal:LeverHttpError`.
+- `5xx` responses and transport errors are retried via the existing
+  `RetryPolicy` (default `max_attempts=3`). Exhausted retries surface as
+  `LeverTransientError` and are recorded as
+  `search:terminal:LeverTransientError` (the orchestrator's classifier
+  treats the exhausted wrapper as terminal and records the exception
+  class name only).
+- Malformed items inside the payload are silently skipped; only a full
+  board failure raises.
+
+Disable semantics: the source is enabled whenever
+`JOB_ATS_BOARDS.lever_boards` is a non-empty list. Omit the key (or pass
+an empty list) to disable Lever without removing the boards from the
+configuration. A failing Lever adapter never blocks the remaining
+adapters (for example JobSpy); see
+[Optional Lever source](docs/runtime-automation.md#optional-lever-source)
+in [Runtime automation](docs/runtime-automation.md) for the full
+contract including the orchestrator integration.
+
+### Optional Greenhouse source
+
+Add Greenhouse board slugs under `JOB_ATS_BOARDS.greenhouse_boards`:
+
+```json
+{"greenhouse_boards": ["acme", "globex"], "results_wanted": 25}
+```
+
+The adapter makes one request per board to
+`GET https://boards-api.greenhouse.io/v1/boards/<board>/jobs?content=true`.
+Search terms and locations are ignored; automation issues one ATS request
+per configured search profile (not once per location), and uses the ATS
+`results_wanted` cap across boards. Results are globally capped, normalized
+with HTML-stripped content, board company, profile name, and a
+UTC retrieval timestamp. Malformed rows are skipped. `4xx` errors are
+terminal; `5xx` and transport failures use bounded retries and do not block
+JobSpy or Lever results.
+
 ## Hermetic end-to-end tests
 
 The repository ships an in-process end-to-end suite at
