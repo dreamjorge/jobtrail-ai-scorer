@@ -494,6 +494,103 @@ def test_automation_run_profile_counts_defaults_empty():
     assert automation.AutomationRun().profile_counts == {}
 
 
+def test_automation_adzuna_adapter_exception_does_not_block_jobspy_import():
+    """An ``AdzunaSourceAdapter`` that raises during ``search`` must be
+    caught at the orchestrator as a ``search:`` failure while the
+    JobSpy adapter keeps importing its results and the run selects a
+    best match."""
+
+    import httpx as _httpx
+
+    from jobtrail_ai_scorer.sources import JobSpySourceAdapter
+    from jobtrail_ai_scorer.sources.adzuna import (
+        AdzunaConfig,
+        AdzunaHttpError,
+        AdzunaSourceAdapter,
+    )
+
+    class RaisingAdzunaAdapter(AdzunaSourceAdapter):
+        """AdzunaSourceAdapter subclass that always raises from search.
+
+        Subclassing (rather than wrapping) keeps the production
+        constructor wired exactly as the orchestrator expects, so the
+        failure path exercises the real ``search()`` raise site.
+        """
+
+        def __init__(self) -> None:
+            config = AdzunaConfig(
+                app_id="id-123",
+                app_key="key-456",
+                country="us",
+            )
+            super().__init__(
+                config=config,
+                client=_httpx.Client(
+                    transport=_httpx.MockTransport(
+                        lambda request: _httpx.Response(200, request=request)
+                    )
+                ),
+            )
+
+        def search(self, request):  # type: ignore[override]
+            raise AdzunaHttpError(
+                "adzuna rejected the request: status=403",
+                status_code=403,
+            )
+
+    gateway = FakeJobTrail()
+    scorer = FakeScorer()
+    scorer.jobs = gateway.jobs
+    adzuna_adapter = RaisingAdzunaAdapter()
+
+    result = JobSearchAutomation(
+        gateway,
+        scorer=scorer,
+        # Pass *both* adapters: the production code defaults to JobSpy
+        # when ``source_adapters`` is None, so the test must opt in
+        # explicitly to keep JobSpy in the mix alongside the failing
+        # Adzuna adapter.
+        source_adapters=(JobSpySourceAdapter(gateway), adzuna_adapter),
+    ).run(
+        config=AutomationConfig(
+            scorer_config_path="safe/config.yaml",
+            locations=("Queretaro",),
+        )
+    )
+
+    # JobSpy results were still imported via the default JobSpy
+    # adapter, so the run has a selected match above the threshold.
+    assert result.searched == 1
+    assert result.imported == 1
+    assert result.scored == 1
+    assert result.selected is not None
+    assert result.selected["title"] == "Python Engineer"
+    assert gateway.imported == [
+        {
+            "source": "indeed",
+            "sourceJobId": "source-1",
+            "company": "Acme",
+            "position": "Python Engineer",
+            "description": "good",
+            "jobUrl": "https://jobs.test/1",
+            "location": "Queretaro",
+            "remote": False,
+            "searchProfile": "default",
+        }
+    ]
+
+    # The Adzuna failure is recorded as a ``search:`` failure with the
+    # terminal classification (4xx is non-retryable) and the exception
+    # type so operators can grep for it. The credentialed URL must
+    # not appear in the label.
+    assert len(result.failures) == 1
+    failure = result.failures[0]
+    assert failure.startswith("search:terminal")
+    assert "AdzunaHttpError" in failure
+    assert "key-456" not in failure
+    assert "id-123" not in failure
+
+
 def test_automation_deduplicates_imports_across_profiles_and_counts_provenance():
     class ProfileDedupeAdapter:
         name = "profiles"

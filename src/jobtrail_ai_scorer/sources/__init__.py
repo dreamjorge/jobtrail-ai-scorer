@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from typing import Any, Mapping, Protocol
 
 
+
 @dataclass(frozen=True)
 class SourceSearchRequest:
     sites: tuple[str, ...]
@@ -109,3 +110,19 @@ class JobSpySourceAdapter:
             normalize_jobspy_job(job, profile_name=request.profile_name)
             for job in self.gateway.search(request.to_jobspy_payload())
         ]
+
+
+# Imported here so the types above (NormalizedJob, SourceSearchRequest) are
+# already defined when ``adzuna`` is loaded; otherwise a circular import
+# would occur because ``adzuna`` re-imports those names from this package.
+from .adzuna import AdzunaSourceAdapter  # noqa: E402
+
+__all__ = [
+    "AdzunaSourceAdapter",
+    "JobSpySourceAdapter",
+    "NormalizedJob",
+    "SearchGateway",
+    "SourceAdapter",
+    "SourceSearchRequest",
+    "normalize_jobspy_job",
+]

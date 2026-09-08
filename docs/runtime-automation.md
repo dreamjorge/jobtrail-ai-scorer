@@ -95,6 +95,106 @@ The JSON is configuration only: it must not contain secrets, credentials, privat
 
 The final launcher output includes `profile_counts` with `searched`, `imported`, `duplicates`, and `failures` per profile when profiles are configured; it is `{}` for the legacy fallback.
 
+## Optional Adzuna source
+
+`AdzunaSourceAdapter` is an optional source the automation launcher can
+include by adding `adzuna` to `JOB_SEARCH_SITES` or to a per-profile
+`sites` list. The adapter reads its configuration from the process
+environment so credentials never live in YAML, fixture files, or version
+control.
+
+### Environment variables
+
+| Variable | Required | Default | Notes |
+| --- | --- | --- | --- |
+| `ADZUNA_APP_ID` | yes (when enabled) | – | Adzuna application id. Must be set together with `ADZUNA_APP_KEY`. |
+| `ADZUNA_APP_KEY` | yes (when enabled) | – | Adzuna application key. Must be set together with `ADZUNA_APP_ID`. |
+| `ADZUNA_COUNTRY` | no | `us` | ISO 3166-1 alpha-2 lower-case country code (for example `mx`, `gb`, `de`). Interpolated into the Adzuna URL path and used to derive `salary_currency` on the normalized job. |
+| `ADZUNA_BASE_URL` | no | `https://api.adzuna.com/v1` | Override the API base URL for staging or mirrored deployments. |
+| `JOB_DISABLE_ADZUNA` | no | unset | Force-disable the source regardless of credentials. Accepts `1`, `true`, `yes`, `on`. |
+
+`AdzunaConfig.from_env` is the single source of truth: production callers
+pass the resulting config to `AdzunaSourceAdapter(config=...)`. When the
+adapter is omitted (or returns `None`) the launcher falls back to the
+remaining source adapters (for example `JobSpySourceAdapter`) without
+code changes.
+
+### Disable semantics
+
+- **Both `ADZUNA_APP_ID` and `ADZUNA_APP_KEY` missing** —
+  `AdzunaConfig.from_env` returns `None` and the source is silently
+  disabled. No log line is emitted, so fresh installs that never intend
+  to use Adzuna see no noise.
+- **Exactly one of `ADZUNA_APP_ID` / `ADZUNA_APP_KEY` set** —
+  `AdzunaConfig.from_env` returns `None` and emits a single `WARNING`
+  line on the `jobtrail_ai_scorer.sources.adzuna` logger that names the
+  exception class (`ValueError`) only. The credential value (or any
+  substring of it) never appears in the warning, the failure label,
+  retry metadata, or any notification.
+- **`JOB_DISABLE_ADZUNA` truthy** — `AdzunaConfig.from_env` returns
+  `None` regardless of credentials. Use this when an operator wants to
+  opt out without removing the variables from the environment.
+
+The silent path is the right default: a fresh install with no Adzuna
+credentials still works, and only an incomplete configuration produces a
+single diagnostic warning.
+
+### Secrets are never logged
+
+Secret hygiene is enforced end to end:
+
+- The partial-credential warning names the exception class only. Neither
+  `ADZUNA_APP_ID` nor `ADZUNA_APP_KEY` (or any substring of them) ever
+  appears in the warning text, the captured log records, or the
+  rendered failure label.
+- HTTP errors raised by the adapter (`AdzunaHttpError` for `4xx`,
+  `AdzunaTransientError` after retry exhaustion) carry the status code
+  and the exception class name. The credentialed request URL (which
+  contains `app_id=` and `app_key=` query parameters) is never embedded
+  in the message, the failure label, or any retry metadata.
+- `AutomationRun.failures` records the failure as
+  `search:<classification>:<ExceptionType>` (for example
+  `search:terminal:AdzunaHttpError` or `search:exhausted:AdzunaTransientError`)
+  so operators can grep for the misconfiguration without seeing
+  credentials.
+- The orchestrator catches `AdzunaSourceAdapter` exceptions at the
+  search stage and continues with the remaining source adapters (for
+  example JobSpy), so a misconfigured or rejected Adzuna call never
+  blocks the run.
+
+### Bounded page, no pagination
+
+`AdzunaSourceAdapter` issues exactly one bounded GET per search
+request:
+
+```text
+GET {base_url}/jobs/{country}/search/1
+    ?app_id={ADZUNA_APP_ID}
+    &app_key={ADZUNA_APP_KEY}
+    &what={search_term}
+    &where={location}
+    &results_per_page={min(results_wanted, MAX_PER_PAGE)}
+    &max_days_old={hours_old}
+```
+
+`results_per_page` is capped at `MAX_PER_PAGE` (50), so the adapter
+never paginates within a single call. Following `redirect_url` links
+for detail pages is not part of this slice. Multi-page support is
+intentionally out of scope and is not opted in by any environment
+variable in this release.
+
+### Retry and error classification
+
+The adapter reuses the project's `RetryPolicy` and `retry_call` so
+transient transport errors and `5xx` responses retry with bounded
+attempts (default `max_attempts=3`, `base_delay=0.5s`, `max_delay=8s`).
+`4xx` responses raise `AdzunaHttpError` immediately (terminal, no retry);
+exhausted retries surface as `AdzunaTransientError` so the orchestrator
+records a stable failure label without leaking the request URL. See
+[Bounded retries with backoff](#bounded-retries-with-backoff) for the
+retry helper contract and the `retry:`/`retryable`/`exhausted`/
+`terminal` classification vocabulary.
+
 ## Pre-import deduplication (seen cache)
 
 The automation launcher skips offers whose `(source, sourceJobId)` pair was
