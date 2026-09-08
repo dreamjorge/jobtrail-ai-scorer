@@ -20,6 +20,7 @@ from .discover import (  # noqa: F401  (re-exported on purpose)
 from .retry import RetryPolicy, classify_retryable, retry_call
 from .seen_cache import SeenCache
 from .notify import NotificationBuilder, recommendation_label
+from .sources import normalize_jobspy_job
 
 
 DEFAULT_TERMS = (
@@ -128,25 +129,7 @@ def search_payloads(config: AutomationConfig) -> list[dict[str, Any]]:
 
 
 def map_jobspy_job(job: Mapping[str, Any]) -> dict[str, Any]:
-    mapping = {
-        "source": "site",
-        "sourceJobId": "id",
-        "company": "company",
-        "position": "title",
-        "description": "description",
-        "jobUrl": "job_url",
-        "location": "location",
-        "remote": "is_remote",
-        "salaryMin": "min_amount",
-        "salaryMax": "max_amount",
-        "salaryCurrency": "currency",
-        "jobType": "job_type",
-    }
-    return {
-        target: job[source]
-        for target, source in mapping.items()
-        if source in job and job[source] is not None
-    }
+    return normalize_jobspy_job(job).to_import_payload()
 
 
 def parse_score_note(notes: Any) -> dict[str, Any] | None:
