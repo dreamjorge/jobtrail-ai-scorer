@@ -106,11 +106,13 @@ def test_search_propagates_profile_name_to_normalized_jobs() -> None:
 def test_4xx_is_terminal_and_error_does_not_leak_secret_or_url() -> None:
     secret = "lever-api-secret"
     url = f"{BASE_URL}/postings/{secret}"
-    client = httpx.Client(
-        transport=httpx.MockTransport(
-            lambda request: httpx.Response(401, text="token=" + secret, request=request)
-        )
-    )
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(401, text="token=" + secret, request=request)
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
     adapter = LeverSourceAdapter(
         (secret,),
         client=client,
@@ -128,6 +130,32 @@ def test_4xx_is_terminal_and_error_does_not_leak_secret_or_url() -> None:
     assert caught.value.status_code == 401
     assert secret not in message
     assert url not in message
+    assert len(captured) == 1
+
+
+def test_search_visits_second_board_when_first_is_under_cap() -> None:
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        board = request.url.path.rsplit("/", 1)[-1]
+        rows = [_posting("acme-job")] if board == "acme" else [_posting("globex-job")]
+        return httpx.Response(200, json=rows, request=request)
+
+    adapter, client = _adapter(
+        handler,
+        boards=("acme", "globex"),
+        captured=captured,
+    )
+    try:
+        jobs = adapter.search(_request(results_wanted=2))
+    finally:
+        client.close()
+
+    assert [job.source_job_id for job in jobs] == ["acme-job", "globex-job"]
+    assert [request.url.path for request in captured] == [
+        "/v0/postings/acme",
+        "/v0/postings/globex",
+    ]
 
 
 def test_5xx_retries_and_recovers() -> None:

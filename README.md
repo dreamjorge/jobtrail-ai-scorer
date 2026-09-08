@@ -237,8 +237,10 @@ Add Greenhouse board slugs under `JOB_ATS_BOARDS.greenhouse_boards`:
 
 The adapter makes one request per board to
 `GET https://boards-api.greenhouse.io/v1/boards/<board>/jobs?content=true`.
-Search terms and locations are ignored; results are globally capped,
-normalized with HTML-stripped content, board company, profile name, and a
+Search terms and locations are ignored; automation issues one ATS request
+per configured search profile (not once per location), and uses the ATS
+`results_wanted` cap across boards. Results are globally capped, normalized
+with HTML-stripped content, board company, profile name, and a
 UTC retrieval timestamp. Malformed rows are skipped. `4xx` errors are
 terminal; `5xx` and transport failures use bounded retries and do not block
 JobSpy or Lever results.

@@ -755,8 +755,9 @@ is non-empty. It issues one request per board to:
 GET https://boards-api.greenhouse.io/v1/boards/<board>/jobs?content=true
 ```
 
-Board scope wins over search terms and locations. Results are capped globally by
-`results_wanted`, malformed rows are skipped, and normalized jobs retain the
+Board scope wins over search terms and locations. Automation issues one ATS
+request per configured search profile (not once per location), and results are
+capped globally by the ATS `results_wanted`, malformed rows are skipped, and normalized jobs retain the
 board slug, profile name, HTML-stripped content, remote heuristic, and UTC
 retrieval timestamp. `4xx` responses are terminal; `5xx` and transport errors
 use bounded retries. A failed Greenhouse search is recorded without blocking
