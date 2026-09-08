@@ -115,6 +115,33 @@ def test_rendered_summary_keys_are_exactly_the_allowlist_when_id_present():
     assert extra == set()
 
 
+def test_notification_allows_bounded_scrubbed_search_profiles():
+    """Selected public search profile names may be rendered, but are bounded."""
+
+    body = _builder().build(
+        score=_score(
+            searchProfiles=[
+                "python",
+                "backend /DATA/secret",
+                "x" * 250,
+                "remote",
+                "agents",
+                "extra-profile",
+            ]
+        ),
+        job=_job(),
+    )
+
+    assert body["searchProfiles"] == [
+        "python",
+        "backend [REDACTED]secret",
+        "x" * 200,
+        "remote",
+        "agents",
+    ]
+    assert set(body) <= ALLOWED_FIELDS
+
+
 # --- run id format -----------------------------------------------------------
 
 

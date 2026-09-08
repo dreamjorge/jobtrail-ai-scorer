@@ -81,7 +81,11 @@ target removal date; do not use them in production. See the
 Run `scripts/automated-job-search.example.py` with required `SCORER_CONFIG_PATH`.
 Configure `JOB_SEARCH_*`, `JOB_SCORE_THRESHOLD`, `SCORER_COMMAND`, and `WHATSAPP_NOTIFY_*`;
 `SCORER_COMMAND` must be the direct `jobtrail-ai-scorer` CLI/launcher (not `run-scorer.sh`),
-and notifications are disabled by default.
+and notifications are disabled by default. Optional `JOB_SEARCH_PROFILES` is a JSON array of
+public search profile objects using only `name`, `search_terms`, `sites`, `locations`,
+`results_wanted`, and `hours_old`; omit it to keep the legacy `JOB_SEARCH_*` fallback.
+Do not place secrets, private local paths, CV/profile content, credentials, or new source
+provider definitions in `JOB_SEARCH_PROFILES`.
 
 The launcher consults a seen cache before every `POST /api/discover/import` so
 offers already imported within the last `2 * JOB_SEARCH_HOURS_OLD` hours are
@@ -106,8 +110,9 @@ off) to append a bounded failure summary to the WhatsApp helper message when
 the run finishes with at least one failure.
 
 Warning: enabled runs write AI score notes and may send one summary through WhatsApp, but never apply to jobs.
-Every best-match summary exposes eleven allowlisted fields (title, company, location, score, recommendation,
-recommendation label, strengths, gaps, external job URL, JobTrail link, and run identifier) and never embeds
+Every best-match summary exposes eleven required allowlisted fields (title, company, location, score, recommendation,
+recommendation label, strengths, gaps, external job URL, JobTrail link, and run identifier) plus optional selected
+public `searchProfiles` names when profiles contributed the selected job; it never embeds
 descriptions, profiles, CVs, raw prompts, reasoning, notes, credentials, or secrets. The JobTrail link is
 built from `JOBTRAIL_BASE_URL` plus `/jobs/<id>` and can be optionally rewritten through `WHATSAPP_SHORT_URL_BASE`.
 See [Runtime automation](docs/runtime-automation.md) for the full field contract and the optional shortener.

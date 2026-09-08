@@ -94,6 +94,25 @@ _LISTING_BETA: dict = {
 # non-negative so the production ``RetryPolicy`` validator is satisfied.
 _FAST_RETRY = RetryPolicy(max_attempts=3, base_delay=0.0, max_delay=0.0)
 
+_REQUIRED_NOTIFICATION_FIELDS = {
+    "title",
+    "company",
+    "location",
+    "score",
+    "recommendation",
+    "recommendationLabel",
+    "strengths",
+    "gaps",
+    "jobUrl",
+    "jobTrailLink",
+    "runId",
+}
+
+
+def _assert_allowlisted_notification_payload(payload: dict) -> None:
+    assert set(payload) <= set(ALLOWED_FIELDS)
+    assert _REQUIRED_NOTIFICATION_FIELDS <= set(payload)
+
 
 def _fast_retry_sleep(_seconds: float) -> None:  # pragma: no cover - trivial
     """No-op sleep so retries are exercised without slowing the suite."""
@@ -232,7 +251,7 @@ def test_happy_path_drives_full_pipeline(server, state):
     # Exactly one best-match WhatsApp message with only allowlisted fields.
     assert len(whatsapp.messages) == 1
     payload = json.loads(whatsapp.messages[0])
-    assert set(payload) == set(ALLOWED_FIELDS)
+    _assert_allowlisted_notification_payload(payload)
     assert payload["score"] == 91
     assert payload["recommendation"] == "PRIORITY_APPLY"
     # The link is percent-encoded; decode it before comparing to the raw id.
@@ -415,7 +434,7 @@ def test_single_notification_invariant_above_threshold(server, state):
     payload = json.loads(whatsapp.messages[0])
     assert payload["score"] == 92
     assert payload["recommendation"] == "PRIORITY_APPLY"
-    assert set(payload) == set(ALLOWED_FIELDS)
+    _assert_allowlisted_notification_payload(payload)
     # The run id matches the documented ``YYYY-MM-DD-HHMM-<6 hex>`` shape.
     assert re.match(r"^\d{4}-\d{2}-\d{2}-\d{4}-[a-f0-9]{6}$", payload["runId"])
     # Exactly one of the two jobs is referenced by the rendered link.

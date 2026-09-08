@@ -603,6 +603,8 @@ class JobTrailAutomation:
             except Exception as exc:
                 failures.append(_format_failure("read", exc, job_id=job_id))
 
+        if best is not None and best_job_id in profiles_by_job_id:
+            best["searchProfiles"] = list(profiles_by_job_id[best_job_id])
         notification_body = self._compose_notification(
             best=best,
             best_job=best_job,
@@ -617,8 +619,6 @@ class JobTrailAutomation:
                 self.notifier(notification_body)
             except Exception:
                 failures.append("notify")
-        if best is not None and best_job_id in profiles_by_job_id:
-            best["searchProfiles"] = list(profiles_by_job_id[best_job_id])
         return AutomationRun(
             searched,
             imported,
@@ -656,10 +656,13 @@ class JobTrailAutomation:
 
         match_body: str | None = None
         if best is not None and notify_enabled:
+            score_for_notification = dict(best_score or {})
+            if best.get("searchProfiles"):
+                score_for_notification["searchProfiles"] = best["searchProfiles"]
             match_body = json.dumps(
                 build_notification_summary(
                     best_job or {},
-                    best_score or {},
+                    score_for_notification,
                     base_url=base_url,
                 ),
                 ensure_ascii=False,

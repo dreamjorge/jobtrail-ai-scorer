@@ -166,6 +166,7 @@ def main() -> int:
             "scored": result.scored,
             "selected": result.selected is not None,
             "failures": list(result.failures),
+            "profile_counts": result.profile_counts,
         }
     )
     return 1 if result.failures else 0

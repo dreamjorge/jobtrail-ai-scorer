@@ -641,6 +641,48 @@ def test_run_scores_real_mode_and_notifies_once_for_best_match():
     assert "candidate" not in notifier.messages[0].lower()
 
 
+def test_selected_notification_includes_public_search_profiles():
+    class SameJobProfileAdapter:
+        def search(self, request):
+            return [
+                NormalizedJob(
+                    source="indeed",
+                    source_job_id="source-1",
+                    title="Python Engineer",
+                    company="Acme",
+                    description="good",
+                    source_url="https://jobs.test/1",
+                    location="Remote",
+                )
+            ]
+
+    gateway = FakeJobTrail()
+    scorer = FakeScorer()
+    scorer.jobs = gateway.jobs
+    notifier = FakeNotifier()
+
+    result = JobSearchAutomation(
+        gateway,
+        scorer=scorer,
+        notifier=notifier,
+        source_adapters=(SameJobProfileAdapter(),),
+    ).run(
+        config=AutomationConfig(
+            search_profiles=(
+                automation.SearchProfile(name="python"),
+                automation.SearchProfile(name="backend"),
+            ),
+            base_url="http://jobtrail.example.com",
+            scorer_config_path="safe/config.yaml",
+            notify_enabled=True,
+        )
+    )
+
+    assert result.selected["searchProfiles"] == ["python", "backend"]
+    message = json.loads(notifier.messages[0])
+    assert message["searchProfiles"] == ["python", "backend"]
+
+
 def test_selected_notification_contains_job_and_score_data(monkeypatch):
     gateway = FakeJobTrail()
     scorer = FakeScorer()
