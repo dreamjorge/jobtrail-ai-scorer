@@ -47,7 +47,7 @@ def test_final_output_includes_profile_counts(monkeypatch, capsys, launcher) -> 
             pass
 
     class FakeAutomation:
-        def __init__(self, gateway, *, seen_cache=None):
+        def __init__(self, gateway, *, seen_cache=None, ats_boards=None):
             self.gateway = gateway
             self.seen_cache = seen_cache
 
