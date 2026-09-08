@@ -154,9 +154,9 @@ def main() -> int:
     gateway = JobTrailHTTPClient(config.base_url)
     seen_cache = _build_seen_cache(args)
     try:
-        result = JobSearchAutomation(gateway, seen_cache=seen_cache).run(
-            config=config
-        )
+        result = JobSearchAutomation(
+            gateway, seen_cache=seen_cache, ats_boards=config.ats_boards
+        ).run(config=config)
     finally:
         gateway.close()
     print(
