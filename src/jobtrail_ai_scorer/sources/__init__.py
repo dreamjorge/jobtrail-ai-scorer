@@ -98,15 +98,27 @@ def build_ats_adapters(
     default ``source_adapters`` tuple without importing each adapter module
     directly.
 
-    PR-A only wires the factory; concrete ``LeverSourceAdapter`` and
-    ``GreenhouseSourceAdapter`` instances are appended in PR-B and PR-C.
+    The ``LeverSourceAdapter`` and ``GreenhouseSourceAdapter`` are appended
+    in that order when their respective board lists are non-empty.
     """
 
     if ats_boards is None:
         return ()
     if not ats_boards.lever_boards and not ats_boards.greenhouse_boards:
         return ()
-    return ()
+    # Lazy import: keep ``build_ats_adapters`` cheap for callers that
+    # never need the concrete adapter (for example unit tests that only
+    # assert on the factory's empty-tuple contract).
+    adapters: list[SourceAdapter] = []
+    if ats_boards.lever_boards:
+        from .lever import LeverSourceAdapter
+
+        adapters.append(LeverSourceAdapter(boards=ats_boards.lever_boards))
+    if ats_boards.greenhouse_boards:
+        from .greenhouse import GreenhouseSourceAdapter
+
+        adapters.append(GreenhouseSourceAdapter(boards=ats_boards.greenhouse_boards))
+    return tuple(adapters)
 
 
 # Imported here so the types above (NormalizedJob, SourceSearchRequest) are
@@ -115,10 +127,14 @@ def build_ats_adapters(
 # from this package.
 from .adzuna import AdzunaSourceAdapter  # noqa: E402
 from .jobspy import JobSpySourceAdapter, normalize_jobspy_job  # noqa: E402
+from .lever import LeverSourceAdapter  # noqa: E402
+from .greenhouse import GreenhouseSourceAdapter  # noqa: E402
 
 __all__ = [
     "AdzunaSourceAdapter",
     "JobSpySourceAdapter",
+    "LeverSourceAdapter",
+    "GreenhouseSourceAdapter",
     "NormalizedJob",
     "SearchGateway",
     "SourceAdapter",

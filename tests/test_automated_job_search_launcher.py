@@ -38,6 +38,50 @@ class _StopAfterCapture(Exception):
     """Raised once the discovery call args are captured, to short-circuit main()."""
 
 
+def test_launcher_passes_configured_ats_boards_to_automation(
+    monkeypatch, launcher
+) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeGateway:
+        def __init__(self, base_url):
+            self.base_url = base_url
+
+        def close(self):
+            pass
+
+    class FakeAutomation:
+        def __init__(self, gateway, *, seen_cache=None, ats_boards=None):
+            captured["ats_boards"] = ats_boards
+
+        def run(self, *, config):
+            return SimpleNamespace(
+                searched=0,
+                imported=0,
+                scored=0,
+                selected=None,
+                failures=(),
+                profile_counts={},
+            )
+
+    monkeypatch.setattr(launcher, "JobTrailHTTPClient", FakeGateway)
+    monkeypatch.setattr(launcher, "JobSearchAutomation", FakeAutomation)
+    monkeypatch.setattr(launcher, "_build_seen_cache", lambda args: None)
+    monkeypatch.setenv(
+        "JOB_ATS_BOARDS", '{"lever_boards":["acme"],"results_wanted":15}'
+    )
+    monkeypatch.setenv("SCORER_CONFIG_PATH", "safe/config.yaml")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["automated-job-search.example.py", "--no-discover"],
+    )
+
+    assert launcher.main() == 0
+    assert captured["ats_boards"].lever_boards == ("acme",)
+    assert captured["ats_boards"].results_wanted == 15
+
+
 def test_final_output_includes_profile_counts(monkeypatch, capsys, launcher) -> None:
     class FakeGateway:
         def __init__(self, base_url):

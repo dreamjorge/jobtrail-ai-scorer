@@ -195,6 +195,224 @@ records a stable failure label without leaking the request URL. See
 retry helper contract and the `retry:`/`retryable`/`exhausted`/
 `terminal` classification vocabulary.
 
+## Optional Lever source
+
+`LeverSourceAdapter` is an optional ATS source the automation launcher
+includes whenever `JOB_ATS_BOARDS.lever_boards` is a non-empty list. The
+public Lever postings endpoint does not require authentication, so the
+adapter does not read any credential variables.
+
+### Enabling the source
+
+Set `JOB_ATS_BOARDS` to a JSON object with a `lever_boards` key holding
+the board slugs you want to query:
+
+```json
+{"lever_boards": ["acme", "globex"], "results_wanted": 25}
+```
+
+Validation lives in `parse_ats_boards` (see
+[Automated search and scoring](#automated-search-and-scoring)): the
+parser rejects non-string, blank, or duplicate entries and bounds
+`results_wanted` to the closed interval `[1, 200]` (default 25). When
+`lever_boards` is empty (or `JOB_ATS_BOARDS` is unset) the factory
+returns no Lever adapter and the launcher falls back to the remaining
+source adapters (for example `JobSpySourceAdapter`) without code
+changes.
+
+### Public endpoint, single bounded page
+
+`LeverSourceAdapter` issues exactly one bounded GET per configured
+board:
+
+```text
+GET https://api.lever.co/v0/postings/<board>?mode=json
+```
+
+The public Lever endpoint scopes results to a single board slug and
+does not accept free-text queries, so `request.search_term` and
+`request.location` are intentionally ignored. `request.profile_name`
+is propagated to every normalized job and `request.results_wanted`
+is the global cap across all boards: a configured `results_wanted=10`
+never returns more than 10 postings regardless of how many boards
+are configured. The adapter never paginates within a single call and
+does not follow detail-page links; multi-page support is intentionally
+out of scope.
+
+### Field translation
+
+| Lever field | `NormalizedJob` field | Notes |
+| --- | --- | --- |
+| `id` | `source_job_id` | Coerced to `str` when present. |
+| `text` | `title` | – |
+| `description` | `description` | HTML stripped via `ats_common._strip_html` (stdlib `html.parser`). |
+| `applyUrl` | `source_url` | – |
+| `categories.location` + `categories.commitment` | `location` | Joined with ` / ` when both present; one only or `None` otherwise. |
+| board slug (the URL segment) | `company` | – |
+| request `profile_name` | `search_profile` | – |
+| adapter clock (UTC ISO-8601 with `Z` suffix) | `retrieved_at` | Naive clocks are tagged as UTC; aware clocks are converted to UTC. |
+
+Optional fields (`location`, `description`, `title`, `source_url`) are
+omitted from the import payload when their source data is missing;
+`source_job_id` is required (a posting without an `id` is silently
+dropped from the batch).
+
+### Retry and error classification
+
+The adapter reuses the project's `RetryPolicy` and `retry_call`:
+
+- `4xx` responses raise `LeverHttpError` immediately (terminal, no
+  retry). The exception carries `status_code` and `board` so the
+  orchestrator can classify the failure as
+  `search:terminal:LeverHttpError`. The message names the status
+  code only; the request URL (which contains the board slug) is not
+  embedded in the failure label.
+- `5xx` responses and transient transport errors retry with bounded
+  attempts (default `max_attempts=3`, `base_delay=0.5s`, `max_delay=8s`).
+  Exhausted retries surface as `LeverTransientError` so the
+  orchestrator records a stable failure label without leaking the
+  request URL.
+- Malformed items inside the payload (non-mappings, postings without
+  an `id`) are silently skipped; only a full board failure raises.
+  An empty body, scalar payload, or non-list JSON is treated as a
+  partial success and converted to an empty list.
+
+### Orchestrator integration
+
+`build_ats_adapters(ats_boards)` constructs the
+`LeverSourceAdapter` whenever `ats_boards.lever_boards` is non-empty and
+`GreenhouseSourceAdapter` whenever `ats_boards.greenhouse_boards` is non-empty.
+The factory is the single entry point so
+`JobTrailAutomation` can build its default `source_adapters` tuple
+without importing each adapter module directly.
+
+When the Lever call raises, the orchestrator catches the exception at
+the `search:` stage and records it on `AutomationRun.failures` as
+`search:<classification>:<ExceptionType>` (for example
+`search:terminal:LeverHttpError` or
+`search:terminal:LeverTransientError`). The remaining source adapters
+(for example `JobSpySourceAdapter`) continue with their own search
+calls, so a failing Lever adapter never blocks the run. The
+classification wrapper never embeds credentials or the request URL.
+
+## Preflight checks and circuit breaker
+
+The daily automation gates itself with two opt-in features before
+investing in search/import/score work:
+
+- **Preflight checks** — a small set of bounded, side-effect-free probes
+  built by `jobtrail_ai_scorer.preflight.default_preflight_checks`. Each
+  probe runs through `concurrent.futures.Future` with an explicit
+  per-check timeout so a wedged upstream can never block the
+  orchestrator. Status mapping:
+
+  - `healthy` — the probe returned successfully within its timeout.
+  - `degraded` — the probe raised `httpx.HTTPStatusError` with a `4xx`
+    code (the upstream is reachable but unhappy).
+  - `unavailable` — the probe raised a `5xx` code, transport error
+    (`TimeoutException` / `ConnectError` / `OSError`),
+    `subprocess.TimeoutExpired` / `FileNotFoundError`, or exceeded the
+    per-check timeout.
+
+  `should_abort` is `True` iff any *required* check is `unavailable`.
+  The orchestrator records one `preflight:unavailable:<name>` failure
+  label per unavailable required check and returns an empty
+  `AutomationRun` without touching the search/import/score pipeline.
+
+- **Persistent circuit breaker** — a JSON-backed state machine in
+  `jobtrail_ai_scorer.circuit_breaker`. The breaker's state file
+  defaults to
+  `/DATA/AppData/jobtrail/logs/automated-job-search/breaker.json`
+  (overridable via `BREAKER_STATE_PATH`) and uses the same atomic-JSON
+  contract as the seen cache. A corrupt or missing state file degrades
+  to a fresh `CLOSED` breaker so storage failures never crash the
+  automation.
+
+### Preflight checks table
+
+| Name | Probe | Required | Timeout | Notes |
+| --- | --- | --- | --- | --- |
+| `jobtrail_api` | `GET <base_url>/api/health` (falls back to `HEAD` on 404) | yes | 2.0s | Healthy when the response is `2xx` (or the head probe succeeds). |
+| `jobspy_search` | minimal `JobSpySourceAdapter.search` request | yes | 5.0s | Uses `RetryPolicy(max_attempts=1)`. |
+| `hermes_provider` | `hermes --profile <profile> --help` (returncode `== 0` ⇒ healthy) | yes | 2.0s | Defaults to `hermes_executable=hermes`, `hermes_profile=default`. |
+| `whatsapp` | `os.access(<whatsapp_command>, os.X_OK)` | no (only added when `WHATSAPP_NOTIFY_ENABLED=1`) | 1.0s | Optional — a missing helper does not abort the run. |
+
+### Environment variables
+
+| Variable | Required | Default | Notes |
+| --- | --- | --- | --- |
+| `BREAKER_FAILURE_THRESHOLD` | no | `3` | Consecutive failed runs that open the breaker. Must parse as an integer; non-integer values raise `ValueError` from `AutomationConfig.from_env`. |
+| `BREAKER_COOLDOWN_SECONDS` | no | `3600.0` | Cooldown window during which an open breaker blocks the pipeline. Must parse as a float. |
+| `BREAKER_ALERT_COOLDOWN_SECONDS` | no | `3600.0` | Minimum seconds between consecutive breaker-open WhatsApp alerts. Must parse as a float. |
+| `BREAKER_STATE_PATH` | no | `""` (no breaker) | Absolute path to the JSON state file. Empty disables the breaker entirely so existing callers see no behavior change. When set, the file is created on first persistence with `0600` permissions. |
+
+### Breaker state machine
+
+```text
+CLOSED ── consecutive_failures >= threshold ──▶ OPEN (opened_at = now)
+                                                  │
+                                          cooldown_seconds elapsed
+                                                  │
+                                                  ▼
+                                             HALF_OPEN (attempts allowed)
+                                             │       │
+                                        success   failure
+                                             │       │
+                                             ▼       ▼
+                                          CLOSED   OPEN
+                                        (counter  (opened_at = now;
+                                         reset;   no auto-alert until
+                                         alert    alert_cooldown
+                                         timer    elapses)
+                                         reset)
+```
+
+- `should_attempt()` is `True` in `CLOSED`, and in `HALF_OPEN`
+  (cooldown elapsed since `opened_at`); `False` otherwise.
+- `record_failure()` increments the counter, opens the breaker at
+  the threshold, and updates `opened_at` to "now" each time the
+  breaker is (re)opened. It never fires an alert on its own.
+- `record_success()` resets the breaker to `CLOSED`
+  (`consecutive_failures=0`, `opened_at=None`) **and** resets the
+  alert timer so the recovery alert can fire once.
+- `try_alert()` returns `True` iff no alert has been emitted within
+  `alert_cooldown_seconds`; on `True` it stamps `last_alert_at`.
+
+### Operator-facing behavior
+
+- **Healthy preflight + closed breaker:** the existing pipeline runs
+  unchanged. A clean run closes the breaker (counter reset, alert
+  timer reset) so the next `try_alert()` returns `True`.
+- **Preflight unavailable:** empty `AutomationRun`, one
+  `preflight:unavailable:<name>` failure label per unavailable
+  required check, no WhatsApp message (the legacy failure summary
+  is also suppressed because no best-match was selected).
+- **Breaker open:** empty `AutomationRun`, single `breaker:open`
+  failure label. If `breaker.try_alert()` returns `True` *and*
+  `WHATSAPP_NOTIFY_ENABLED=1` (or `WHATSAPP_NOTIFY_ON_FAILURE=1`),
+  one bounded `{"kind": "breaker_open", "message": "..."}` alert is
+  sent through the configured WhatsApp helper. The breaker-opened run
+  MUST NOT increment the failure counter (so the alert does not
+  extend the cooldown) and MUST NOT re-alert within
+  `BREAKER_ALERT_COOLDOWN_SECONDS`.
+- **Recovery:** a successful run during `HALF_OPEN` closes the
+  breaker. `record_success()` clears `last_alert_at` so the recovery
+  alert can fire on the next `try_alert()`.
+
+### Opt-in / opt-out
+
+- Set `BREAKER_STATE_PATH=/some/path.json` to wire the breaker to
+  that path. The file is created on first persistence with `0600`
+  permissions.
+- Leave `BREAKER_STATE_PATH` empty (the default) to keep the
+  legacy pipeline unchanged. Existing systemd units that never set
+  the variable see no behavior change.
+- The orchestrator also accepts an explicit
+  `circuit_breaker=...` injection on `JobTrailAutomation(...)` for
+  tests and special deployments. The injection wins over the
+  config-derived default; both ultimately drive the same
+  `should_attempt()` / `record_*` / `try_alert()` contract.
+
 ## Pre-import deduplication (seen cache)
 
 The automation launcher skips offers whose `(source, sourceJobId)` pair was
@@ -645,3 +863,20 @@ python3 scripts/runtime_clean.py \\
   --target /absolute/runtime-root/scorer-python.backup-automation-20260906T172527Z
 # review the listed plan, then add --yes
 ```
+
+## Optional Greenhouse source
+
+`GreenhouseSourceAdapter` is enabled when `JOB_ATS_BOARDS.greenhouse_boards`
+is non-empty. It issues one request per board to:
+
+```text
+GET https://boards-api.greenhouse.io/v1/boards/<board>/jobs?content=true
+```
+
+Board scope wins over search terms and locations. Automation issues one ATS
+request per configured search profile (not once per location), and results are
+capped globally by the ATS `results_wanted`, malformed rows are skipped, and normalized jobs retain the
+board slug, profile name, HTML-stripped content, remote heuristic, and UTC
+retrieval timestamp. `4xx` responses are terminal; `5xx` and transport errors
+use bounded retries. A failed Greenhouse search is recorded without blocking
+JobSpy or Lever adapters.

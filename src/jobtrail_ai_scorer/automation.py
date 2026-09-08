@@ -229,6 +229,17 @@ class AutomationConfig:
     whatsapp_command: str = ""
     discover_container: str | None = None
     ats_boards: AtsBoardConfig | None = None
+    # Circuit breaker configuration. ``breaker_state_path`` is the sentinel
+    # for "breaker not configured" — an empty string means the
+    # orchestrator will not build a :class:`CircuitBreaker` at all. Setting
+    # ``BREAKER_STATE_PATH`` in the environment (or passing a non-empty
+    # value here) wires the breaker to that path. The other breaker_*
+    # fields tune the threshold and cooldowns; the underlying defaults
+    # are defined in :mod:`jobtrail_ai_scorer.circuit_breaker`.
+    breaker_failure_threshold: int = 3
+    breaker_cooldown_seconds: float = 3600.0
+    breaker_alert_cooldown_seconds: float = 3600.0
+    breaker_state_path: str = ""
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "AutomationConfig":
@@ -241,6 +252,24 @@ class AutomationConfig:
 
         def truthy(key: str, default: str = "0") -> bool:
             return e.get(key, default).strip().lower() in {"1", "true", "yes", "on"}
+
+        def _coerce_int(key: str, default: int) -> int:
+            raw = e.get(key)
+            if raw is None or raw == "":
+                return default
+            try:
+                return int(raw)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"{key} must be an integer") from exc
+
+        def _coerce_float(key: str, default: float) -> float:
+            raw = e.get(key)
+            if raw is None or raw == "":
+                return default
+            try:
+                return float(raw)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"{key} must be a float") from exc
 
         discover_container = e.get("JOBTRAIL_DISCOVER_CONTAINER", "").strip() or None
         search_profiles = (
@@ -270,6 +299,16 @@ class AutomationConfig:
             whatsapp_command=e.get("WHATSAPP_NOTIFY_COMMAND", ""),
             discover_container=discover_container,
             ats_boards=ats_boards,
+            breaker_failure_threshold=_coerce_int(
+                "BREAKER_FAILURE_THRESHOLD", cls.breaker_failure_threshold
+            ),
+            breaker_cooldown_seconds=_coerce_float(
+                "BREAKER_COOLDOWN_SECONDS", cls.breaker_cooldown_seconds
+            ),
+            breaker_alert_cooldown_seconds=_coerce_float(
+                "BREAKER_ALERT_COOLDOWN_SECONDS", cls.breaker_alert_cooldown_seconds
+            ),
+            breaker_state_path=e.get("BREAKER_STATE_PATH", "").strip(),
         )
 
 
@@ -347,6 +386,37 @@ def source_search_requests(config: AutomationConfig) -> list[SourceSearchRequest
                     profile_name=profile.name,
                 )
             )
+    return requests
+
+
+def ats_source_search_requests(config: AutomationConfig) -> list[SourceSearchRequest]:
+    """Build one request per configured profile for board-backed ATS sources."""
+
+    results_wanted = (
+        config.ats_boards.results_wanted
+        if config.ats_boards is not None
+        else config.results_wanted
+    )
+    profiles = config.search_profiles or (SearchProfile(name="default"),)
+    requests: list[SourceSearchRequest] = []
+    for profile in profiles:
+        locations = profile.locations or config.locations
+        location = locations[0] if locations else ""
+        requests.append(
+            SourceSearchRequest(
+                sites=profile.sites or config.sites,
+                search_term=profile.search_terms or config.search_terms,
+                location=location,
+                results_wanted=results_wanted,
+                hours_old=(
+                    profile.hours_old
+                    if profile.hours_old is not None
+                    else config.hours_old
+                ),
+                is_remote=location.strip().lower() == "remote",
+                profile_name=profile.name,
+            )
+        )
     return requests
 
 
@@ -523,6 +593,8 @@ class JobTrailAutomation:
         retry_sleep: Callable[[float], None] | None = None,
         source_adapters: tuple[SourceAdapter, ...] | None = None,
         ats_boards: AtsBoardConfig | None = None,
+        preflight_runner: Callable[["AutomationConfig"], Any] | None = None,
+        circuit_breaker: Any | None = None,
     ) -> None:
         self.gateway, self.scorer, self.notifier = (
             gateway,
@@ -547,12 +619,24 @@ class JobTrailAutomation:
             max_delay=8.0,
         )
         self._scorer_retry_sleep = retry_sleep
+        # ``preflight_runner`` and ``circuit_breaker`` are opt-in test
+        # overrides. The default ``None`` keeps the legacy pipeline
+        # unchanged: no preflight is run, and no breaker gates the run.
+        # When ``preflight_runner`` is provided, ``run()`` calls it with
+        # the resolved :class:`AutomationConfig` and treats a
+        # ``should_abort`` report as a hard abort. When ``circuit_breaker``
+        # is provided, ``run()`` consults it before the pipeline and
+        # records success/failure afterwards; if no override is supplied
+        # and the active config has a non-empty ``breaker_state_path``, a
+        # default breaker is built from that config (see
+        # :meth:`_resolve_breaker`).
+        self._preflight_runner = preflight_runner
+        self._circuit_breaker = circuit_breaker
         # Default ``source_adapters`` preserves the historical
         # ``(JobSpySourceAdapter(gateway),)`` tuple when no ATS boards are
         # configured. When ``ats_boards`` is supplied, the factory appends
-        # any concrete Lever/Greenhouse adapters (PR-B/PR-C); PR-A only
-        # wires the factory so it currently returns an empty tuple and the
-        # default stays identical for callers that do not opt in.
+        # the configured Lever/Greenhouse adapters while explicit
+        # ``source_adapters`` injection remains untouched.
         if source_adapters is None:
             if ats_boards is None:
                 source_adapters = (JobSpySourceAdapter(gateway),)
@@ -601,12 +685,42 @@ class JobTrailAutomation:
     def run(self, *, config: AutomationConfig) -> AutomationRun:
         if not config.scorer_config_path:
             raise ValueError("SCORER_CONFIG_PATH is required")
-        failures: list[str] = []
-        ids: list[str] = []
-        scored_ids: list[str] = []
         self._scorer_command = config.scorer_command
         self._whatsapp_command = config.whatsapp_command
         self.base_url = config.base_url
+
+        # Step 0: resolve the circuit breaker.
+        #
+        # The injection override (constructor) wins; otherwise the breaker
+        # is built from ``config.breaker_*`` when the config opts in via
+        # a non-empty ``breaker_state_path``. An empty path means "no
+        # breaker configured" so the legacy pipeline is preserved.
+        breaker = self._resolve_breaker(config)
+        if breaker is not None and not breaker.should_attempt():
+            # Step 0a: breaker is OPEN. Record a single bounded failure,
+            # attempt one alert (gated by the breaker's own cooldown and
+            # the operator's notify flags), and return an empty run. The
+            # breaker-opened run MUST NOT increment the failure counter
+            # so the alert does not extend the cooldown.
+            return self._handle_breaker_open(
+                breaker=breaker,
+                config=config,
+            )
+
+        # Step 0b: preflight is opt-in. When ``preflight_runner`` is
+        # provided, a non-empty ``should_abort`` aborts the run before
+        # any search/import/score work.
+        if self._preflight_runner is not None:
+            report = self._preflight_runner(config)
+            if getattr(report, "should_abort", False):
+                preflight_failures = self._preflight_failure_labels(report)
+                return self._empty_run(
+                    tuple(preflight_failures), breaker=breaker
+                )
+
+        failures: list[str] = []
+        ids: list[str] = []
+        scored_ids: list[str] = []
         searched = imported = scored = 0
         count_profiles = bool(config.search_profiles)
         profile_counts: dict[str, dict[str, int]] = (
@@ -625,7 +739,12 @@ class JobTrailAutomation:
         imported_by_identity: dict[tuple[str, str], str] = {}
         profiles_by_job_id: dict[str, list[str]] = {}
         for adapter in self.source_adapters:
-            for request in source_search_requests(config):
+            requests = (
+                ats_source_search_requests(config)
+                if getattr(adapter, "name", None) in {"lever", "greenhouse"}
+                else source_search_requests(config)
+            )
+            for request in requests:
                 profile_name = request.profile_name
                 try:
                     jobs = adapter.search(request)
@@ -745,7 +864,7 @@ class JobTrailAutomation:
                 self.notifier(notification_body)
             except Exception:
                 failures.append("notify")
-        return AutomationRun(
+        run = AutomationRun(
             searched,
             imported,
             scored,
@@ -753,6 +872,132 @@ class JobTrailAutomation:
             best,
             profile_counts,
         )
+        # Step N: record the run outcome on the breaker so it can open
+        # after consecutive failures or close after a clean run.
+        if breaker is not None:
+            if run.failures:
+                breaker.record_failure()
+            else:
+                breaker.record_success()
+        return run
+
+    # --- Breaker / preflight helpers --------------------------------------
+
+    def _resolve_breaker(self, config: "AutomationConfig") -> Any | None:
+        """Return the breaker to use for this run, or ``None`` to skip.
+
+        The constructor override wins. When no override is supplied, a
+        default :class:`CircuitBreaker` is built from
+        ``config.breaker_*`` only when ``config.breaker_state_path`` is
+        non-empty (the sentinel for "not configured"). An empty path
+        preserves the legacy pipeline so existing callers that construct
+        ``AutomationConfig`` without opting in see no behavior change.
+        """
+
+        if self._circuit_breaker is not None:
+            return self._circuit_breaker
+        if not config.breaker_state_path:
+            return None
+        # Lazy import so callers that never opt in don't pay the cost
+        # of the circuit_breaker module's atomic-JSON helper.
+        from .circuit_breaker import BreakerConfig, CircuitBreaker
+
+        breaker_config = BreakerConfig(
+            failure_threshold=config.breaker_failure_threshold,
+            cooldown_seconds=config.breaker_cooldown_seconds,
+            alert_cooldown_seconds=config.breaker_alert_cooldown_seconds,
+            state_path=config.breaker_state_path,
+        )
+        return CircuitBreaker(breaker_config)
+
+    def _handle_breaker_open(
+        self,
+        *,
+        breaker: Any,
+        config: "AutomationConfig",
+    ) -> "AutomationRun":
+        """Return an empty run for an OPEN breaker, emitting one alert.
+
+        The breaker-opened run is deliberately short: the legacy
+        pipeline never runs, the failure counter is not incremented
+        (so the alert does not extend the cooldown), and the notifier
+        is called at most once per alert cooldown when notifications
+        are enabled via ``notify_enabled`` or ``notify_on_failure``.
+        """
+
+        failures: list[str] = ["breaker:open"]
+        if (
+            breaker.try_alert()
+            and (config.notify_enabled or config.notify_on_failure)
+        ):
+            self._send_breaker_alert(failures=failures)
+        return AutomationRun(
+            0,
+            0,
+            0,
+            tuple(failures),
+            None,
+            {},
+        )
+
+    def _send_breaker_alert(
+        self,
+        *,
+        failures: list[str],
+    ) -> None:
+        """Best-effort delivery of the breaker-open alert.
+
+        Failures here must not crash the run; they are appended to the
+        ``failures`` list as ``notify`` so the operator can see the
+        notifier crashed without losing the breaker-opened state.
+        """
+
+        body = json.dumps(
+            {
+                "kind": "breaker_open",
+                "message": "Circuit breaker is open; automation paused.",
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        try:
+            self.notifier(body)
+        except Exception:
+            failures.append("notify")
+
+    @staticmethod
+    def _preflight_failure_labels(report: Any) -> list[str]:
+        """Return one ``preflight:unavailable:<name>`` label per failing check."""
+
+        labels: list[str] = []
+        required_map = getattr(report, "_required", {}) or {}
+        for result in report:
+            if result.status == "unavailable" and required_map.get(
+                result.name, True
+            ):
+                labels.append(f"preflight:unavailable:{result.name}")
+        return labels
+
+    @staticmethod
+    def _empty_run(
+        failures: tuple[str, ...],
+        *,
+        breaker: Any | None,
+    ) -> "AutomationRun":
+        """Return an empty :class:`AutomationRun` for the short-circuit paths.
+
+        The breaker is recorded as a failure when one or more failures
+        are present so a hard preflight-abort can still trip the
+        breaker after enough consecutive hard-abort runs. No record is
+        made for the breaker-opened path (the run was already inside
+        an OPEN state, so recording there is a no-op in the standard
+        state machine and would extend the cooldown).
+        """
+
+        run = AutomationRun(0, 0, 0, failures, None, {})
+        if breaker is not None and failures:
+            breaker.record_failure()
+        return run
 
     @staticmethod
     def _compose_notification(

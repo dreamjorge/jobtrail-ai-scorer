@@ -15,6 +15,13 @@ atomic (``tmp + rename``) and the file is always tightened to ``0600``.
 A cache that fails to read, contains invalid JSON, or is missing its parent
 directory must never crash the calling automation. ``SeenCache`` treats every
 failure as "start empty and try again next write".
+
+The atomic-JSON read/write helpers in :mod:`._atomic_json` back this module
+so :class:`.circuit_breaker.CircuitBreaker` can share the same on-disk
+contract. ``SeenCache`` passes ``lock_path=None`` because its own
+:meth:`transaction` context manager already acquires the cross-process lock
+at a higher level -- wrapping every read/write in another ``fcntl.flock``
+would deadlock on the same fd.
 """
 
 from __future__ import annotations
@@ -26,6 +33,8 @@ import os
 from pathlib import Path
 import time
 from typing import Callable, Iterable, Iterator, Mapping
+
+from ._atomic_json import read_json, write_json_atomic
 
 
 # Default path lives outside the repository under the runtime logs directory.
@@ -156,38 +165,22 @@ class SeenCache:
         self.save()
 
     def save(self) -> None:
-        """Atomically write the cache to disk (tmp + rename)."""
+        """Atomically write the cache to disk via the shared helper."""
 
         payload = {
             "version": SEEN_CACHE_SCHEMA_VERSION,
             "entries": self._entries,
         }
-        path = self._path
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = self._tmp_path(path)
-        # Open with O_CREAT|O_TRUNC|O_WRONLY and the desired mode so the tmp
-        # file is also 0600, regardless of the process umask.
-        fd = os.open(
-            str(tmp_path),
-            os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
-            self._file_mode,
+        # ``lock_path=None`` because :meth:`transaction` holds the
+        # cross-process lock at a higher level for the check/import/mark
+        # sequence; wrapping every read/write in another ``fcntl.flock``
+        # would deadlock when the holder re-enters on the same fd.
+        write_json_atomic(
+            self._path,
+            payload,
+            lock_path=None,
+            mode=self._file_mode,
         )
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                json.dump(payload, handle, indent=2, sort_keys=True)
-                handle.write("\n")
-        except BaseException:
-            # If writing the tmp file failed, remove it so we never leak partial bytes.
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-            raise
-        # ``os.replace`` is atomic on POSIX and overwrites the destination.
-        os.replace(tmp_path, path)
-        # Defense in depth: the umask can still widen the perms if the file
-        # already existed before we wrote it.
-        self._enforce_mode(path)
 
     @property
     def size(self) -> int:
@@ -207,40 +200,13 @@ class SeenCache:
             return float(self._clock())
         return float(now)
 
-    def _tmp_path(self, path: Path) -> Path:
-        suffix = path.suffix or ".json"
-        # Unique per writer (pid + object id) so concurrent/overlapping runs
-        # never share the same tmp file and interleave writes.
-        return path.with_name(f"{path.stem}.tmp.{os.getpid()}.{id(self)}{suffix}")
-
-    def _enforce_mode(self, path: Path) -> None:
-        try:
-            current_mode = path.stat().st_mode & 0o777
-        except OSError:
-            return
-        if current_mode != self._file_mode:
-            try:
-                os.chmod(path, self._file_mode)
-            except OSError:
-                # Best-effort: a failed chmod must not crash the run.
-                pass
-
     def _load(self) -> None:
-        path = self._path
-        try:
-            if not path.exists():
-                self._entries = {}
-                return
-            # Tighten permissions on every load so we never serve a world-readable
-            # cache even if something previously left it loose.
-            self._enforce_mode(path)
-            with path.open("r", encoding="utf-8") as handle:
-                data = json.load(handle)
-        except (OSError, json.JSONDecodeError):
-            # Corruption: degrade to empty cache, never raise.
+        """Read the cache from disk; corrupt/missing files become empty."""
+
+        data = read_json(self._path, default=None, lock_path=None)
+        if data is None:
             self._entries = {}
             return
-
         self._entries = _validate_entries(data)
 
 
