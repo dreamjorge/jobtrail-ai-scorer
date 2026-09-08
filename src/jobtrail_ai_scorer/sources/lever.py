@@ -232,7 +232,7 @@ class LeverSourceAdapter:
             self._client = client
         self._retry_policy = retry_policy or RetryPolicy()
         self._retry_sleep = retry_sleep
-        self._clock: Callable[[], datetime] = clock or datetime.now
+        self._clock: Callable[[], datetime] = clock or (lambda: datetime.now(timezone.utc))
 
     def close(self) -> None:
         """Release the underlying ``httpx.Client`` when this adapter owns it."""

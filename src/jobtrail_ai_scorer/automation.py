@@ -350,6 +350,37 @@ def source_search_requests(config: AutomationConfig) -> list[SourceSearchRequest
     return requests
 
 
+def ats_source_search_requests(config: AutomationConfig) -> list[SourceSearchRequest]:
+    """Build one request per configured profile for board-backed ATS sources."""
+
+    results_wanted = (
+        config.ats_boards.results_wanted
+        if config.ats_boards is not None
+        else config.results_wanted
+    )
+    profiles = config.search_profiles or (SearchProfile(name="default"),)
+    requests: list[SourceSearchRequest] = []
+    for profile in profiles:
+        locations = profile.locations or config.locations
+        location = locations[0] if locations else ""
+        requests.append(
+            SourceSearchRequest(
+                sites=profile.sites or config.sites,
+                search_term=profile.search_terms or config.search_terms,
+                location=location,
+                results_wanted=results_wanted,
+                hours_old=(
+                    profile.hours_old
+                    if profile.hours_old is not None
+                    else config.hours_old
+                ),
+                is_remote=location.strip().lower() == "remote",
+                profile_name=profile.name,
+            )
+        )
+    return requests
+
+
 def search_payloads(config: AutomationConfig) -> list[dict[str, Any]]:
     return [request.to_jobspy_payload() for request in source_search_requests(config)]
 
@@ -550,9 +581,8 @@ class JobTrailAutomation:
         # Default ``source_adapters`` preserves the historical
         # ``(JobSpySourceAdapter(gateway),)`` tuple when no ATS boards are
         # configured. When ``ats_boards`` is supplied, the factory appends
-        # any concrete Lever/Greenhouse adapters (PR-B/PR-C); PR-A only
-        # wires the factory so it currently returns an empty tuple and the
-        # default stays identical for callers that do not opt in.
+        # the configured Lever/Greenhouse adapters while explicit
+        # ``source_adapters`` injection remains untouched.
         if source_adapters is None:
             if ats_boards is None:
                 source_adapters = (JobSpySourceAdapter(gateway),)
@@ -625,7 +655,12 @@ class JobTrailAutomation:
         imported_by_identity: dict[tuple[str, str], str] = {}
         profiles_by_job_id: dict[str, list[str]] = {}
         for adapter in self.source_adapters:
-            for request in source_search_requests(config):
+            requests = (
+                ats_source_search_requests(config)
+                if getattr(adapter, "name", None) in {"lever", "greenhouse"}
+                else source_search_requests(config)
+            )
+            for request in requests:
                 profile_name = request.profile_name
                 try:
                     jobs = adapter.search(request)
