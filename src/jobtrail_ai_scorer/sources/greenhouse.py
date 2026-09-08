@@ -107,7 +107,7 @@ class GreenhouseSourceAdapter:
         self._client = client or httpx.Client(timeout=DEFAULT_TIMEOUT)
         self._retry_policy = retry_policy or RetryPolicy()
         self._retry_sleep = retry_sleep
-        self._clock = clock or datetime.now
+        self._clock = clock or (lambda: datetime.now(timezone.utc))
 
     def close(self) -> None:
         if self._owns_client:
