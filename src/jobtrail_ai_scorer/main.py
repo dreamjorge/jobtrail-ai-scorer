@@ -62,7 +62,10 @@ def run_score(*, config_path: Path, limit: int | None = None, job_id: str | None
               dry_run: bool = False, force: bool = False, marker: str | None = None,
               provider_name: str | None = None, base_url: str | None = None,
               client_factory: ClientFactory | None = None,
-              provider_factory: ProviderFactory | None = None) -> ScoreRunResult:
+              provider_factory: ProviderFactory | None = None,
+              output_json: bool = False) -> ScoreRunResult:
+    if output_json and not dry_run:
+        raise ValueError("output_json requires dry_run")
     config = load_config(config_path)
     overrides = {}
     if provider_name is not None:
@@ -95,17 +98,21 @@ def run_score(*, config_path: Path, limit: int | None = None, job_id: str | None
     try:
         result = score_jobs(client, provider, profile, job_id=job_id, limit=limit,
                             force=force, dry_run=dry_run, marker=marker or config.marker,
-                            emit_status=False)
+                            emit_status=False, output_json=output_json)
         # Must run before the client closes below: with --job-id this samples
         # the live job via client.get_job, and a closed client makes that
         # call fail silently, falling back to a tiny stub payload that
         # undercounts the estimate and can hide a genuinely oversized prompt.
-        _emit_prompt_tokens_estimate(client, profile_only=profile_only, cv=cv,
-                                      job_id=job_id)
+        if not output_json:
+            _emit_prompt_tokens_estimate(client, profile_only=profile_only, cv=cv,
+                                          job_id=job_id)
     finally:
         close = getattr(client, "close", None)
         if close:
             close()
+    if output_json:
+        typer.echo(result.json_text)
+        return result
     for outcome in result.outcomes:
         if outcome.status == "skipped":
             typer.echo(f"SKIP {outcome.job_id}: {outcome.reason}")
@@ -252,6 +259,7 @@ def _read_seen_entries(path: Path) -> list[dict]:
 @app.command()
 def score(limit: int | None = typer.Option(None), job_id: str | None = typer.Option(None),
           dry_run: bool = typer.Option(False, "--dry-run"), force: bool = typer.Option(False),
+          json_output: bool = typer.Option(False, "--json"),
           marker: str | None = typer.Option(None), provider: str | None = typer.Option(None),
           base_url: str | None = typer.Option(
               None, "--base-url",
@@ -262,7 +270,7 @@ def score(limit: int | None = typer.Option(None), job_id: str | None = typer.Opt
     """Score eligible jobs and save validated score notes."""
     result = run_score(config_path=config, limit=limit, job_id=job_id, dry_run=dry_run,
                        force=force, marker=marker, provider_name=provider,
-                       base_url=base_url)
+                       base_url=base_url, output_json=json_output)
     if result.failed:
         raise typer.Exit(code=1)
 
