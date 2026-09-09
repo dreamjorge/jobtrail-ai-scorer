@@ -26,7 +26,7 @@ switched to the canonical file.
 Run `jobtrail-ai-scorer score --config config.yaml [OPTIONS]`. Options include `--limit N`,
 `--job-id ID`, `--dry-run`, `--force`, `--marker TEXT`, and `--provider hermes|openai_compatible`.
 The default marker enables deduplication: jobs with a marked score are skipped; `--force` re-scores them.
-`--dry-run` validates and reports scores without writing notes. Exit status is nonzero if any job fails.
+`score --dry-run` is scorer-only: it validates and reports scores without writing notes. It does not run the full search/import/notification automation.
 
 For Hermes, configure `hermes_executable`, `hermes_profile`, and optional
 `provider_timeout_seconds` in your local YAML (the executable must already be installed).
@@ -96,6 +96,13 @@ public search profile objects using only `name`, `search_terms`, `sites`, `locat
 `results_wanted`, and `hours_old`; omit it to keep the legacy `JOB_SEARCH_*` fallback.
 Do not place secrets, private local paths, CV/profile content, credentials, or new source
 provider definitions in `JOB_SEARCH_PROFILES`.
+
+For the full pipeline, pass `--dry-run` to this launcher (or set
+`JOBTRAIL_AUTOMATION_DRY_RUN=1`). This searches and scores, then reports
+`planned_operations` and a deterministic, redacted `notification_preview`, but does not
+import jobs, save score notes, send WhatsApp, mutate the seen cache, update the circuit
+breaker, or write the run journal. The CLI flag wins over the environment setting.
+This full-automation dry-run is distinct from `jobtrail-ai-scorer score --dry-run` above.
 
 The launcher consults a seen cache before every `POST /api/discover/import` so
 offers already imported within the last `2 * JOB_SEARCH_HOURS_OLD` hours are

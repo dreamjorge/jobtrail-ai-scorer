@@ -180,6 +180,98 @@ def test_container_flag_overrides_env_var(monkeypatch, launcher) -> None:
     assert captured["container_name"] == "cli-container"
 
 
+def test_dry_run_flag_overrides_env_and_skips_seen_cache(
+    monkeypatch, launcher
+) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeGateway:
+        def __init__(self, base_url):
+            self.base_url = base_url
+
+        def close(self):
+            pass
+
+    class FakeAutomation:
+        def __init__(self, gateway, *, seen_cache=None, ats_boards=None):
+            captured["seen_cache"] = seen_cache
+
+        def run(self, *, config):
+            captured["dry_run"] = config.dry_run
+            return SimpleNamespace(
+                searched=0,
+                imported=0,
+                scored=0,
+                selected=None,
+                failures=(),
+                profile_counts={},
+                dry_run=True,
+                planned_operations={},
+                notification_preview=None,
+            )
+
+    monkeypatch.setattr(launcher, "JobTrailHTTPClient", FakeGateway)
+    monkeypatch.setattr(launcher, "JobSearchAutomation", FakeAutomation)
+    def unexpected_cache_build(_args):
+        raise AssertionError("dry-run must not construct SeenCache")
+    monkeypatch.setattr(launcher, "_build_seen_cache", unexpected_cache_build)
+    monkeypatch.setenv("JOBTRAIL_AUTOMATION_DRY_RUN", "0")
+    monkeypatch.setenv("SCORER_CONFIG_PATH", "safe/config.yaml")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["automated-job-search.example.py", "--no-discover", "--dry-run"],
+    )
+
+    assert launcher.main() == 0
+    assert captured == {"seen_cache": None, "dry_run": True}
+
+
+def test_dry_run_env_propagates_without_flag(monkeypatch, launcher) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeGateway:
+        def __init__(self, base_url):
+            self.base_url = base_url
+
+        def close(self):
+            pass
+
+    class FakeAutomation:
+        def __init__(self, gateway, *, seen_cache=None, ats_boards=None):
+            captured["seen_cache"] = seen_cache
+
+        def run(self, *, config):
+            captured["dry_run"] = config.dry_run
+            return SimpleNamespace(
+                searched=0,
+                imported=0,
+                scored=0,
+                selected=None,
+                failures=(),
+                profile_counts={},
+                dry_run=True,
+                planned_operations={},
+                notification_preview=None,
+            )
+
+    monkeypatch.setattr(launcher, "JobTrailHTTPClient", FakeGateway)
+    monkeypatch.setattr(launcher, "JobSearchAutomation", FakeAutomation)
+    monkeypatch.setattr(
+        launcher,
+        "_build_seen_cache",
+        lambda _args: (_ for _ in ()).throw(AssertionError("cache constructed")),
+    )
+    monkeypatch.setenv("JOBTRAIL_AUTOMATION_DRY_RUN", "1")
+    monkeypatch.setenv("SCORER_CONFIG_PATH", "safe/config.yaml")
+    monkeypatch.setattr(
+        sys, "argv", ["automated-job-search.example.py", "--no-discover"]
+    )
+
+    assert launcher.main() == 0
+    assert captured == {"seen_cache": None, "dry_run": True}
+
+
 def test_container_defaults_when_neither_flag_nor_env_set(
     monkeypatch, launcher
 ) -> None:

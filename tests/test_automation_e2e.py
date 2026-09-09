@@ -269,6 +269,64 @@ def test_happy_path_drives_full_pipeline(server, state):
         assert forbidden not in rendered
 
 
+def test_dry_run_searches_without_writes_and_previews_redacted_notification(
+    tmp_path, server, state
+):
+    """Dry-run plans the pipeline while leaving every persistent side effect untouched."""
+
+    class DryRunScorer(StubScorer):
+        def __call__(self, job_id, config_path, payload=None):
+            self.calls.append((job_id, config_path))
+            return {
+                "score": 91,
+                "recommendation": "PRIORITY_APPLY",
+                "strengths": ["PROFILE_SENTINEL", "Python"],
+                "gaps": ["CREDENTIAL_SENTINEL"],
+            }
+
+    cache_path = tmp_path / "seen.json"
+    breaker_path = tmp_path / "breaker.json"
+    journal_path = tmp_path / "runs.jsonl"
+    cache = SeenCache(cache_path)
+    scorer = DryRunScorer(state)
+    whatsapp = StubWhatsApp()
+
+    result = _run(
+        server,
+        scorer=scorer,
+        notifier=whatsapp,
+        seen_cache=cache,
+        config_overrides={
+            "dry_run": True,
+            "breaker_state_path": str(breaker_path),
+            "run_journal_path": str(journal_path),
+        },
+    )
+
+    assert result.dry_run is True
+    assert result.searched == 2
+    assert result.imported == 0
+    assert result.scored == 2
+    assert result.planned_operations == {
+        "searched": 2,
+        "imported": 2,
+        "scored": 2,
+        "notified": 1,
+    }
+    assert result.notification_preview is not None
+    preview = json.dumps(result.notification_preview, sort_keys=True)
+    assert "PROFILE_SENTINEL" not in preview
+    assert "CREDENTIAL_SENTINEL" not in preview
+    assert "[REDACTED]" in preview
+    assert state.imported == []
+    assert state.jobs == {}
+    assert scorer.calls and len(scorer.calls) == 2
+    assert whatsapp.messages == []
+    assert not cache_path.exists()
+    assert not breaker_path.exists()
+    assert not journal_path.exists()
+
+
 def test_dedup_skip_second_search(tmp_path, server, state):
     """A second run with the same ``SeenCache`` skips cached offers."""
 

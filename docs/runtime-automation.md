@@ -8,6 +8,17 @@ Defaults are safe and bounded: `JOBTRAIL_BASE_URL=http://127.0.0.1:8000`, `JOB_S
 
 Set `WHATSAPP_NOTIFY_COMMAND=./notify-whatsapp-via-hermes.local.sh` (the helper accepts the summary on stdin), then set `WHATSAPP_NOTIFY_ENABLED=1` only when the configured Hermes notification helper is ready. At most one summary is sent per run, and only for the highest validated score at or above the threshold. The summary contains title, company, location, score, recommendation, recommendation label, strengths, gaps, the external job URL, the JobTrail link, and the run identifier, plus optional selected public `searchProfiles` names only when profile provenance exists. See [Daily WhatsApp summary fields](#daily-whatsapp-summary-fields) for the contract and the optional `WHATSAPP_SHORT_URL_BASE` shortener. This workflow writes `[AI_JOB_SCORE_V1]` notes and sends WhatsApp when enabled, but **never applies to jobs automatically**. It must not expose descriptions, profiles, prompts, notes, credentials, or secrets.
 
+### Full-automation dry-run
+
+Use `scripts/automated-job-search.example.py --dry-run`, or set
+`JOBTRAIL_AUTOMATION_DRY_RUN=1`, to exercise the full search-and-score pipeline without
+side effects. The CLI flag takes precedence over the environment setting. Output includes
+`planned_operations` (`searched`, `imported`, `scored`, and `notified`) and a deterministic,
+redacted `notification_preview`. In this mode searches and scorer previews run, but jobs are
+not imported, score notes are not saved, WhatsApp is not called, and the seen cache, circuit
+breaker, and run journal are not created or changed. This is distinct from the scorer-only
+`jobtrail-ai-scorer score --dry-run`, which does not perform the full automation search.
+
 Use these examples to run JobTrail AI Scorer from a local scheduler while keeping private runtime files out of the repository. Copy the example files, edit only local ignored copies, and dry-run first before allowing writes to JobTrail notes.
 
 > **Deprecation note.** The historical dry-run wrappers
@@ -566,7 +577,10 @@ secrets. Default is off; opt in explicitly.
 
 ## Safety rules
 
-- **Dry-run first:** keep `SCORER_DRY_RUN=1` until the config, JobTrail connection, provider, and logs look correct.
+- **Dry-run first:** `SCORER_DRY_RUN=1` applies to the scorer-only runner; use
+  `JOBTRAIL_AUTOMATION_DRY_RUN=1` or the launcher `--dry-run` for the full automation
+  search/import/score/notify plan. Keep the applicable dry-run setting enabled until the
+  config, JobTrail connection, provider, and logs look correct.
 - Local config stays ignored. Do not commit `config.yaml`, candidate profiles, logs, secrets, tokens, or copied runtime scripts containing machine-specific paths.
 - Store logs outside the repository, for example under `/tmp/jobtrail-ai-scorer-logs` or another local operator-owned directory.
 - For JobTrail maintenance commands, use both JobTrail compose files together: `compose.hub.yml` and `compose.override.yml`. Keep maintenance commands explicit so the override services, ports, and mounts are included.
