@@ -146,17 +146,23 @@ class ScoreRunResult:
 
 
 def should_score(
-    job: dict[str, Any], *, force: bool = False, marker: str = CURRENT_MARKER
+    job: dict[str, Any],
+    *,
+    force: bool = False,
+    marker: str = CURRENT_MARKER,
+    current_fingerprint: str | None = None,
 ) -> bool:
     """Return whether a complete job is eligible for scoring."""
 
     marker = _normalize_marker(marker)
+    if force:
+        return True
     description = job.get("description")
     if not isinstance(description, str) or not description.strip():
         return False
-    if force:
-        return True
-    return not _contains_score_marker(job.get("notes"), marker=marker)
+    return not _contains_score_marker(
+        job.get("notes"), marker=marker, current_fingerprint=current_fingerprint
+    )
 
 
 def render_prompt(job: dict[str, Any], candidate_profile: str) -> str:
@@ -212,7 +218,12 @@ def score_jobs(
 
         try:
             full_job = candidate if job_payload is not None else client.get_job(candidate_id)
-            if not should_score(full_job, force=force, marker=marker):
+            if not should_score(
+                full_job,
+                force=force,
+                marker=marker,
+                current_fingerprint=job_fingerprint(full_job),
+            ):
                 skipped += 1
                 reason = "empty_description" if not _has_description(full_job) else "already_scored"
                 outcomes.append(ScoreOutcome(candidate_id, "skipped", reason))
@@ -268,13 +279,31 @@ def _has_description(job: dict[str, Any]) -> bool:
     return isinstance(description, str) and bool(description.strip())
 
 
-def _contains_score_marker(notes: Any, *, marker: str) -> bool:
+def _contains_score_marker(
+    notes: Any, *, marker: str, current_fingerprint: str | None = None
+) -> bool:
     if not isinstance(notes, list):
         return False
+
+    # Legacy notes remain a permanent deduplication marker.
     for note in notes:
         body = note.get("body") if isinstance(note, dict) else None
-        if isinstance(body, str) and (marker in body or LEGACY_MARKER in body):
+        if isinstance(body, str) and LEGACY_MARKER in body:
             return True
+
+    # Notes are ordered oldest to newest; only the latest current-marker note
+    # determines whether this fingerprint has already been scored.
+    for note in reversed(notes):
+        body = note.get("body") if isinstance(note, dict) else None
+        if not isinstance(body, str) or marker not in body:
+            continue
+        payload = parse_score_note(body, marker=marker)
+        if payload is None or current_fingerprint is None:
+            return True
+        recorded_fingerprint = payload.get("input_fingerprint")
+        if not isinstance(recorded_fingerprint, str):
+            return True
+        return recorded_fingerprint == current_fingerprint
     return False
 
 
