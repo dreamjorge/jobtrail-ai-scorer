@@ -108,6 +108,14 @@ def main() -> int:
             "re-imported (also set by JOBTRAIL_RESET_SEEN_CACHE=1)."
         ),
     )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help=(
+            "Search and score without importing jobs, writing runtime state, "
+            "or sending WhatsApp notifications (overrides JOBTRAIL_AUTOMATION_DRY_RUN)."
+        ),
+    )
     args = parser.parse_args()
     config = AutomationConfig.from_env()
     if not config.whatsapp_command:
@@ -116,12 +124,13 @@ def main() -> int:
             "whatsapp_command": "./notify-whatsapp-via-hermes.local.sh",
         }
         config = AutomationConfig(**overrides)
-    if args.config or args.notify:
+    if args.config or args.notify or args.dry_run:
         config = AutomationConfig(
             **{
                 **config.__dict__,
                 "scorer_config_path": args.config or config.scorer_config_path,
                 "notify_enabled": args.notify or config.notify_enabled,
+                "dry_run": args.dry_run or config.dry_run,
             }
         )
 
@@ -152,7 +161,10 @@ def main() -> int:
     config = merge_resolved_base_url(config, base_url)
 
     gateway = JobTrailHTTPClient(config.base_url)
-    seen_cache = _build_seen_cache(args)
+    # Dry-run is deliberately state-free: the automation layer also skips
+    # breaker and journal writes, while the launcher must not even construct
+    # the seen cache (construction can create its parent directory).
+    seen_cache = None if config.dry_run else _build_seen_cache(args)
     try:
         result = JobSearchAutomation(
             gateway, seen_cache=seen_cache, ats_boards=config.ats_boards
@@ -167,6 +179,9 @@ def main() -> int:
             "selected": result.selected is not None,
             "failures": list(result.failures),
             "profile_counts": result.profile_counts,
+            "dry_run": getattr(result, "dry_run", False),
+            "planned_operations": getattr(result, "planned_operations", {}),
+            "notification_preview": getattr(result, "notification_preview", None),
         }
     )
     return 1 if result.failures else 0
