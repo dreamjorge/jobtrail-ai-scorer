@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import json
+import unicodedata
+from collections.abc import Mapping
 from typing import Any, Protocol
 
 from pydantic import ValidationError
@@ -13,6 +16,18 @@ from .providers.base import ScoreProvider
 
 CURRENT_MARKER = "[AI_JOB_SCORE_V1]"
 LEGACY_MARKER = "[HERMES_JOB_SCORE_V1]"
+FINGERPRINT_VERSION = 1
+_FINGERPRINT_FIELDS = {
+    "title": ("title", "position"),
+    "company": ("company",),
+    "location": ("location",),
+    "description": ("description",),
+    "salaryMin": ("salaryMin", "salary_min"),
+    "salaryMax": ("salaryMax", "salary_max"),
+    "salaryCurrency": ("salaryCurrency", "salary_currency"),
+    "jobType": ("jobType", "job_type", "employment_type"),
+    "remote": ("remote",),
+}
 
 PROMPT_INSTRUCTIONS = (
     "Evaluate this job against the candidate profile. "
@@ -35,6 +50,26 @@ def serialize_job(job: dict[str, Any]) -> str:
 
     job_data = {key: value for key, value in job.items() if key != "notes"}
     return json.dumps(job_data, sort_keys=True, default=str)
+
+
+def _normalize_fingerprint_value(value: Any) -> Any:
+    if isinstance(value, str):
+        normalized = unicodedata.normalize("NFKC", value)
+        return " ".join(normalized.casefold().split())
+    return value
+
+
+def job_fingerprint(job: Mapping[str, Any]) -> str:
+    """Return the versioned digest of the fields that affect a job score."""
+
+    canonical = {
+        field: _normalize_fingerprint_value(
+            next((job[key] for key in aliases if key in job), None)
+        )
+        for field, aliases in _FINGERPRINT_FIELDS.items()
+    }
+    payload = json.dumps(canonical, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 class JobTrailGateway(Protocol):
@@ -186,7 +221,7 @@ def score_jobs(
             prompt = render_prompt(full_job, candidate_profile)
             raw_score = provider.score(prompt)
             score = ScoreResult.model_validate(json.loads(raw_score))
-            note_body = _serialize_note(marker, score)
+            note_body = _serialize_note(marker, score, job=full_job)
             if dry_run:
                 processed += 1
                 outcomes.append(_validated_outcome(candidate_id, score))
@@ -261,8 +296,43 @@ def _bound_list(values: tuple[str, ...]) -> list[str]:
     return [_bound_string(value)[:_MAX_OUTPUT_ITEM_STRING] for value in values[:_MAX_OUTPUT_ITEMS]]
 
 
-def _serialize_note(marker: str, score: ScoreResult) -> str:
-    canonical_json = json.dumps(
-        score.model_dump(mode="json"), sort_keys=True, separators=(",", ":")
+def serialize_score_note(
+    marker: str, score: ScoreResult | Mapping[str, Any], *, job: Mapping[str, Any] | None = None
+) -> str:
+    """Serialize a validated score, optionally binding it to a job fingerprint."""
+
+    payload = (
+        score.model_dump(mode="json") if isinstance(score, ScoreResult) else dict(score)
     )
+    if job is not None:
+        payload["fingerprint_version"] = FINGERPRINT_VERSION
+        payload["input_fingerprint"] = job_fingerprint(job)
+    canonical_json = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return f"{marker}\n{canonical_json}"
+
+
+def parse_score_note(body: str, *, marker: str = CURRENT_MARKER) -> dict[str, Any] | None:
+    """Parse a score note payload, including notes written before fingerprints."""
+
+    if not isinstance(body, str):
+        return None
+    lines = body.split("\n", 1)
+    if len(lines) != 2 or lines[0].strip() != marker.strip():
+        return None
+    try:
+        payload = json.loads(lines[1])
+    except json.JSONDecodeError:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _serialize_note(
+    marker: str, score: ScoreResult, *, job: Mapping[str, Any] | None = None
+) -> str:
+    """Backward-compatible private wrapper for score note serialization."""
+
+    return serialize_score_note(marker, score, job=job)
+
+
+def _parse_note(body: str, *, marker: str = CURRENT_MARKER) -> dict[str, Any] | None:
+    return parse_score_note(body, marker=marker)

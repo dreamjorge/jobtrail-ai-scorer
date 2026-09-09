@@ -3,7 +3,7 @@ from dataclasses import dataclass, field
 
 import pytest
 
-from jobtrail_ai_scorer.scoring import ScoreOutcome, render_prompt, score_jobs
+from jobtrail_ai_scorer.scoring import ScoreOutcome, job_fingerprint, render_prompt, score_jobs
 
 
 VALID_SCORE = {
@@ -151,7 +151,12 @@ def test_valid_score_saves_marker_and_canonical_json_note():
     assert result.processed == 1
     assert result.skipped == 0
     assert result.failed == 0
-    assert client.notes == [("j1", "[AI_JOB_SCORE_V1]\n" + json.dumps(VALID_SCORE, sort_keys=True, separators=(",", ":")))]
+    expected_note = {
+        **VALID_SCORE,
+        "fingerprint_version": 1,
+        "input_fingerprint": job_fingerprint(full_job("j1")),
+    }
+    assert client.notes == [("j1", "[AI_JOB_SCORE_V1]\n" + json.dumps(expected_note, sort_keys=True, separators=(",", ":")))]
     assert "Generic profile" in provider.prompts[0]
 
 
