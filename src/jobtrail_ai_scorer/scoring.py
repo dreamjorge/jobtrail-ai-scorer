@@ -50,6 +50,11 @@ class JobTrailGateway(Protocol):
         """Add a note to a job."""
 
 
+_MAX_OUTPUT_STRING = 500
+_MAX_OUTPUT_ITEMS = 20
+_MAX_OUTPUT_ITEM_STRING = 200
+
+
 @dataclass(frozen=True)
 class ScoreOutcome:
     """A privacy-safe result for one attempted job."""
@@ -57,6 +62,34 @@ class ScoreOutcome:
     job_id: str
     status: str
     reason: str
+    score: int | None = None
+    recommendation: str | None = None
+    strengths: tuple[str, ...] = ()
+    gaps: tuple[str, ...] = ()
+    career_value: str | None = None
+    reasoning: str | None = None
+    hard_requirements_missing: tuple[str, ...] = ()
+    needs_confirmation: tuple[str, ...] = ()
+
+    def as_json(self) -> dict[str, Any]:
+        """Return only bounded, validated fields safe for external output."""
+        result: dict[str, Any] = {
+            "job_id": _bound_string(self.job_id),
+            "status": _bound_string(self.status),
+        }
+        if self.score is not None:
+            result.update({
+                "score": self.score,
+                "recommendation": _bound_string(self.recommendation or ""),
+                "strengths": _bound_list(self.strengths),
+                "gaps": _bound_list(self.gaps),
+                "career_value": _bound_string(self.career_value or ""),
+                "reasoning": _bound_string(self.reasoning or ""),
+                "hard_requirements_missing": _bound_list(self.hard_requirements_missing),
+                "needs_confirmation": _bound_list(self.needs_confirmation),
+            })
+        result["reason"] = _bound_string(self.reason)
+        return {key: result[key] for key in sorted(result)}
 
 
 @dataclass(frozen=True)
@@ -67,6 +100,14 @@ class ScoreRunResult:
     skipped: int
     failed: int
     outcomes: tuple[ScoreOutcome, ...]
+
+    @property
+    def json_output(self) -> list[dict[str, Any]]:
+        return [outcome.as_json() for outcome in self.outcomes]
+
+    @property
+    def json_text(self) -> str:
+        return json.dumps(self.json_output, sort_keys=True, separators=(",", ":"))
 
 
 def should_score(
@@ -105,9 +146,12 @@ def score_jobs(
     dry_run: bool = False,
     marker: str = CURRENT_MARKER,
     emit_status: bool = True,
+    output_json: bool = False,
 ) -> ScoreRunResult:
     """Score independently eligible jobs and save only validated results."""
 
+    if output_json and not dry_run:
+        raise ValueError("output_json requires dry_run")
     marker = _normalize_marker(marker)
     candidates = _select_candidates(client, job_id=job_id, limit=limit)
     outcomes: list[ScoreOutcome] = []
@@ -138,7 +182,7 @@ def score_jobs(
             note_body = _serialize_note(marker, score)
             if dry_run:
                 processed += 1
-                outcomes.append(ScoreOutcome(candidate_id, "dry_run", "validated"))
+                outcomes.append(_validated_outcome(candidate_id, score))
                 if emit_status:
                     print(f"DRY RUN {candidate_id}: validated score {score.score}")
             else:
@@ -190,6 +234,24 @@ def _contains_score_marker(notes: Any, *, marker: str) -> bool:
         if isinstance(body, str) and (marker in body or LEGACY_MARKER in body):
             return True
     return False
+
+
+def _validated_outcome(job_id: str, score: ScoreResult) -> ScoreOutcome:
+    values = score.model_dump()
+    return ScoreOutcome(
+        job_id, "dry_run", "validated", values["score"], values["recommendation"],
+        tuple(values["strengths"]), tuple(values["gaps"]), values["career_value"],
+        values["reasoning"], tuple(values["hard_requirements_missing"]),
+        tuple(values["needs_confirmation"]),
+    )
+
+
+def _bound_string(value: str) -> str:
+    return value[:_MAX_OUTPUT_STRING]
+
+
+def _bound_list(values: tuple[str, ...]) -> list[str]:
+    return [_bound_string(value)[:_MAX_OUTPUT_ITEM_STRING] for value in values[:_MAX_OUTPUT_ITEMS]]
 
 
 def _serialize_note(marker: str, score: ScoreResult) -> str:
