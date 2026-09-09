@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import inspect
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import json
@@ -243,6 +244,7 @@ class AutomationConfig:
     breaker_cooldown_seconds: float = 3600.0
     breaker_alert_cooldown_seconds: float = 3600.0
     breaker_state_path: str = ""
+    dry_run: bool = False
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "AutomationConfig":
@@ -313,6 +315,7 @@ class AutomationConfig:
                 "BREAKER_ALERT_COOLDOWN_SECONDS", cls.breaker_alert_cooldown_seconds
             ),
             breaker_state_path=e.get("BREAKER_STATE_PATH", "").strip(),
+            dry_run=truthy("JOBTRAIL_AUTOMATION_DRY_RUN", "0"),
         )
 
 
@@ -549,6 +552,9 @@ class AutomationRun:
     failures: tuple[str, ...] = ()
     selected: dict[str, Any] | None = None
     profile_counts: dict[str, dict[str, int]] = field(default_factory=dict)
+    dry_run: bool = False
+    planned_operations: dict[str, int] = field(default_factory=dict)
+    notification_preview: dict[str, Any] | None = None
 
 
 def _format_failure(stage: str, exc: BaseException, *, job_id: str | None = None) -> str:
@@ -615,6 +621,7 @@ class JobTrailAutomation:
         self.seen_cache = seen_cache
         self._scorer_command = "jobtrail-ai-scorer"
         self._whatsapp_command = ""
+        self._dry_run = False
         self.base_url = AutomationConfig.base_url
         # Scorer subprocess invocations are idempotent (the CLI runs with
         # ``--force``) so retry is safe. The default policy bounds attempts
@@ -655,7 +662,17 @@ class JobTrailAutomation:
                 )
         self.source_adapters = source_adapters
 
-    def _score(self, job_id: str, config_path: str) -> None:
+    def _invoke_scorer(self, job_id: str, config_path: str,
+                       payload: dict[str, Any] | None = None) -> Any:
+        """Call injected scorers with payload when supported."""
+        try:
+            inspect.signature(self.scorer).bind(job_id, config_path, payload)
+        except (TypeError, ValueError):
+            return self.scorer(job_id, config_path)
+        return self.scorer(job_id, config_path, payload)
+
+    def _score(self, job_id: str, config_path: str,
+               payload: dict[str, Any] | None = None) -> Any:
         # No retry here: ``run()`` already wraps every call to ``self.scorer``
         # (default or injected) in a single ``retry_call`` with
         # ``_scorer_retry_policy``. Retrying here too would nest attempts
@@ -666,20 +683,45 @@ class JobTrailAutomation:
         # ``AutomationConfig.base_url`` in ``run()``) so the scorer targets
         # the same backend instead of falling back to whatever static
         # ``jobtrail_base_url`` is committed in the scorer's own YAML config.
-        subprocess.run(
-            [
-                *shlex.split(self._scorer_command),
-                "score",
-                "--config",
-                config_path,
-                "--job-id",
-                job_id,
-                "--force",
-                "--base-url",
-                self.base_url,
-            ],
-            check=True,
-        )
+        command = [*shlex.split(self._scorer_command), "score"]
+        if self._dry_run:
+            result = subprocess.run(
+                [
+                    *command,
+                    "--dry-run",
+                    "--json",
+                    "--job-json",
+                    "-",
+                    "--config",
+                    config_path,
+                ],
+                check=True,
+                capture_output=True,
+                input=json.dumps(
+                    payload if payload is not None else {"id": job_id},
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                text=True,
+            )
+            value = json.loads(result.stdout)
+            if isinstance(value, list):
+                value = next(
+                    (
+                        item
+                        for item in value
+                        if isinstance(item, dict)
+                        and str(item.get("job_id")) == str(job_id)
+                    ),
+                    value[0] if len(value) == 1 else None,
+                )
+            if not isinstance(value, dict) or not isinstance(
+                value.get("score"), (int, float)
+            ):
+                raise ValueError("scorer dry-run output must be a score mapping")
+            return value
+        subprocess.run([*command, "--config", config_path, "--job-id", job_id, "--force", "--base-url", self.base_url], check=True)
+        return None
 
     def _notify(self, message: str) -> None:
         if not self._whatsapp_command:
@@ -696,7 +738,15 @@ class JobTrailAutomation:
             raise ValueError("SCORER_CONFIG_PATH is required")
         self._scorer_command = config.scorer_command
         self._whatsapp_command = config.whatsapp_command
+        self._dry_run = config.dry_run
         self.base_url = config.base_url
+
+        if config.dry_run:
+            if self._preflight_runner is not None:
+                report = self._preflight_runner(config)
+                if getattr(report, "should_abort", False):
+                    return self._empty_run(tuple(self._preflight_failure_labels(report)), breaker=None, dry_run=True)
+            return self._run_dry(config=config)
 
         # Step 0: resolve the circuit breaker.
         #
@@ -891,6 +941,83 @@ class JobTrailAutomation:
         self._journal_run(config, run, started_at)
         return run
 
+    def _run_dry(self, *, config: AutomationConfig) -> AutomationRun:
+        failures: list[str] = []
+        searched = scored = planned_imported = planned_notified = 0
+        previews: list[tuple[str, dict[str, Any]]] = []
+        identities: dict[tuple[str, str], str] = {}
+        profiles_by_id: dict[str, list[str]] = {}
+        count_profiles = bool(config.search_profiles)
+        profile_counts = ({p.name: {"searched": 0, "imported": 0, "duplicates": 0, "failures": 0}
+                          for p in config.search_profiles} if count_profiles else {})
+        for adapter in self.source_adapters:
+            requests = (ats_source_search_requests(config)
+                        if getattr(adapter, "name", None) in {"lever", "greenhouse"}
+                        else source_search_requests(config))
+            for request in requests:
+                try:
+                    jobs = adapter.search(request)
+                    searched += len(jobs)
+                    if count_profiles:
+                        profile_counts[request.profile_name]["searched"] += len(jobs)
+                    for job in jobs:
+                        payload = job.to_import_payload()
+                        identity = self._cache_identity(job)
+                        if identity is not None and identity in identities:
+                            if count_profiles:
+                                profile_counts[request.profile_name]["duplicates"] += 1
+                            self._append_profile_provenance(profiles_by_id, identities[identity], request.profile_name)
+                            continue
+                        job_id = identity[1] if identity else str(payload.get("jobUrl") or payload.get("position") or searched)
+                        if identity is not None:
+                            identities[identity] = job_id
+                        previews.append((job_id, payload))
+                        planned_imported += 1
+                        if count_profiles:
+                            profile_counts[request.profile_name]["imported"] += 1
+                        self._append_profile_provenance(profiles_by_id, job_id, request.profile_name)
+                except Exception as exc:
+                    failures.append(_format_failure("search", exc))
+                    if count_profiles:
+                        profile_counts[request.profile_name]["failures"] += 1
+        scored_previews: list[tuple[str, dict[str, Any], dict[str, Any]]] = []
+        for job_id, job in previews[:config.max_score]:
+            try:
+                score = retry_call(
+                    self._invoke_scorer, job_id, config.scorer_config_path, job,
+                    policy=self._scorer_retry_policy, sleep=self._scorer_retry_sleep,
+                    label=f"scorer score {job_id}",
+                )
+                if not isinstance(score, Mapping) or not isinstance(score.get("score"), (int, float)):
+                    raise ValueError("scorer preview must be a score mapping")
+                scored_previews.append((job_id, job, dict(score)))
+                scored += 1
+            except Exception as exc:
+                failures.append(_format_failure("score", exc, job_id=job_id))
+        best = best_job = best_score = best_job_id = None
+        for job_id, job, score in scored_previews:
+            if score["score"] >= config.score_threshold and (best is None or score["score"] > best["score"]):
+                best = {"title": job.get("position", job.get("title", "")), "company": job.get("company", ""),
+                        "location": job.get("location", ""), "score": score["score"],
+                        "recommendation": score.get("recommendation", ""), "strengths": score.get("strengths", []),
+                        "gaps": score.get("gaps", []), "jobUrl": job.get("jobUrl", job.get("job_url", ""))}
+                best_job, best_score, best_job_id = job, score, job_id
+        if best is not None and best_job_id in profiles_by_id:
+            best["searchProfiles"] = list(profiles_by_id[best_job_id])
+        body = self._compose_notification(best=best, best_job=best_job, best_score=best_score,
+                                           failures=tuple(failures), notify_enabled=config.notify_enabled,
+                                           notify_on_failure=config.notify_on_failure, base_url=self.base_url)
+        notification_preview = None
+        if body is not None:
+            planned_notified = 1
+            try:
+                notification_preview = json.loads(body.split("\n", 1)[0])
+            except (TypeError, json.JSONDecodeError):
+                notification_preview = {"kind": "notification_preview"}
+        return AutomationRun(searched, 0, scored, tuple(failures), best, profile_counts, True,
+                             {"searched": searched, "imported": planned_imported, "scored": scored,
+                              "notified": planned_notified}, notification_preview)
+
     def _journal_run(self, config: AutomationConfig, run: AutomationRun, started_at: datetime) -> None:
         if not config.run_journal_path:
             return
@@ -1002,6 +1129,7 @@ class JobTrailAutomation:
         failures: tuple[str, ...],
         *,
         breaker: Any | None,
+        dry_run: bool = False,
     ) -> "AutomationRun":
         """Return an empty :class:`AutomationRun` for the short-circuit paths.
 
@@ -1013,7 +1141,8 @@ class JobTrailAutomation:
         state machine and would extend the cooldown).
         """
 
-        run = AutomationRun(0, 0, 0, failures, None, {})
+        run = AutomationRun(0, 0, 0, failures, None, {}, dry_run,
+                             {"searched": 0, "imported": 0, "scored": 0, "notified": 0} if dry_run else {})
         if breaker is not None and failures:
             breaker.record_failure()
         return run

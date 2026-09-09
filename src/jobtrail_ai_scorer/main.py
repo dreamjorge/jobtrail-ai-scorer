@@ -2,6 +2,7 @@
 import json
 import logging
 import os
+import sys
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -63,7 +64,8 @@ def run_score(*, config_path: Path, limit: int | None = None, job_id: str | None
               provider_name: str | None = None, base_url: str | None = None,
               client_factory: ClientFactory | None = None,
               provider_factory: ProviderFactory | None = None,
-              output_json: bool = False) -> ScoreRunResult:
+              output_json: bool = False,
+              job_payload: dict | None = None) -> ScoreRunResult:
     if output_json and not dry_run:
         raise ValueError("output_json requires dry_run")
     config = load_config(config_path)
@@ -98,14 +100,15 @@ def run_score(*, config_path: Path, limit: int | None = None, job_id: str | None
     try:
         result = score_jobs(client, provider, profile, job_id=job_id, limit=limit,
                             force=force, dry_run=dry_run, marker=marker or config.marker,
-                            emit_status=False, output_json=output_json)
+                            emit_status=False, output_json=output_json,
+                            job_payload=job_payload)
         # Must run before the client closes below: with --job-id this samples
         # the live job via client.get_job, and a closed client makes that
         # call fail silently, falling back to a tiny stub payload that
         # undercounts the estimate and can hide a genuinely oversized prompt.
         if not output_json:
             _emit_prompt_tokens_estimate(client, profile_only=profile_only, cv=cv,
-                                          job_id=job_id)
+                                          job_id=job_id, job_payload=job_payload)
     finally:
         close = getattr(client, "close", None)
         if close:
@@ -142,7 +145,8 @@ def _split_profile(profile: str, cv: str) -> str:
 
 
 def _emit_prompt_tokens_estimate(client: object, *, profile_only: str, cv: str,
-                                 job_id: str | None) -> None:
+                                 job_id: str | None,
+                                 job_payload: dict | None = None) -> None:
     """Print one ``prompt_tokens_estimate=`` line plus an optional budget warning.
 
     The breakdown uses the raw profile / cv values (before the inline CV
@@ -151,7 +155,7 @@ def _emit_prompt_tokens_estimate(client: object, *, profile_only: str, cv: str,
     matches the JSON the provider will see.
     """
 
-    job_payload = _sample_job_payload(client, job_id)
+    job_payload = _sample_job_payload(client, job_id, job_payload)
     breakdown = estimate_sections(
         profile=profile_only,
         cv=cv,
@@ -167,7 +171,8 @@ def _emit_prompt_tokens_estimate(client: object, *, profile_only: str, cv: str,
         typer.echo(f"prompt_token_budget={warning}")
 
 
-def _sample_job_payload(client: object, job_id: str | None) -> str:
+def _sample_job_payload(client: object, job_id: str | None,
+                        job_payload: dict | None = None) -> str:
     """Pick a deterministic sample job for the size estimate.
 
     When ``job_id`` is provided we read the same job the provider will see so
@@ -175,6 +180,8 @@ def _sample_job_payload(client: object, job_id: str | None) -> str:
     empty dict so the per-run line stays bounded when no job was scored.
     """
 
+    if job_payload is not None:
+        return serialize_job(job_payload)
     if job_id is None:
         return serialize_job({})
     get_job = getattr(client, "get_job", None)
@@ -260,6 +267,7 @@ def _read_seen_entries(path: Path) -> list[dict]:
 def score(limit: int | None = typer.Option(None), job_id: str | None = typer.Option(None),
           dry_run: bool = typer.Option(False, "--dry-run"), force: bool = typer.Option(False),
           json_output: bool = typer.Option(False, "--json"),
+          job_json: str | None = typer.Option(None, "--job-json", hidden=True),
           marker: str | None = typer.Option(None), provider: str | None = typer.Option(None),
           base_url: str | None = typer.Option(
               None, "--base-url",
@@ -268,9 +276,21 @@ def score(limit: int | None = typer.Option(None), job_id: str | None = typer.Opt
           ),
           config: Path = typer.Option(Path("config.yaml"), "--config")) -> None:
     """Score eligible jobs and save validated score notes."""
+    job_payload = None
+    if job_json == "-":
+        job_json = sys.stdin.read()
+    if job_json is not None:
+        try:
+            parsed = json.loads(job_json)
+        except json.JSONDecodeError as exc:
+            raise typer.BadParameter("must be valid JSON", param_hint="--job-json") from exc
+        if not isinstance(parsed, dict):
+            raise typer.BadParameter("must be a JSON object", param_hint="--job-json")
+        job_payload = parsed
     result = run_score(config_path=config, limit=limit, job_id=job_id, dry_run=dry_run,
                        force=force, marker=marker, provider_name=provider,
-                       base_url=base_url, output_json=json_output)
+                       base_url=base_url, output_json=json_output,
+                       job_payload=job_payload)
     if result.failed:
         raise typer.Exit(code=1)
 

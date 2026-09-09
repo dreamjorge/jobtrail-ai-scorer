@@ -147,18 +147,25 @@ def score_jobs(
     marker: str = CURRENT_MARKER,
     emit_status: bool = True,
     output_json: bool = False,
+    job_payload: dict[str, Any] | None = None,
 ) -> ScoreRunResult:
     """Score independently eligible jobs and save only validated results."""
 
     if output_json and not dry_run:
         raise ValueError("output_json requires dry_run")
     marker = _normalize_marker(marker)
-    candidates = _select_candidates(client, job_id=job_id, limit=limit)
+    candidates = (
+        [job_payload]
+        if job_payload is not None
+        else _select_candidates(client, job_id=job_id, limit=limit)
+    )
     outcomes: list[ScoreOutcome] = []
     processed = skipped = failed = 0
 
     for candidate in candidates:
         candidate_id = candidate.get("id")
+        if job_payload is not None and not isinstance(candidate_id, str):
+            candidate_id = job_id
         if not isinstance(candidate_id, str) or not candidate_id:
             failed += 1
             outcomes.append(ScoreOutcome("<unknown>", "failed", "invalid_job_id"))
@@ -169,7 +176,7 @@ def score_jobs(
             continue
 
         try:
-            full_job = client.get_job(candidate_id)
+            full_job = candidate if job_payload is not None else client.get_job(candidate_id)
             if not should_score(full_job, force=force, marker=marker):
                 skipped += 1
                 reason = "empty_description" if not _has_description(full_job) else "already_scored"
