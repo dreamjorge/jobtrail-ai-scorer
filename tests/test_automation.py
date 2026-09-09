@@ -107,6 +107,49 @@ def test_search_payloads_split_sites_and_locations():
     ]
 
 
+def test_automation_config_parses_dry_run_truthy_env():
+    assert AutomationConfig.from_env({"JOBTRAIL_AUTOMATION_DRY_RUN": "yes"}).dry_run is True
+    assert AutomationConfig.from_env({"JOBTRAIL_AUTOMATION_DRY_RUN": "off"}).dry_run is False
+
+
+def test_automation_dry_run_has_no_write_side_effects():
+    class Adapter:
+        name = "custom"
+        def search(self, request):
+            return [NormalizedJob(source="custom", source_job_id="source-1", title="Secret role",
+                                  company="Acme", description="private prompt", source_url="https://jobs.test/1",
+                                  location="remote")]
+
+    class Cache:
+        def transaction(self):
+            raise AssertionError("dry-run must not open cache transactions")
+        def mark_seen(self, *args, **kwargs):
+            raise AssertionError("dry-run must not mark cache")
+
+    gateway = FakeJobTrail()
+    notifications = []
+    breaker = type("Breaker", (), {
+        "should_attempt": lambda self: True,
+        "record_success": lambda self: (_ for _ in ()).throw(AssertionError("breaker mutated")),
+    })()
+    journal = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("journal mutated"))
+    run = JobSearchAutomation(
+        gateway,
+        scorer=lambda job_id, path: {"score": 95, "recommendation": "PRIORITY_APPLY",
+                                     "strengths": ["Python"], "gaps": []},
+        notifier=notifications.append, seen_cache=Cache(), source_adapters=(Adapter(),),
+        circuit_breaker=breaker, run_journal=journal,
+    ).run(config=AutomationConfig(scorer_config_path="safe.yaml", dry_run=True,
+                                  locations=("remote",), notify_enabled=True, run_journal_path="journal.json"))
+
+    assert gateway.imported == []
+    assert notifications == []
+    assert run.dry_run is True
+    assert run.planned_operations == {"searched": 1, "imported": 1, "scored": 1, "notified": 1}
+    assert run.notification_preview["company"] == "Acme"
+    assert "private prompt" not in json.dumps(run.notification_preview)
+
+
 def test_automation_config_parses_search_profiles_from_env():
     config = AutomationConfig.from_env(
         {
