@@ -2612,3 +2612,30 @@ def test_preflight_healthy_runs_pipeline_with_injected_breaker(tmp_path):
     assert result.failures == ("breaker:open",)
     assert result.imported == 0
     assert result.scored == 0
+
+
+def test_run_journal_records_success_once(tmp_path):
+    calls = []
+    automation = JobSearchAutomation(FakeJobTrail(), scorer=lambda *_: None, run_journal=lambda *args, **kwargs: calls.append((args, kwargs)))
+    automation.run(config=AutomationConfig(scorer_config_path="safe/config.yaml", run_journal_path=str(tmp_path / "runs.jsonl")))
+    assert len(calls) == 1
+
+
+def test_run_journal_records_breaker_open_once(tmp_path):
+    class OpenBreaker:
+        def should_attempt(self): return False
+        def try_alert(self): return False
+    calls = []
+    automation = JobSearchAutomation(FakeJobTrail(), circuit_breaker=OpenBreaker(), run_journal=lambda *a, **k: calls.append(a))
+    result = automation.run(config=AutomationConfig(scorer_config_path="safe/config.yaml", run_journal_path=str(tmp_path / "runs.jsonl")))
+    assert result.failures == ("breaker:open",)
+    assert len(calls) == 1
+
+
+def test_run_journal_records_preflight_abort_once(tmp_path):
+    from jobtrail_ai_scorer.preflight import PreflightReport, PreflightResult, STATUS_UNAVAILABLE
+    calls = []
+    automation = JobSearchAutomation(FakeJobTrail(), preflight_runner=lambda _: PreflightReport((PreflightResult(name="api", status=STATUS_UNAVAILABLE),)), run_journal=lambda *a, **k: calls.append(a))
+    result = automation.run(config=AutomationConfig(scorer_config_path="safe/config.yaml", run_journal_path=str(tmp_path / "runs.jsonl")))
+    assert result.searched == 0
+    assert len(calls) == 1
