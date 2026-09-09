@@ -880,3 +880,7 @@ board slug, profile name, HTML-stripped content, remote heuristic, and UTC
 retrieval timestamp. `4xx` responses are terminal; `5xx` and transport errors
 use bounded retries. A failed Greenhouse search is recorded without blocking
 JobSpy or Lever adapters.
+
+### Funnel metrics
+
+Use `jobtrail-ai-scorer metrics --period today|7d|30d --json` for a bounded privacy-safe view. `today` means the current UTC day; `7d` and `30d` are rolling half-open windows. Set `JOBTRAIL_RUN_JOURNAL_PATH` (or pass `--journal-path`) to enable journaling; it is disabled by default. Missing backend, journal, score, or application-status data is reported in `missing_data`; application status is limited to fields exposed by JobTrail.

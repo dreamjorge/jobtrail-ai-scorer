@@ -1,6 +1,9 @@
 """Command-line entry point for scoring JobTrail jobs."""
 import json
 import logging
+import os
+import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Callable
 
@@ -8,6 +11,10 @@ import typer
 
 from .config import AppConfig, load_config
 from .jobtrail import JobTrailClient
+from .metrics import compute_metrics
+from .run_journal import DEFAULT_RUN_JOURNAL_PATH, iter_runs
+from .seen_cache import DEFAULT_SEEN_CACHE_PATH
+from ._atomic_json import read_json
 from .prompt_budget import LoadStatus, PromptBudget
 from .prompt_tokens import estimate_sections, optional_budget_from_env
 from .scoring import (
@@ -182,6 +189,64 @@ def _warn_if_unavailable(section: str, status: LoadStatus) -> None:
             section,
             status,
         )
+
+
+@app.command()
+def metrics(
+    period: str = typer.Option("today", "--period"),
+    json_output: bool = typer.Option(False, "--json"),
+    journal_path: Path | None = typer.Option(None, "--journal-path"),
+    seen_cache_path: Path | None = typer.Option(None, "--seen-cache-path"),
+    base_url: str = typer.Option("http://127.0.0.1:8000", "--base-url"),
+) -> None:
+    """Render privacy-safe funnel metrics without mutating JobTrail."""
+    if period not in {"today", "7d", "30d"}:
+        raise typer.BadParameter("must be one of: today, 7d, 30d", param_hint="--period")
+    journal = journal_path or Path(os.environ.get("JOBTRAIL_RUN_JOURNAL_PATH", "") or DEFAULT_RUN_JOURNAL_PATH)
+    cache = seen_cache_path or Path(os.environ.get("JOBTRAIL_SEEN_CACHE_PATH", "") or DEFAULT_SEEN_CACHE_PATH)
+    now = time.time()
+    if period == "today":
+        from datetime import datetime, timezone
+        start = datetime.fromtimestamp(now, timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+        since, until = start, start + 86400
+    else:
+        since, until = now - (7 if period == "7d" else 30) * 86400, now
+    runs = list(iter_runs(journal, since=since, until=until))
+    seen_entries = _read_seen_entries(cache)
+    jobs: list[dict] = []
+    missing: list[str] = []
+    client = None
+    try:
+        client = JobTrailClient(base_url)
+        list_jobs = getattr(client, "list_jobs", None)
+        if callable(list_jobs):
+            jobs = [job for job in list_jobs() if isinstance(job, dict)]
+        else:
+            missing.append("scored_jobs")
+    except Exception:
+        missing.append("scored_jobs")
+    finally:
+        if client is not None and callable(getattr(client, "close", None)):
+            client.close()
+    view = compute_metrics(runs=runs, seen_entries=seen_entries, scored_jobs=jobs, period=period, now=now)
+    if missing:
+        view = replace(view, missing_data=tuple(sorted(set(view.missing_data) | set(missing))))
+    if json_output:
+        typer.echo(json.dumps(view.to_dict(), sort_keys=True, separators=(",", ":")))
+    else:
+        typer.echo(f"period={view.period} searched={view.searched} imported={view.imported} scored={view.scored} notifications={view.notifications} missing_data={','.join(view.missing_data) or 'none'}")
+
+
+def _read_seen_entries(path: Path) -> list[dict]:
+    payload = read_json(path, default={})
+    entries = payload.get("entries", {}) if isinstance(payload, dict) else {}
+    result = []
+    for key, value in entries.items() if isinstance(entries, dict) else ():
+        if not isinstance(key, str) or not isinstance(value, dict) or "\x1f" not in key:
+            continue
+        source, source_job_id = key.split("\x1f", 1)
+        result.append({"source": source, "sourceJobId": source_job_id, "first_seen": value.get("first_seen")})
+    return result
 
 
 @app.command()

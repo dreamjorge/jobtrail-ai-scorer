@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 import json
 import os
 import shlex
@@ -28,6 +29,7 @@ from .sources import (
     normalize_jobspy_job,
 )
 from .notify import NotificationBuilder, recommendation_label
+from .run_journal import record_run
 
 
 DEFAULT_TERMS = (
@@ -224,6 +226,7 @@ class AutomationConfig:
     score_threshold: int = 80
     scorer_command: str = "jobtrail-ai-scorer"
     scorer_config_path: str = ""
+    run_journal_path: str = ""
     notify_enabled: bool = False
     notify_on_failure: bool = False
     whatsapp_command: str = ""
@@ -294,6 +297,7 @@ class AutomationConfig:
             score_threshold=int(e.get("JOB_SCORE_THRESHOLD", "80")),
             scorer_command=e.get("SCORER_COMMAND", "jobtrail-ai-scorer"),
             scorer_config_path=e.get("SCORER_CONFIG_PATH", ""),
+                run_journal_path=e.get("JOBTRAIL_RUN_JOURNAL_PATH", "").strip(),
             notify_enabled=truthy("WHATSAPP_NOTIFY_ENABLED", "0"),
             notify_on_failure=truthy("WHATSAPP_NOTIFY_ON_FAILURE", "0"),
             whatsapp_command=e.get("WHATSAPP_NOTIFY_COMMAND", ""),
@@ -595,6 +599,8 @@ class JobTrailAutomation:
         ats_boards: AtsBoardConfig | None = None,
         preflight_runner: Callable[["AutomationConfig"], Any] | None = None,
         circuit_breaker: Any | None = None,
+            run_journal: Callable[..., Any] | None = None,
+            clock: Callable[[], datetime] | None = None,
     ) -> None:
         self.gateway, self.scorer, self.notifier = (
             gateway,
@@ -632,6 +638,8 @@ class JobTrailAutomation:
         # :meth:`_resolve_breaker`).
         self._preflight_runner = preflight_runner
         self._circuit_breaker = circuit_breaker
+        self._run_journal = run_journal or record_run
+        self._clock = clock or (lambda: datetime.now(timezone.utc))
         # Default ``source_adapters`` preserves the historical
         # ``(JobSpySourceAdapter(gateway),)`` tuple when no ATS boards are
         # configured. When ``ats_boards`` is supplied, the factory appends
@@ -683,6 +691,7 @@ class JobTrailAutomation:
         )
 
     def run(self, *, config: AutomationConfig) -> AutomationRun:
+        started_at = self._clock()
         if not config.scorer_config_path:
             raise ValueError("SCORER_CONFIG_PATH is required")
         self._scorer_command = config.scorer_command
@@ -702,21 +711,21 @@ class JobTrailAutomation:
             # the operator's notify flags), and return an empty run. The
             # breaker-opened run MUST NOT increment the failure counter
             # so the alert does not extend the cooldown.
-            return self._handle_breaker_open(
+            run = self._handle_breaker_open(
                 breaker=breaker,
                 config=config,
             )
 
-        # Step 0b: preflight is opt-in. When ``preflight_runner`` is
-        # provided, a non-empty ``should_abort`` aborts the run before
-        # any search/import/score work.
+            self._journal_run(config, run, started_at)
+            return run
+
         if self._preflight_runner is not None:
             report = self._preflight_runner(config)
             if getattr(report, "should_abort", False):
                 preflight_failures = self._preflight_failure_labels(report)
-                return self._empty_run(
-                    tuple(preflight_failures), breaker=breaker
-                )
+                run = self._empty_run(tuple(preflight_failures), breaker=breaker)
+                self._journal_run(config, run, started_at)
+                return run
 
         failures: list[str] = []
         ids: list[str] = []
@@ -879,7 +888,17 @@ class JobTrailAutomation:
                 breaker.record_failure()
             else:
                 breaker.record_success()
+        self._journal_run(config, run, started_at)
         return run
+
+    def _journal_run(self, config: AutomationConfig, run: AutomationRun, started_at: datetime) -> None:
+        if not config.run_journal_path:
+            return
+        try:
+            self._run_journal(config.run_journal_path, run, started_at=started_at,
+                              finished_at=self._clock(), base_url_source="static")
+        except Exception:
+            pass
 
     # --- Breaker / preflight helpers --------------------------------------
 

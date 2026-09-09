@@ -76,6 +76,16 @@ The canonical real-path flow lives at the root of `scripts/`
 target removal date; do not use them in production. See the
 [legacy README](scripts/legacy/README.md) for the replacement mapping.
 
+### Funnel metrics
+
+Run `jobtrail-ai-scorer metrics --period today|7d|30d --json` for a bounded,
+privacy-safe funnel view. `today` is the current UTC day; `7d` and `30d` are
+half-open rolling windows. Use `--journal-path`, `--seen-cache-path`, and
+`--base-url` to override inputs. Set `JOBTRAIL_RUN_JOURNAL_PATH` to enable
+automation run journaling (empty by default for compatibility). Missing
+backend, journal, or score/application data is reported as `missing_data`;
+application status is limited to fields exposed by the JobTrail API.
+
 ## Automated JobTrail search
 
 Run `scripts/automated-job-search.example.py` with required `SCORER_CONFIG_PATH`.
