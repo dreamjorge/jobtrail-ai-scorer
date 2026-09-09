@@ -3,7 +3,15 @@ from dataclasses import dataclass, field
 
 import pytest
 
-from jobtrail_ai_scorer.scoring import ScoreOutcome, job_fingerprint, render_prompt, score_jobs
+from jobtrail_ai_scorer.scoring import (
+    CURRENT_MARKER,
+    ScoreOutcome,
+    job_fingerprint,
+    render_prompt,
+    score_jobs,
+    serialize_score_note,
+    should_score,
+)
 
 
 VALID_SCORE = {
@@ -240,3 +248,52 @@ def test_score_jobs_normalizes_marker_for_dedupe_and_note_serialization():
     score_jobs(new_job, FakeProvider(json.dumps(VALID_SCORE)), "Generic profile", marker=marker)
 
     assert new_job.notes[0][1].startswith("[CUSTOM]\n")
+
+
+def test_unchanged_fingerprinted_job_is_skipped():
+    job = full_job("j1")
+    job["notes"] = [{"body": serialize_score_note(CURRENT_MARKER, VALID_SCORE, job=job)}]
+
+    assert should_score(job, current_fingerprint=job_fingerprint(job)) is False
+
+
+def test_meaningful_change_is_eligible_again():
+    original = full_job("j1")
+    changed = {**original, "salaryMax": 200, "notes": [
+        {"body": serialize_score_note(CURRENT_MARKER, VALID_SCORE, job=original)}
+    ]}
+
+    assert should_score(changed, current_fingerprint=job_fingerprint(changed)) is True
+
+
+def test_whitespace_only_change_remains_skipped():
+    original = full_job("j1")
+    changed = {**original, "description": "  Job\n description ", "notes": [
+        {"body": serialize_score_note(CURRENT_MARKER, VALID_SCORE, job=original)}
+    ]}
+
+    assert should_score(changed, current_fingerprint=job_fingerprint(changed)) is False
+
+
+def test_legacy_current_marker_note_remains_skipped():
+    job = full_job("j1", notes=[{"body": CURRENT_MARKER + "\n" + json.dumps(VALID_SCORE)}])
+
+    assert should_score(job, current_fingerprint=job_fingerprint(job)) is False
+
+
+def test_force_overrides_fingerprint_eligibility():
+    job = full_job("j1")
+    job["notes"] = [{"body": serialize_score_note(CURRENT_MARKER, VALID_SCORE, job=job)}]
+
+    assert should_score(job, force=True, current_fingerprint=job_fingerprint(job)) is True
+
+
+def test_score_history_uses_latest_fingerprinted_note():
+    old = full_job("j1")
+    changed = {**old, "salaryMax": 200}
+    changed["notes"] = [
+        {"body": serialize_score_note(CURRENT_MARKER, VALID_SCORE, job=old)},
+        {"body": serialize_score_note(CURRENT_MARKER, VALID_SCORE, job=changed)},
+    ]
+
+    assert should_score(changed, current_fingerprint=job_fingerprint(changed)) is False
