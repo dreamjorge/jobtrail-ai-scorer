@@ -160,7 +160,7 @@ def main() -> int:
             print(f"backend discovery failed: {error}", file=sys.stderr)
             return 2
     print(f"backend: {base_url} (source={source})", file=sys.stderr)
-    config = merge_resolved_base_url(config, base_url)
+    config = merge_resolved_base_url(config, base_url, source=source)
 
     gateway = JobTrailHTTPClient(config.base_url)
     # Dry-run is deliberately state-free: the automation layer also skips

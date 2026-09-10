@@ -20,7 +20,9 @@ from .discover import (  # noqa: F401  (re-exported on purpose)
     DEFAULT_DOCKER_CONTAINER as DISCOVER_DEFAULT_CONTAINER,
 )
 from .retry import RetryPolicy, classify_retryable, retry_call
-from .scoring import job_fingerprint
+from .scoring import job_fingerprint, parse_score_note as parse_scoring_score_note
+from .models import ScoreResult
+from pydantic import ValidationError
 from .seen_cache import SeenCache
 from .sources import (
     JobSpySourceAdapter,
@@ -246,6 +248,7 @@ class AutomationConfig:
     breaker_alert_cooldown_seconds: float = 3600.0
     breaker_state_path: str = ""
     dry_run: bool = False
+    base_url_source: str = "static"
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "AutomationConfig":
@@ -351,10 +354,12 @@ def resolve_automation_base_url(
 def merge_resolved_base_url(
     config: AutomationConfig,
     base_url: str,
+    *,
+    source: str = "static",
 ) -> AutomationConfig:
     """Return a new ``AutomationConfig`` with ``base_url`` replaced by ``base_url``."""
 
-    overrides = {**config.__dict__, "base_url": base_url}
+    overrides = {**config.__dict__, "base_url": base_url, "base_url_source": source}
     return AutomationConfig(**overrides)
 
 
@@ -572,6 +577,8 @@ class AutomationRun:
     notification_preview: dict[str, Any] | None = None
     changed: int = 0
     rescored: int = 0
+    deduplicated: int | None = None
+    notification_sent: bool | None = None
 
 
 def _format_failure(stage: str, exc: BaseException, *, job_id: str | None = None) -> str:
@@ -709,13 +716,15 @@ class JobTrailAutomation:
                     "--json",
                     "--job-json",
                     "-",
+                    "--job-id",
+                    job_id,
                     "--config",
                     config_path,
                 ],
                 check=True,
                 capture_output=True,
                 input=json.dumps(
-                    payload if payload is not None else {"id": job_id},
+                    {**(payload or {}), "id": job_id},
                     sort_keys=True,
                     separators=(",", ":"),
                 ),
@@ -807,7 +816,7 @@ class JobTrailAutomation:
         failures: list[str] = []
         ids: list[str] = []
         scored_ids: list[str] = []
-        searched = imported = scored = changed = rescored = 0
+        searched = imported = scored = changed = rescored = deduplicated = 0
         changed_payloads: dict[str, dict[str, Any]] = {}
         count_profiles = bool(config.search_profiles)
         profile_counts: dict[str, dict[str, int]] = (
@@ -869,6 +878,7 @@ class JobTrailAutomation:
                                 identity = self._cache_identity(job)
                                 if count_profiles and identity in imported_by_identity:
                                     profile_counts[profile_name]["duplicates"] += 1
+                                    deduplicated += 1
                                     winning_job_id = imported_by_identity[identity]
                                     self._append_profile_provenance(
                                         profiles_by_job_id,
@@ -881,13 +891,26 @@ class JobTrailAutomation:
                                     hours_old=request.hours_old,
                                     failures=failures,
                                 ):
+                                    deduplicated += 1
                                     existing = existing_by_identity.get(identity) if identity else None
                                     current_payload = job.to_import_payload()
-                                    if existing is not None and job_fingerprint(existing) != job_fingerprint(current_payload):
-                                        job_id_str = str(existing["id"])
-                                        if job_id_str not in changed_payloads:
-                                            changed += 1
-                                            changed_payloads[job_id_str] = {**current_payload, "id": job_id_str, "notes": existing.get("notes", [])}
+                                    if existing is not None:
+                                        stored_fingerprint = self._latest_stored_fingerprint(existing.get("notes"))
+                                        changed_job = (
+                                            stored_fingerprint is not None
+                                            and stored_fingerprint != job_fingerprint(current_payload)
+                                        )
+                                        if stored_fingerprint is None:
+                                            changed_job = job_fingerprint(existing) != job_fingerprint(current_payload)
+                                        if changed_job:
+                                            job_id_str = str(existing["id"])
+                                            if job_id_str not in changed_payloads:
+                                                changed += 1
+                                                changed_payloads[job_id_str] = {
+                                                    **current_payload,
+                                                    "id": job_id_str,
+                                                    "notes": existing.get("notes", []),
+                                                }
                                     continue
                                 import_payload = job.to_import_payload()
                                 result = self.gateway.import_job(import_payload)
@@ -940,6 +963,9 @@ class JobTrailAutomation:
         for job_id in scored_ids:
             try:
                 job = self.gateway.get_job(job_id)
+                payload = changed_payloads.get(job_id)
+                if payload is not None:
+                    job = {**job, **{key: value for key, value in payload.items() if key != "notes"}}
                 score = parse_score_note(job.get("notes"))
                 if (
                     score
@@ -973,9 +999,11 @@ class JobTrailAutomation:
             notify_on_failure=config.notify_on_failure,
             base_url=self.base_url,
         )
+        notification_sent = False
         if notification_body is not None:
             try:
                 self.notifier(notification_body)
+                notification_sent = True
             except Exception:
                 failures.append("notify")
         run = AutomationRun(
@@ -987,6 +1015,8 @@ class JobTrailAutomation:
             profile_counts,
             changed=changed,
             rescored=rescored,
+            deduplicated=deduplicated,
+            notification_sent=notification_sent,
         )
         # Step N: record the run outcome on the breaker so it can open
         # after consecutive failures or close after a clean run.
@@ -1080,7 +1110,7 @@ class JobTrailAutomation:
             return
         try:
             self._run_journal(config.run_journal_path, run, started_at=started_at,
-                              finished_at=self._clock(), base_url_source="static")
+                              finished_at=self._clock(), base_url_source=config.base_url_source)
         except Exception:
             pass
 
@@ -1129,8 +1159,9 @@ class JobTrailAutomation:
         """
 
         failures: list[str] = ["breaker:open"]
+        notification_sent = False
         if (config.notify_enabled or config.notify_on_failure) and breaker.try_alert():
-            self._send_breaker_alert(failures=failures)
+            notification_sent = self._send_breaker_alert(failures=failures)
         return AutomationRun(
             0,
             0,
@@ -1138,13 +1169,14 @@ class JobTrailAutomation:
             tuple(failures),
             None,
             {},
+            notification_sent=notification_sent,
         )
 
     def _send_breaker_alert(
         self,
         *,
         failures: list[str],
-    ) -> None:
+    ) -> bool:
         """Best-effort delivery of the breaker-open alert.
 
         Failures here must not crash the run; they are appended to the
@@ -1162,8 +1194,10 @@ class JobTrailAutomation:
         )
         try:
             self.notifier(body)
+            return True
         except Exception:
             failures.append("notify")
+            return False
 
     @staticmethod
     def _preflight_failure_labels(report: Any) -> list[str]:
@@ -1196,7 +1230,8 @@ class JobTrailAutomation:
         """
 
         run = AutomationRun(0, 0, 0, failures, None, {}, dry_run,
-                             {"searched": 0, "imported": 0, "scored": 0, "notified": 0} if dry_run else {})
+                             {"searched": 0, "imported": 0, "scored": 0, "notified": 0} if dry_run else {},
+                             notification_sent=False)
         if breaker is not None and failures:
             breaker.record_failure()
         return run
@@ -1271,6 +1306,22 @@ class JobTrailAutomation:
             profiles.append(profile_name)
 
     # --- seen-cache helpers -----------------------------------------------
+
+    @staticmethod
+    def _latest_stored_fingerprint(notes: Any) -> str | None:
+        if not isinstance(notes, list):
+            return None
+        for note in reversed(notes):
+            body = note.get("body") if isinstance(note, dict) else None
+            payload = parse_scoring_score_note(body) if isinstance(body, str) else None
+            if payload is None or not isinstance(payload.get("input_fingerprint"), str):
+                continue
+            try:
+                ScoreResult.model_validate({key: value for key, value in payload.items() if key not in {"fingerprint_version", "input_fingerprint"}})
+            except ValidationError:
+                continue
+            return payload["input_fingerprint"]
+        return None
 
     def _cache_identity(
         self, job: NormalizedJob | Mapping[str, Any]

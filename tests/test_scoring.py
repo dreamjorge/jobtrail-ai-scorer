@@ -297,3 +297,13 @@ def test_score_history_uses_latest_fingerprinted_note():
     ]
 
     assert should_score(changed, current_fingerprint=job_fingerprint(changed)) is False
+
+
+def test_malformed_newer_score_note_does_not_hide_valid_older_score():
+    job = full_job("j1")
+    job["notes"] = [
+        {"body": serialize_score_note(CURRENT_MARKER, VALID_SCORE, job=job)},
+        {"body": CURRENT_MARKER + "\\nnot-json"},
+    ]
+
+    assert should_score(job, current_fingerprint=job_fingerprint(job)) is False

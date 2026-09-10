@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import json
+import re
 import unicodedata
 from collections.abc import Mapping
 from typing import Any, Protocol
@@ -205,8 +206,13 @@ def score_jobs(
 
     for candidate in candidates:
         candidate_id = candidate.get("id")
-        if job_payload is not None and not isinstance(candidate_id, str):
-            candidate_id = job_id
+        if job_payload is not None:
+            if job_id is not None and isinstance(candidate_id, str) and candidate_id != job_id:
+                failed += 1
+                outcomes.append(ScoreOutcome("<unknown>", "failed", "ambiguous_job_id"))
+                continue
+            if not isinstance(candidate_id, str):
+                candidate_id = job_id
         if not isinstance(candidate_id, str) or not candidate_id:
             failed += 1
             outcomes.append(ScoreOutcome("<unknown>", "failed", "invalid_job_id"))
@@ -291,20 +297,36 @@ def _contains_score_marker(
         if isinstance(body, str) and LEGACY_MARKER in body:
             return True
 
-    # Notes are ordered oldest to newest; only the latest current-marker note
-    # determines whether this fingerprint has already been scored.
+    # Walk backwards, ignoring malformed or foreign fingerprinted notes. This
+    # lets a valid legacy (pre-fingerprint) score remain effective even when a
+    # newer unrelated note was appended. A malformed marker remains a marker
+    # only when no older valid score exists, preserving legacy deduplication.
+    saw_malformed = False
     for note in reversed(notes):
         body = note.get("body") if isinstance(note, dict) else None
         if not isinstance(body, str) or marker not in body:
             continue
         payload = parse_score_note(body, marker=marker)
-        if payload is None or current_fingerprint is None:
-            return True
+        if payload is None:
+            saw_malformed = True
+            continue
+        try:
+            _validate_score_payload(payload)
+        except ValidationError:
+            saw_malformed = True
+            continue
         recorded_fingerprint = payload.get("input_fingerprint")
-        if not isinstance(recorded_fingerprint, str):
+        if recorded_fingerprint is None:
             return True
-        return recorded_fingerprint == current_fingerprint
-    return False
+        if isinstance(recorded_fingerprint, str) and current_fingerprint is not None:
+            return recorded_fingerprint == current_fingerprint
+    return saw_malformed
+
+
+def _validate_score_payload(payload: Mapping[str, Any]) -> ScoreResult:
+    score_payload = {key: value for key, value in payload.items()
+                     if key not in {"fingerprint_version", "input_fingerprint"}}
+    return ScoreResult.model_validate(score_payload)
 
 
 def _validated_outcome(job_id: str, score: ScoreResult) -> ScoreOutcome:
@@ -317,8 +339,17 @@ def _validated_outcome(job_id: str, score: ScoreResult) -> ScoreOutcome:
     )
 
 
+_SENSITIVE_OUTPUT = re.compile(
+    r"(?i)(?:https?://|ftp://)[^\s<>\"']+|"
+    r"(?:api[_-]?key|token|password|secret|credential)\s*[=:]\s*[^\s,;]+"
+)
+
+
 def _bound_string(value: str) -> str:
-    return value[:_MAX_OUTPUT_STRING]
+    # Dry-run JSON is an external boundary: never serialize provider prose,
+    # source failures, URLs, or credential-like assignments verbatim.
+    scrubbed = _SENSITIVE_OUTPUT.sub("[redacted]", str(value))
+    return scrubbed[:_MAX_OUTPUT_STRING]
 
 
 def _bound_list(values: tuple[str, ...]) -> list[str]:
