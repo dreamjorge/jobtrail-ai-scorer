@@ -216,7 +216,10 @@ def _jobtrail_api_probe(base_url: str, *, timeout_seconds: float) -> Callable[[]
 
 
 def _jobspy_search_probe(
-    base_url: str, *, timeout_seconds: float
+    base_url: str,
+    *,
+    timeout_seconds: float,
+    sites: tuple[str, ...] = ("linkedin",),
 ) -> Callable[[], None]:
     """Build the ``jobspy_search`` probe.
 
@@ -244,7 +247,7 @@ def _jobspy_search_probe(
     adapter = JobSpySourceAdapter(gateway)
 
     request = SourceSearchRequest(
-        sites=("linkedin",),
+        sites=sites,
         search_term="preflight",
         location="remote",
         results_wanted=1,
@@ -321,6 +324,19 @@ def _whatsapp_probe(whatsapp_command: str) -> Callable[[], None]:
     return probe
 
 
+def _preflight_sites(config: AutomationConfig) -> tuple[str, ...]:
+    """Return only sources active in the scheduled search configuration."""
+
+    profiles = getattr(config, "search_profiles", ()) or ()
+    profile_sites = tuple(
+        site
+        for profile in profiles
+        for site in (getattr(profile, "sites", ()) or ())
+    )
+    sites = profile_sites or tuple(getattr(config, "sites", ()) or ())
+    return sites or ("linkedin",)
+
+
 def _load_scorer_config(config: AutomationConfig) -> Any:
     """Load the configured scorer settings when the launcher supplies a path."""
 
@@ -358,7 +374,11 @@ def default_preflight_checks(
         ),
         PreflightCheck(
             name="jobspy_search",
-            probe=_jobspy_search_probe(config.base_url, timeout_seconds=5.0),
+            probe=_jobspy_search_probe(
+                config.base_url,
+                timeout_seconds=5.0,
+                sites=_preflight_sites(config),
+            ),
             timeout_seconds=5.0,
             required=True,
         ),
