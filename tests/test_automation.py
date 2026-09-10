@@ -468,6 +468,91 @@ def test_automation_can_import_normalized_jobs_from_source_adapter():
     assert result.failures == ()
 
 
+def test_automation_cached_unchanged_job_is_skipped(tmp_path):
+    class CachedAdapter:
+        name = "custom"
+        def search(self, request):
+            return [NormalizedJob(source="custom", source_job_id="cached-1", title="Same")]
+
+    class ListedGateway(FakeJobTrail):
+        def list_jobs(self):
+            return [{"id": "existing", "source": "custom", "sourceJobId": "cached-1", "position": "Same"}]
+
+    cache = SeenCache(tmp_path / "seen.json")
+    cache.mark_seen("custom", "cached-1")
+    gateway = ListedGateway()
+    run = JobSearchAutomation(gateway, seen_cache=cache, source_adapters=(CachedAdapter(),)).run(
+        config=AutomationConfig(scorer_config_path="safe.yaml", locations=("remote",))
+    )
+    assert gateway.imported == []
+    assert run.changed == run.rescored == 0
+
+
+def test_automation_changed_cached_job_is_rescored_without_import(tmp_path):
+    class ChangedAdapter:
+        name = "custom"
+        def search(self, request):
+            return [NormalizedJob(source="custom", source_job_id="cached-1", title="Changed", description="new")]
+
+    class ListedGateway(FakeJobTrail):
+        def list_jobs(self):
+            return [self.jobs["existing"]]
+
+    class AppendScorer:
+        def __init__(self, gateway):
+            self.gateway, self.calls = gateway, []
+        def __call__(self, job_id, config_path, payload=None):
+            self.calls.append((job_id, payload))
+            self.gateway.jobs[job_id]["notes"].append({"body": '[AI_JOB_SCORE_V1]\\n{"score": 95}'})
+
+    gateway = ListedGateway()
+    gateway.jobs["existing"] = {"id": "existing", "source": "custom", "sourceJobId": "cached-1",
+                                 "position": "Old", "description": "old", "notes": [{"body": "old note"}]}
+    cache = SeenCache(tmp_path / "seen.json")
+    cache.mark_seen("custom", "cached-1")
+    scorer = AppendScorer(gateway)
+    run = JobSearchAutomation(gateway, scorer=scorer, seen_cache=cache,
+                               source_adapters=(ChangedAdapter(),)).run(
+        config=AutomationConfig(scorer_config_path="safe.yaml", locations=("remote",))
+    )
+    assert gateway.imported == []
+    assert run.changed == run.rescored == 1
+    assert scorer.calls[0][0] == "existing"
+    assert scorer.calls[0][1]["position"] == "Changed"
+    assert len(gateway.jobs["existing"]["notes"]) == 2
+
+
+def test_automation_list_jobs_unavailable_preserves_cache_fallback(tmp_path):
+    class CachedAdapter:
+        name = "custom"
+        def search(self, request):
+            return [NormalizedJob(source="custom", source_job_id="cached-1", title="Same")]
+
+    cache = SeenCache(tmp_path / "seen.json")
+    cache.mark_seen("custom", "cached-1")
+    class UnavailableGateway(FakeJobTrail):
+        def list_jobs(self):
+            raise RuntimeError("backend unavailable")
+
+    gateway = UnavailableGateway()
+    run = JobSearchAutomation(gateway, seen_cache=cache, source_adapters=(CachedAdapter(),)).run(
+        config=AutomationConfig(scorer_config_path="safe.yaml", locations=("remote",))
+    )
+    assert gateway.imported == []
+    assert run.changed == run.rescored == 0
+    assert any("changed-jobs:list-unavailable" in failure for failure in run.failures)
+
+
+def test_automation_new_job_flow_counters_remain_unchanged():
+    gateway = FakeJobTrail()
+    scorer = FakeScorer()
+    scorer.jobs = gateway.jobs
+    run = JobSearchAutomation(gateway, scorer=scorer).run(
+        config=AutomationConfig(scorer_config_path="safe.yaml")
+    )
+    assert (run.imported, run.scored, run.changed, run.rescored) == (1, 1, 0, 0)
+
+
 def test_automation_seen_cache_uses_normalized_job_identity(tmp_path):
     class PayloadAliasJob(NormalizedJob):
         def to_import_payload(self):
