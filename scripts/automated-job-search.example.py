@@ -17,6 +17,7 @@ discovery and uses the URL verbatim (highest priority).
 """
 
 import argparse
+import inspect
 import os
 import sys
 
@@ -29,6 +30,7 @@ from jobtrail_ai_scorer.automation import (
     merge_resolved_base_url,
     resolve_automation_base_url,
 )
+from jobtrail_ai_scorer.preflight import run_preflight
 from jobtrail_ai_scorer.seen_cache import DEFAULT_SEEN_CACHE_PATH, SeenCache
 
 
@@ -158,7 +160,7 @@ def main() -> int:
             print(f"backend discovery failed: {error}", file=sys.stderr)
             return 2
     print(f"backend: {base_url} (source={source})", file=sys.stderr)
-    config = merge_resolved_base_url(config, base_url)
+    config = merge_resolved_base_url(config, base_url, source=source)
 
     gateway = JobTrailHTTPClient(config.base_url)
     # Dry-run is deliberately state-free: the automation layer also skips
@@ -166,9 +168,15 @@ def main() -> int:
     # the seen cache (construction can create its parent directory).
     seen_cache = None if config.dry_run else _build_seen_cache(args)
     try:
-        result = JobSearchAutomation(
-            gateway, seen_cache=seen_cache, ats_boards=config.ats_boards
-        ).run(config=config)
+        automation_kwargs = {
+            "seen_cache": seen_cache,
+            "ats_boards": config.ats_boards,
+        }
+        if "preflight_runner" in inspect.signature(JobSearchAutomation).parameters:
+            automation_kwargs["preflight_runner"] = (
+                None if config.dry_run else run_preflight
+            )
+        result = JobSearchAutomation(gateway, **automation_kwargs).run(config=config)
     finally:
         gateway.close()
     print(

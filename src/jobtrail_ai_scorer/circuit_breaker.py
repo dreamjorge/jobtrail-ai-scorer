@@ -48,10 +48,12 @@ storage failures never crash the calling automation.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
+import os
 import time
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Iterator, Mapping
 
 from ._atomic_json import read_json, write_json_atomic
 
@@ -171,19 +173,21 @@ class CircuitBreaker:
         :meth:`try_alert`.
         """
 
-        new_count = self._state.consecutive_failures + 1
-        opened_at = self._state.opened_at
-        if new_count >= self._config.failure_threshold:
-            # Restarts the cooldown on every failure once the breaker is
-            # already OPEN, matching the "stay open while failures keep
-            # coming" semantic.
-            opened_at = self._clock()
-        self._state = dataclasses.replace(
-            self._state,
-            consecutive_failures=new_count,
-            opened_at=opened_at,
-        )
-        self._save()
+        with self._storage_lock():
+            self._state = self._load()
+            new_count = self._state.consecutive_failures + 1
+            opened_at = self._state.opened_at
+            if new_count >= self._config.failure_threshold:
+                # Restarts the cooldown on every failure once the breaker is
+                # already OPEN, matching the "stay open while failures keep
+                # coming" semantic.
+                opened_at = self._clock()
+            self._state = dataclasses.replace(
+                self._state,
+                consecutive_failures=new_count,
+                opened_at=opened_at,
+            )
+            self._save()
 
     def record_success(self) -> None:
         """Record a success: close the breaker and reset the alert timer.
@@ -194,13 +198,15 @@ class CircuitBreaker:
         is cleared so the breaker is unambiguously CLOSED.
         """
 
-        self._state = BreakerState(
-            consecutive_failures=0,
-            opened_at=None,
-            last_alert_at=None,
-            schema_version=self._state.schema_version,
-        )
-        self._save()
+        with self._storage_lock():
+            self._state = self._load()
+            self._state = BreakerState(
+                consecutive_failures=0,
+                opened_at=None,
+                last_alert_at=None,
+                schema_version=self._state.schema_version,
+            )
+            self._save()
 
     def try_alert(self) -> bool:
         """Return ``True`` iff an alert should be emitted right now.
@@ -212,21 +218,54 @@ class CircuitBreaker:
         failed persistence must not crash the automation.
         """
 
-        now = self._clock()
-        last = self._state.last_alert_at
-        if last is not None and (now - last) < self._config.alert_cooldown_seconds:
-            return False
-        self._state = dataclasses.replace(self._state, last_alert_at=now)
-        self._save()
-        return True
+        with self._storage_lock():
+            self._state = self._load()
+            now = self._clock()
+            last = self._state.last_alert_at
+            if last is not None and (now - last) < self._config.alert_cooldown_seconds:
+                return False
+            self._state = dataclasses.replace(self._state, last_alert_at=now)
+            self._save()
+            return True
 
     # --- persistence ---------------------------------------------------------
 
     def _save(self) -> None:
-        """Persist ``self._state`` to ``config.state_path`` atomically."""
+        """Persist state best-effort; storage failure must not abort automation."""
 
         payload = dataclasses.asdict(self._state)
-        write_json_atomic(self._config.state_path, payload)
+        try:
+            write_json_atomic(self._config.state_path, payload)
+        except OSError:
+            pass
+
+    @contextlib.contextmanager
+    def _storage_lock(self) -> Iterator[None]:
+        """Hold one stable sibling lock across reload, mutation, and save."""
+
+        fd: int | None = None
+        try:
+            lock_path = Path(self._config.state_path).with_name(
+                Path(self._config.state_path).name + ".lock"
+            )
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+            import fcntl
+
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        except OSError:
+            if fd is not None:
+                with contextlib.suppress(OSError):
+                    os.close(fd)
+            yield
+            return
+        try:
+            yield
+        finally:
+            with contextlib.suppress(OSError):
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            with contextlib.suppress(OSError):
+                os.close(fd)
 
     def _load(self) -> BreakerState:
         """Load the breaker state from disk; degrade to defaults on failure."""

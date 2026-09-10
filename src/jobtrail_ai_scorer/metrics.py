@@ -111,7 +111,7 @@ def compute_metrics(
         if finished is not None:
             (failure_times if failed else success_times).append(finished)
         _merge_counts(sources, run.get("source_counts"), SourceStats)
-        _merge_counts(profiles, run.get("profile_counts"), ProfileStats)
+        _merge_counts(profiles, run.get("profile_counts"), ProfileStats, duplicates_key="duplicates")
         _merge_run_dimension(sources, run.get("source"), run)
         _merge_run_dimension(profiles, run.get("searchProfile", run.get("profile")), run)
 
@@ -126,9 +126,12 @@ def compute_metrics(
         missing.add("source_counts")
     if valid_seen:
         # Seen entries are authoritative for imported-by-source counts.
+        imported_by_source: dict[str, int] = {}
         for entry in valid_seen:
             source = entry["source"]
-            sources.setdefault(source, {"imported": 0})["imported"] = sources.get(source, {}).get("imported", 0) + 1
+            imported_by_source[source] = imported_by_source.get(source, 0) + 1
+        for source, count in imported_by_source.items():
+            sources.setdefault(source, {})["imported"] = count
 
     bins = {f"{start}-{start + 9}": 0 for start in range(0, 90, 10)}
     bins["90-100"] = 0
@@ -199,7 +202,7 @@ def _merge_run_dimension(target: dict[str, dict[str, int]], name: Any, run: dict
             bucket[key] = bucket.get(key, 0) + int(value)
 
 
-def _merge_counts(target: dict[str, dict[str, int]], value: Any, _kind: Any) -> None:
+def _merge_counts(target: dict[str, dict[str, int]], value: Any, _kind: Any, *, duplicates_key: str = "deduplicated") -> None:
     if not isinstance(value, dict):
         return
     for name, counts in value.items():
@@ -207,8 +210,9 @@ def _merge_counts(target: dict[str, dict[str, int]], value: Any, _kind: Any) -> 
             continue
         bucket = target.setdefault(name, {})
         for key in ("searched", "imported", "deduplicated", "scored"):
-            if isinstance(counts.get(key), (int, float)) and not isinstance(counts[key], bool):
-                bucket[key] = bucket.get(key, 0) + int(counts[key])
+            source_key = duplicates_key if key == "deduplicated" else key
+            if isinstance(counts.get(source_key), (int, float)) and not isinstance(counts[source_key], bool):
+                bucket[key] = bucket.get(key, 0) + int(counts[source_key])
 
 
 def _score(job: dict[str, Any]) -> int | None:
@@ -220,10 +224,12 @@ def _score(job: dict[str, Any]) -> int | None:
             body = note.get("body") if isinstance(note, dict) else None
             if isinstance(body, str) and "[AI_JOB_SCORE_V1]" in body:
                 try:
-                    value = json.loads(body.split("[AI_JOB_SCORE_V1]", 1)[1].strip()).get("score")
+                    payload = json.loads(body.split("[AI_JOB_SCORE_V1]", 1)[1].strip())
                 except (ValueError, TypeError, json.JSONDecodeError):
-                    pass
-                break
+                    continue
+                if isinstance(payload, dict) and isinstance(payload.get("score"), (int, float)):
+                    value = payload["score"]
+                    break
     return int(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
 
 

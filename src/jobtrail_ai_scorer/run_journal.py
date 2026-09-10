@@ -33,7 +33,9 @@ period filter ``[since, until)`` against ``started_at``.
 from __future__ import annotations
 
 import contextlib
+import itertools
 import json
+import math
 import os
 from datetime import datetime
 from pathlib import Path
@@ -61,6 +63,7 @@ _BREAKER_FAILURE_PREFIX = "breaker:"
 
 # Stage prefix used to label a preflight-aborted short-circuit run.
 _PREFLIGHT_FAILURE_PREFIX = "preflight:unavailable:"
+_TMP_COUNTER = itertools.count()
 
 
 def record_run(
@@ -149,15 +152,17 @@ def _line_for_run(
     scored = int(getattr(run, "scored", 0) or 0)
     changed = int(getattr(run, "changed", 0) or 0)
     rescored = int(getattr(run, "rescored", 0) or 0)
-    profile_counts = getattr(run, "profile_counts", None) or {}
+    profile_counts = _normalize_profile_counts(getattr(run, "profile_counts", None))
 
-    deduplicated = _deduplicated(
-        searched=searched,
-        imported=imported,
-        profile_counts=profile_counts,
+    explicit_deduplicated = getattr(run, "deduplicated", None)
+    deduplicated = (
+        max(0, explicit_deduplicated)
+        if isinstance(explicit_deduplicated, int) and not isinstance(explicit_deduplicated, bool)
+        else _deduplicated(searched=searched, imported=imported, profile_counts=profile_counts)
     )
     scored_failed = sum(1 for f in failures if f.startswith(_SCORE_FAILURE_PREFIX))
-    notified = bool(selected) or bool(failures)
+    notification_sent = getattr(run, "notification_sent", None)
+    notified = notification_sent if isinstance(notification_sent, bool) else bool(selected) or bool(failures)
     notification_kind = _classify_notification_kind(
         selected=selected, failures=failures
     )
@@ -179,6 +184,7 @@ def _line_for_run(
         "notification_kind": notification_kind,
         "failures": failures,
         "base_url_source": str(base_url_source),
+        **({"profile_counts": profile_counts} if profile_counts else {}),
     }
 
 
@@ -187,6 +193,25 @@ def _failure_list(run: Any) -> list[str]:
 
     raw = getattr(run, "failures", ()) or ()
     return [str(label) for label in raw]
+
+
+def _normalize_profile_counts(value: Any) -> dict[str, dict[str, int]]:
+    """Return a bounded, JSON-safe profile-count mapping."""
+    if not isinstance(value, dict):
+        return {}
+    normalized: dict[str, dict[str, int]] = {}
+    for raw_name, raw_counts in list(value.items())[:100]:
+        if not isinstance(raw_name, str) or not raw_name.strip() or not isinstance(raw_counts, dict):
+            continue
+        counts: dict[str, int] = {}
+        for key in ("searched", "imported", "duplicates", "deduplicated", "failures", "scored"):
+            number = raw_counts.get(key)
+            if (isinstance(number, (int, float)) and not isinstance(number, bool)
+                    and (isinstance(number, int) or math.isfinite(number))):
+                counts[key] = max(0, min(int(number), 1_000_000_000))
+        if counts:
+            normalized[raw_name[:200]] = counts
+    return normalized
 
 
 def _deduplicated(
@@ -280,7 +305,7 @@ def _within_period(
 
     started_at = parsed.get("started_at")
     if not isinstance(started_at, (int, float)) or isinstance(started_at, bool):
-        return True  # not a number we can compare; let downstream decide
+        return since is None and until is None
     if since is not None and started_at < since:
         return False
     if until is not None and started_at >= until:
@@ -308,7 +333,8 @@ def _append_jsonl_line(path: str | os.PathLike[str], line: str) -> None:
         try:
             existing = target.read_text(encoding="utf-8")
         except OSError:
-            existing = ""
+            # Never replace an existing journal whose contents cannot be read.
+            return
     new_content = existing + ("" if existing.endswith("\n") or not existing else "\n") + line + "\n"
     tmp_path = _tmp_path(target)
     fd = os.open(str(tmp_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, DEFAULT_FILE_MODE)
@@ -333,11 +359,8 @@ def _tmp_path(path: Path) -> Path:
     helper works for callers that pass extension-less file names.
     """
 
-    import itertools
-
-    counter = itertools.count()
     suffix = path.suffix or ".jsonl"
-    return path.with_name(f"{path.stem}.tmp.{os.getpid()}.{next(counter)}{suffix}")
+    return path.with_name(f"{path.stem}.tmp.{os.getpid()}.{next(_TMP_COUNTER)}{suffix}")
 
 
 def _enforce_mode(path: Path, mode: int = DEFAULT_FILE_MODE) -> None:

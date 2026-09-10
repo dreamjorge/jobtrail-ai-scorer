@@ -39,6 +39,7 @@ import concurrent.futures
 import dataclasses
 import os
 import subprocess
+from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 
 import httpx
@@ -215,7 +216,10 @@ def _jobtrail_api_probe(base_url: str, *, timeout_seconds: float) -> Callable[[]
 
 
 def _jobspy_search_probe(
-    base_url: str, *, timeout_seconds: float
+    base_url: str,
+    *,
+    timeout_seconds: float,
+    sites: tuple[str, ...] = ("linkedin",),
 ) -> Callable[[], None]:
     """Build the ``jobspy_search`` probe.
 
@@ -243,7 +247,7 @@ def _jobspy_search_probe(
     adapter = JobSpySourceAdapter(gateway)
 
     request = SourceSearchRequest(
-        sites=("linkedin",),
+        sites=sites,
         search_term="preflight",
         location="remote",
         results_wanted=1,
@@ -320,6 +324,35 @@ def _whatsapp_probe(whatsapp_command: str) -> Callable[[], None]:
     return probe
 
 
+def _preflight_sites(config: AutomationConfig) -> tuple[str, ...]:
+    """Return only sources active in the scheduled search configuration."""
+
+    profiles = getattr(config, "search_profiles", ()) or ()
+    profile_sites = tuple(
+        site
+        for profile in profiles
+        for site in (getattr(profile, "sites", ()) or ())
+    )
+    sites = profile_sites or tuple(getattr(config, "sites", ()) or ())
+    return sites or ("linkedin",)
+
+
+def _load_scorer_config(config: AutomationConfig) -> Any:
+    """Load the configured scorer settings when the launcher supplies a path."""
+
+    if hasattr(config, "provider"):
+        return config
+    path = str(getattr(config, "scorer_config_path", "") or "").strip()
+    if path:
+        try:
+            from .config import load_config
+
+            return load_config(Path(path))
+        except Exception:
+            pass
+    return config
+
+
 def default_preflight_checks(
     config: AutomationConfig,
 ) -> tuple[PreflightCheck, ...]:
@@ -335,31 +368,35 @@ def default_preflight_checks(
     checks: list[PreflightCheck] = [
         PreflightCheck(
             name="jobtrail_api",
-            probe=_jobtrail_api_probe(
-                config.base_url, timeout_seconds=2.0
-            ),
+            probe=_jobtrail_api_probe(config.base_url, timeout_seconds=2.0),
             timeout_seconds=2.0,
             required=True,
         ),
         PreflightCheck(
             name="jobspy_search",
             probe=_jobspy_search_probe(
-                config.base_url, timeout_seconds=5.0
+                config.base_url,
+                timeout_seconds=5.0,
+                sites=_preflight_sites(config),
             ),
             timeout_seconds=5.0,
             required=True,
         ),
-        PreflightCheck(
-            name="hermes_provider",
-            probe=_hermes_provider_probe(
-                _config_attr(config, "hermes_executable", "hermes"),
-                _config_attr(config, "hermes_profile", "default"),
-                timeout_seconds=2.0,
-            ),
-            timeout_seconds=2.0,
-            required=True,
-        ),
     ]
+    scorer_config = _load_scorer_config(config)
+    if _config_attr(scorer_config, "provider", "hermes") == "hermes":
+        checks.append(
+            PreflightCheck(
+                name="hermes_provider",
+                probe=_hermes_provider_probe(
+                    _config_attr(scorer_config, "hermes_executable", "hermes"),
+                    _config_attr(scorer_config, "hermes_profile", "default"),
+                    timeout_seconds=2.0,
+                ),
+                timeout_seconds=2.0,
+                required=True,
+            )
+        )
     if config.notify_enabled:
         checks.append(
             PreflightCheck(
