@@ -20,6 +20,7 @@ from .discover import (  # noqa: F401  (re-exported on purpose)
     DEFAULT_DOCKER_CONTAINER as DISCOVER_DEFAULT_CONTAINER,
 )
 from .retry import RetryPolicy, classify_retryable, retry_call
+from .scoring import job_fingerprint
 from .seen_cache import SeenCache
 from .sources import (
     JobSpySourceAdapter,
@@ -479,6 +480,8 @@ class AutomationGateway(Protocol):
     def search(self, payload: dict[str, Any]) -> list[dict[str, Any]]: ...
     def import_job(self, payload: dict[str, Any]) -> dict[str, Any]: ...
     def get_job(self, job_id: str) -> dict[str, Any]: ...
+    # Optional for backwards-compatible fakes and older gateways.
+    def list_jobs(self) -> list[dict[str, Any]]: ...
 
 
 class JobTrailHTTPClient:
@@ -530,6 +533,18 @@ class JobTrailHTTPClient:
         result = self._post_once("/api/discover/import", payload)
         return result if isinstance(result, dict) else {"id": result}
 
+    def list_jobs(self) -> list[dict[str, Any]]:
+        def _do_get() -> Any:
+            response = self._client.get("/api/jobs")
+            response.raise_for_status()
+            return response.json()
+
+        result = retry_call(_do_get, policy=self._retry_policy, sleep=self._retry_sleep,
+                            label="GET /api/jobs")
+        if not isinstance(result, list):
+            raise ValueError("JobTrail API returned an invalid jobs collection")
+        return [job for job in result if isinstance(job, dict)]
+
     def get_job(self, job_id: str) -> dict[str, Any]:
         def _do_get() -> Any:
             response = self._client.get(f"/api/jobs/{quote(job_id, safe='')}")
@@ -555,6 +570,8 @@ class AutomationRun:
     dry_run: bool = False
     planned_operations: dict[str, int] = field(default_factory=dict)
     notification_preview: dict[str, Any] | None = None
+    changed: int = 0
+    rescored: int = 0
 
 
 def _format_failure(stage: str, exc: BaseException, *, job_id: str | None = None) -> str:
@@ -720,7 +737,17 @@ class JobTrailAutomation:
             ):
                 raise ValueError("scorer dry-run output must be a score mapping")
             return value
-        subprocess.run([*command, "--config", config_path, "--job-id", job_id, "--force", "--base-url", self.base_url], check=True)
+        if payload is None:
+            subprocess.run(
+                [*command, "--config", config_path, "--job-id", job_id,
+                 "--force", "--base-url", self.base_url],
+                check=True,
+            )
+        else:
+            args = [*command, "--config", config_path, "--base-url", self.base_url,
+                    "--job-json", "-"]
+            input_data = json.dumps({**payload, "id": job_id}, sort_keys=True, separators=(",", ":"))
+            subprocess.run(args, check=True, input=input_data, text=True)
         return None
 
     def _notify(self, message: str) -> None:
@@ -780,7 +807,8 @@ class JobTrailAutomation:
         failures: list[str] = []
         ids: list[str] = []
         scored_ids: list[str] = []
-        searched = imported = scored = 0
+        searched = imported = scored = changed = rescored = 0
+        changed_payloads: dict[str, dict[str, Any]] = {}
         count_profiles = bool(config.search_profiles)
         profile_counts: dict[str, dict[str, int]] = (
             {
@@ -797,6 +825,21 @@ class JobTrailAutomation:
         )
         imported_by_identity: dict[tuple[str, str], str] = {}
         profiles_by_job_id: dict[str, list[str]] = {}
+        existing_by_identity: dict[tuple[str, str], dict[str, Any]] = {}
+        if self.seen_cache is not None:
+            list_jobs = getattr(self.gateway, "list_jobs", None)
+            if callable(list_jobs):
+                try:
+                    for existing in list_jobs():
+                        identity = self._normalized_identity(existing.get("source"), existing.get("sourceJobId"))
+                        if identity is not None and isinstance(existing.get("id"), str):
+                            existing_by_identity[identity] = existing
+                except Exception as exc:
+                    # A legacy backend may not expose GET /api/jobs at all;
+                    # preserve the historical cache-only behavior for a 404.
+                    if getattr(getattr(exc, "response", None), "status_code", None) != 404:
+                        failures.append(f"changed-jobs:list-unavailable:{type(exc).__name__}")
+            # Older gateways without list_jobs retain the SeenCache-only path.
         for adapter in self.source_adapters:
             requests = (
                 ats_source_search_requests(config)
@@ -838,6 +881,13 @@ class JobTrailAutomation:
                                     hours_old=request.hours_old,
                                     failures=failures,
                                 ):
+                                    existing = existing_by_identity.get(identity) if identity else None
+                                    current_payload = job.to_import_payload()
+                                    if existing is not None and job_fingerprint(existing) != job_fingerprint(current_payload):
+                                        job_id_str = str(existing["id"])
+                                        if job_id_str not in changed_payloads:
+                                            changed += 1
+                                            changed_payloads[job_id_str] = {**current_payload, "id": job_id_str, "notes": existing.get("notes", [])}
                                     continue
                                 import_payload = job.to_import_payload()
                                 result = self.gateway.import_job(import_payload)
@@ -864,18 +914,23 @@ class JobTrailAutomation:
                     failures.append(_format_failure("search", exc))
                     if count_profiles:
                         profile_counts[profile_name]["failures"] += 1
-        for job_id in ids[: config.max_score]:
+        score_jobs = [(job_id, None) for job_id in ids]
+        score_jobs.extend((job_id, payload) for job_id, payload in changed_payloads.items())
+        for job_id, payload in score_jobs[: config.max_score]:
             try:
                 retry_call(
-                    self.scorer,
+                    self._invoke_scorer,
                     job_id,
                     config.scorer_config_path,
+                    payload,
                     policy=self._scorer_retry_policy,
                     sleep=self._scorer_retry_sleep,
                     label=f"scorer score {job_id}",
                 )
                 scored_ids.append(job_id)
                 scored += 1
+                if payload is not None:
+                    rescored += 1
             except Exception as exc:
                 failures.append(_format_failure("score", exc, job_id=job_id))
         best = None
@@ -930,6 +985,8 @@ class JobTrailAutomation:
             tuple(failures),
             best,
             profile_counts,
+            changed=changed,
+            rescored=rescored,
         )
         # Step N: record the run outcome on the breaker so it can open
         # after consecutive failures or close after a clean run.

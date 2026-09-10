@@ -13,14 +13,29 @@ def test_period_boundaries_and_journal_aggregation():
     view = compute_metrics(
         runs=[
             {"started_at": ts(7), "searched": 2, "imported": 1, "deduplicated": 1,
-             "scored": 1, "scored_failed": 0, "notified": True, "finished_at": ts(7, 1)},
+             "scored": 1, "changed": 3, "rescored": 2, "scored_failed": 0,
+             "notified": True, "finished_at": ts(7, 1)},
             {"started_at": ts(1), "searched": 9, "finished_at": ts(1, 1)},
         ], period="7d", now=ts(8, 12), seen_entries=[{"source": "board", "first_seen": ts(7)}],
     )
     assert view.searched == 2
     assert view.imported == 1
     assert view.notifications == 1
+    assert view.changed == 3
+    assert view.rescored == 2
+    assert view.to_dict()["changed"] == 3
+    assert view.to_dict()["rescored"] == 2
     assert view.last_success_at == ts(7, 1)
+
+
+def test_legacy_journal_lines_default_new_totals_to_zero():
+    view = compute_metrics(
+        runs=[{"started_at": ts(7), "searched": 1}],
+        period="today",
+        now=ts(7, 12),
+    )
+    assert view.changed == 0
+    assert view.rescored == 0
 
 
 def test_today_is_utc_and_rejects_invalid_period_or_future_now():

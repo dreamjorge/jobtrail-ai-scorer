@@ -147,6 +147,8 @@ def _line_for_run(
     searched = int(getattr(run, "searched", 0) or 0)
     imported = int(getattr(run, "imported", 0) or 0)
     scored = int(getattr(run, "scored", 0) or 0)
+    changed = int(getattr(run, "changed", 0) or 0)
+    rescored = int(getattr(run, "rescored", 0) or 0)
     profile_counts = getattr(run, "profile_counts", None) or {}
 
     deduplicated = _deduplicated(
@@ -170,6 +172,8 @@ def _line_for_run(
         "imported": imported,
         "deduplicated": deduplicated,
         "scored": scored,
+        "changed": changed,
+        "rescored": rescored,
         "scored_failed": scored_failed,
         "notified": notified,
         "notification_kind": notification_kind,

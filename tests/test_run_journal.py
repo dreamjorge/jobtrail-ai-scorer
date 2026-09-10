@@ -22,6 +22,8 @@ def _run(
     searched: int = 0,
     imported: int = 0,
     scored: int = 0,
+    changed: int = 0,
+    rescored: int = 0,
     failures: tuple[str, ...] = (),
     profile_counts: dict[str, dict[str, int]] | None = None,
     selected: dict[str, Any] | None = None,
@@ -30,6 +32,8 @@ def _run(
         searched=searched,
         imported=imported,
         scored=scored,
+        changed=changed,
+        rescored=rescored,
         failures=failures,
         selected=selected,
         profile_counts=profile_counts or {},
@@ -59,8 +63,8 @@ def test_append_has_expected_schema_and_derived_fields(tmp_path: Path) -> None:
     line = _lines(path)[0]
     assert set(line) == {
         "schema_version", "run_id", "started_at", "finished_at", "searched",
-        "imported", "deduplicated", "scored", "scored_failed", "notified",
-        "notification_kind", "failures", "base_url_source",
+        "imported", "deduplicated", "scored", "changed", "rescored", "scored_failed",
+        "notified", "notification_kind", "failures", "base_url_source",
     }
     assert line["schema_version"] == SCHEMA_VERSION
     assert isinstance(line["run_id"], str)
@@ -70,11 +74,22 @@ def test_append_has_expected_schema_and_derived_fields(tmp_path: Path) -> None:
     assert line["imported"] == 8
     assert line["deduplicated"] == 4
     assert line["scored"] == 3
+    assert line["changed"] == 0
+    assert line["rescored"] == 0
     assert line["scored_failed"] == 0
     assert line["notified"] is False
     assert line["notification_kind"] == "none"
     assert line["failures"] == []
     assert line["base_url_source"] == "static"
+
+
+def test_changed_and_rescored_are_persisted(tmp_path: Path) -> None:
+    path = tmp_path / "runs.jsonl"
+    _record(path, _run(changed=4, rescored=2))
+
+    line = _lines(path)[0]
+    assert line["changed"] == 4
+    assert line["rescored"] == 2
 
 
 def test_two_appends_remain_two_jsonl_records(tmp_path: Path) -> None:

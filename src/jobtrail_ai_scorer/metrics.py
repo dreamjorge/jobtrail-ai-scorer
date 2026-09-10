@@ -36,6 +36,8 @@ class MetricsView:
     scored: int = 0
     scored_failed: int = 0
     notifications: int = 0
+    changed: int = 0
+    rescored: int = 0
     source_stats: dict[str, SourceStats] = field(default_factory=dict)
     profile_stats: dict[str, ProfileStats] = field(default_factory=dict)
     score_bins: dict[str, int] = field(default_factory=dict)
@@ -83,7 +85,7 @@ def compute_metrics(
     selected_seen = [e for e in seen_entries if isinstance(e, dict) and _in_period(e.get("first_seen"), since, until)]
     selected_jobs = [j for j in scored_jobs if isinstance(j, dict) and _in_period(j.get("scored_at", j.get("created_at")), since, until, missing_is_valid=True)]
 
-    totals = {key: 0 for key in ("searched", "imported", "deduplicated", "scored", "scored_failed")}
+    totals = {key: 0 for key in ("searched", "imported", "deduplicated", "scored", "scored_failed", "changed", "rescored")}
     sources: dict[str, dict[str, int]] = {}
     profiles: dict[str, dict[str, int]] = {}
     notifications = 0
@@ -155,7 +157,27 @@ def compute_metrics(
 
     source_stats = {name: SourceStats(**{k: int(v) for k, v in data.items() if k in SourceStats.__dataclass_fields__}) for name, data in sources.items()}
     profile_stats = {name: ProfileStats(**{k: int(v) for k, v in data.items() if k in ProfileStats.__dataclass_fields__}) for name, data in profiles.items()}
-    return MetricsView(period, since, until, totals["searched"], totals["imported"], totals["deduplicated"], totals["scored"], totals["scored_failed"], notifications, source_stats, profile_stats, bins, totals.get("matches", 0), statuses, max(success_times, default=None), max(failure_times, default=None), tuple(sorted(missing)))
+    return MetricsView(
+        period,
+        since,
+        until,
+        totals["searched"],
+        totals["imported"],
+        totals["deduplicated"],
+        totals["scored"],
+        totals["scored_failed"],
+        notifications,
+        totals["changed"],
+        totals["rescored"],
+        source_stats,
+        profile_stats,
+        bins,
+        totals.get("matches", 0),
+        statuses,
+        max(success_times, default=None),
+        max(failure_times, default=None),
+        tuple(sorted(missing)),
+    )
 
 
 def _number(value: Any) -> float | None:
