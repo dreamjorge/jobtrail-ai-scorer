@@ -33,6 +33,7 @@ period filter ``[since, until)`` against ``started_at``.
 from __future__ import annotations
 
 import contextlib
+import itertools
 import json
 import os
 from datetime import datetime
@@ -61,6 +62,7 @@ _BREAKER_FAILURE_PREFIX = "breaker:"
 
 # Stage prefix used to label a preflight-aborted short-circuit run.
 _PREFLIGHT_FAILURE_PREFIX = "preflight:unavailable:"
+_TMP_COUNTER = itertools.count()
 
 
 def record_run(
@@ -280,7 +282,7 @@ def _within_period(
 
     started_at = parsed.get("started_at")
     if not isinstance(started_at, (int, float)) or isinstance(started_at, bool):
-        return True  # not a number we can compare; let downstream decide
+        return since is None and until is None
     if since is not None and started_at < since:
         return False
     if until is not None and started_at >= until:
@@ -308,7 +310,8 @@ def _append_jsonl_line(path: str | os.PathLike[str], line: str) -> None:
         try:
             existing = target.read_text(encoding="utf-8")
         except OSError:
-            existing = ""
+            # Never replace an existing journal whose contents cannot be read.
+            return
     new_content = existing + ("" if existing.endswith("\n") or not existing else "\n") + line + "\n"
     tmp_path = _tmp_path(target)
     fd = os.open(str(tmp_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, DEFAULT_FILE_MODE)
@@ -333,11 +336,8 @@ def _tmp_path(path: Path) -> Path:
     helper works for callers that pass extension-less file names.
     """
 
-    import itertools
-
-    counter = itertools.count()
     suffix = path.suffix or ".jsonl"
-    return path.with_name(f"{path.stem}.tmp.{os.getpid()}.{next(counter)}{suffix}")
+    return path.with_name(f"{path.stem}.tmp.{os.getpid()}.{next(_TMP_COUNTER)}{suffix}")
 
 
 def _enforce_mode(path: Path, mode: int = DEFAULT_FILE_MODE) -> None:

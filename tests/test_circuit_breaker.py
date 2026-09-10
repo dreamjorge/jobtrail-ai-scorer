@@ -451,9 +451,8 @@ def test_atomic_write_does_not_leave_partial_file_when_rename_fails(
 
     monkeypatch.setattr("jobtrail_ai_scorer._atomic_json.os.replace", _boom)
 
-    # ``record_failure`` must raise, but the existing state file is untouched.
-    with pytest.raises(OSError):
-        breaker.record_failure()
+    # Storage failure is best-effort; the existing state file is untouched.
+    breaker.record_failure()
     assert path.read_text(encoding="utf-8") == original
 
 

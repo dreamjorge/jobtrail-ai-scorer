@@ -1129,10 +1129,7 @@ class JobTrailAutomation:
         """
 
         failures: list[str] = ["breaker:open"]
-        if (
-            breaker.try_alert()
-            and (config.notify_enabled or config.notify_on_failure)
-        ):
+        if (config.notify_enabled or config.notify_on_failure) and breaker.try_alert():
             self._send_breaker_alert(failures=failures)
         return AutomationRun(
             0,

@@ -39,6 +39,7 @@ import concurrent.futures
 import dataclasses
 import os
 import subprocess
+from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 
 import httpx
@@ -320,6 +321,22 @@ def _whatsapp_probe(whatsapp_command: str) -> Callable[[], None]:
     return probe
 
 
+def _load_scorer_config(config: AutomationConfig) -> Any:
+    """Load the configured scorer settings when the launcher supplies a path."""
+
+    if hasattr(config, "provider"):
+        return config
+    path = str(getattr(config, "scorer_config_path", "") or "").strip()
+    if path:
+        try:
+            from .config import load_config
+
+            return load_config(Path(path))
+        except Exception:
+            pass
+    return config
+
+
 def default_preflight_checks(
     config: AutomationConfig,
 ) -> tuple[PreflightCheck, ...]:
@@ -335,31 +352,31 @@ def default_preflight_checks(
     checks: list[PreflightCheck] = [
         PreflightCheck(
             name="jobtrail_api",
-            probe=_jobtrail_api_probe(
-                config.base_url, timeout_seconds=2.0
-            ),
+            probe=_jobtrail_api_probe(config.base_url, timeout_seconds=2.0),
             timeout_seconds=2.0,
             required=True,
         ),
         PreflightCheck(
             name="jobspy_search",
-            probe=_jobspy_search_probe(
-                config.base_url, timeout_seconds=5.0
-            ),
+            probe=_jobspy_search_probe(config.base_url, timeout_seconds=5.0),
             timeout_seconds=5.0,
             required=True,
         ),
-        PreflightCheck(
-            name="hermes_provider",
-            probe=_hermes_provider_probe(
-                _config_attr(config, "hermes_executable", "hermes"),
-                _config_attr(config, "hermes_profile", "default"),
-                timeout_seconds=2.0,
-            ),
-            timeout_seconds=2.0,
-            required=True,
-        ),
     ]
+    scorer_config = _load_scorer_config(config)
+    if _config_attr(scorer_config, "provider", "hermes") == "hermes":
+        checks.append(
+            PreflightCheck(
+                name="hermes_provider",
+                probe=_hermes_provider_probe(
+                    _config_attr(scorer_config, "hermes_executable", "hermes"),
+                    _config_attr(scorer_config, "hermes_profile", "default"),
+                    timeout_seconds=2.0,
+                ),
+                timeout_seconds=2.0,
+                required=True,
+            )
+        )
     if config.notify_enabled:
         checks.append(
             PreflightCheck(
