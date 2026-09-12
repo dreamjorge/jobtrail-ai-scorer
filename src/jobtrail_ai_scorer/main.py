@@ -13,6 +13,7 @@ import typer
 from .config import AppConfig, load_config
 from .jobtrail import JobTrailClient
 from .metrics import compute_metrics
+from .feedback import feedback_note_body, validate_labels
 from .run_journal import DEFAULT_RUN_JOURNAL_PATH, iter_runs
 from .seen_cache import DEFAULT_SEEN_CACHE_PATH
 from ._atomic_json import read_json
@@ -261,6 +262,54 @@ def _read_seen_entries(path: Path) -> list[dict]:
         source, source_job_id = key.split("\x1f", 1)
         result.append({"source": source, "sourceJobId": source_job_id, "first_seen": value.get("first_seen")})
     return result
+
+
+def run_feedback(*, config_path: Path, job_id: str, labels: list[str], comment: str | None = None,
+                 client_factory: ClientFactory | None = None) -> dict:
+    """Fetch a scored job, then append one validated feedback note."""
+    config = load_config(config_path)
+    client = (client_factory or (lambda url: JobTrailClient(url)))(str(config.jobtrail_base_url))
+    try:
+        job = client.get_job(job_id)
+        if not _has_valid_score_marker(job):
+            raise ValueError("job has no valid score marker")
+        body = feedback_note_body(labels, comment=comment, job=job)
+        client.add_note(job_id, body)
+        return {"job_id": job_id, "labels": validate_labels(labels)}
+    finally:
+        close = getattr(client, "close", None)
+        if callable(close):
+            close()
+
+
+def _has_valid_score_marker(job: object) -> bool:
+    if not isinstance(job, dict) or not isinstance(job.get("notes"), list):
+        return False
+    from .scoring import CURRENT_MARKER, LEGACY_MARKER, parse_score_note
+    for note in reversed(job["notes"]):
+        body = note.get("body") if isinstance(note, dict) else None
+        for marker in (CURRENT_MARKER, LEGACY_MARKER):
+            payload = parse_score_note(body, marker=marker) if isinstance(body, str) else None
+            score = payload.get("score") if payload else None
+            if isinstance(score, int) and not isinstance(score, bool) and 0 <= score <= 100:
+                return True
+    return False
+
+
+@app.command()
+def feedback(
+    job_id: str = typer.Option(..., "--job-id"),
+    label: list[str] = typer.Option(..., "--label", help="Feedback label(s), repeat or comma-separate."),
+    comment: str | None = typer.Option(None, "--comment"),
+    config: Path = typer.Option(Path("config.yaml"), "--config"),
+) -> None:
+    """Attach structured feedback to a previously scored job."""
+    labels = [part.strip() for item in label for part in item.split(",") if part.strip()]
+    try:
+        run_feedback(config_path=config, job_id=job_id, labels=labels, comment=comment)
+    except ValueError as error:
+        raise typer.BadParameter(str(error)) from error
+    typer.echo(f"FEEDBACK {job_id}")
 
 
 @app.command()
