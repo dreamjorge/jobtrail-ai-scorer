@@ -233,6 +233,7 @@ class AutomationConfig:
     run_journal_path: str = ""
     notify_enabled: bool = False
     notify_on_failure: bool = False
+    digest_top_n: int = 1
     whatsapp_command: str = ""
     discover_container: str | None = None
     ats_boards: AtsBoardConfig | None = None
@@ -280,6 +281,17 @@ class AutomationConfig:
             except (TypeError, ValueError) as exc:
                 raise ValueError(f"{key} must be a float") from exc
 
+        raw_digest_top_n = e.get("WHATSAPP_DIGEST_TOP_N")
+        if raw_digest_top_n is None or raw_digest_top_n == "":
+            digest_top_n = 1
+        else:
+            try:
+                digest_top_n = int(raw_digest_top_n)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("WHATSAPP_DIGEST_TOP_N must be an integer between 1 and 5") from exc
+            if not 1 <= digest_top_n <= 5:
+                raise ValueError("WHATSAPP_DIGEST_TOP_N must be between 1 and 5")
+
         discover_container = e.get("JOBTRAIL_DISCOVER_CONTAINER", "").strip() or None
         search_profiles = (
             _parse_search_profiles(e["JOB_SEARCH_PROFILES"])
@@ -306,6 +318,7 @@ class AutomationConfig:
                 run_journal_path=e.get("JOBTRAIL_RUN_JOURNAL_PATH", "").strip(),
             notify_enabled=truthy("WHATSAPP_NOTIFY_ENABLED", "0"),
             notify_on_failure=truthy("WHATSAPP_NOTIFY_ON_FAILURE", "0"),
+            digest_top_n=digest_top_n,
             whatsapp_command=e.get("WHATSAPP_NOTIFY_COMMAND", ""),
             discover_container=discover_container,
             ats_boards=ats_boards,
@@ -956,6 +969,7 @@ class JobTrailAutomation:
                     rescored += 1
             except Exception as exc:
                 failures.append(_format_failure("score", exc, job_id=job_id))
+        qualified: list[tuple[str, dict[str, Any], dict[str, Any], dict[str, Any]]] = []
         best = None
         best_job = None
         best_score = None
@@ -967,11 +981,7 @@ class JobTrailAutomation:
                 if payload is not None:
                     job = {**job, **{key: value for key, value in payload.items() if key != "notes"}}
                 score = parse_score_note(job.get("notes"))
-                if (
-                    score
-                    and score.get("score", -1) >= config.score_threshold
-                    and (best is None or score["score"] > best["score"])
-                ):
+                if score and score.get("score", -1) >= config.score_threshold:
                     best = {
                         "title": job.get("position", job.get("title", "")),
                         "company": job.get("company", ""),
@@ -985,15 +995,19 @@ class JobTrailAutomation:
                     best_job = job
                     best_score = score
                     best_job_id = job_id
+                    if job_id in profiles_by_job_id:
+                        best["searchProfiles"] = list(profiles_by_job_id[job_id])
+                    qualified.append((str(job_id), best, job, score))
             except Exception as exc:
                 failures.append(_format_failure("read", exc, job_id=job_id))
 
+        qualified.sort(key=lambda item: (-item[3]["score"], item[0]))
+        selected = qualified[:config.digest_top_n]
+        best, best_job, best_score, best_job_id = (selected[0][1], selected[0][2], selected[0][3], selected[0][0]) if selected else (None, None, None, None)
         if best is not None and best_job_id in profiles_by_job_id:
             best["searchProfiles"] = list(profiles_by_job_id[best_job_id])
         notification_body = self._compose_notification(
-            best=best,
-            best_job=best_job,
-            best_score=best_score,
+            selected=selected,
             failures=tuple(failures),
             notify_enabled=config.notify_enabled,
             notify_on_failure=config.notify_on_failure,
@@ -1089,9 +1103,20 @@ class JobTrailAutomation:
                         "recommendation": score.get("recommendation", ""), "strengths": score.get("strengths", []),
                         "gaps": score.get("gaps", []), "jobUrl": job.get("jobUrl", job.get("job_url", ""))}
                 best_job, best_score, best_job_id = job, score, job_id
-        if best is not None and best_job_id in profiles_by_id:
-            best["searchProfiles"] = list(profiles_by_id[best_job_id])
-        body = self._compose_notification(best=best, best_job=best_job, best_score=best_score,
+        qualified = []
+        for job_id, job, score in scored_previews:
+            if score["score"] >= config.score_threshold:
+                summary = {"title": job.get("position", job.get("title", "")), "company": job.get("company", ""),
+                           "location": job.get("location", ""), "score": score["score"],
+                           "recommendation": score.get("recommendation", ""), "strengths": score.get("strengths", []),
+                           "gaps": score.get("gaps", []), "jobUrl": job.get("jobUrl", job.get("job_url", ""))}
+                if job_id in profiles_by_id:
+                    summary["searchProfiles"] = list(profiles_by_id[job_id])
+                qualified.append((str(job_id), summary, job, score))
+        qualified.sort(key=lambda item: (-item[3]["score"], item[0]))
+        selected = qualified[:config.digest_top_n]
+        best, best_job, best_score, best_job_id = (selected[0][1], selected[0][2], selected[0][3], selected[0][0]) if selected else (None, None, None, None)
+        body = self._compose_notification(selected=selected,
                                            failures=tuple(failures), notify_enabled=config.notify_enabled,
                                            notify_on_failure=config.notify_on_failure, base_url=self.base_url)
         notification_preview = None
@@ -1239,9 +1264,10 @@ class JobTrailAutomation:
     @staticmethod
     def _compose_notification(
         *,
-        best: dict[str, Any] | None,
-        best_job: dict[str, Any] | None,
-        best_score: dict[str, Any] | None,
+        selected: list[tuple[str, dict[str, Any], dict[str, Any], dict[str, Any]]] | None = None,
+        best: dict[str, Any] | None = None,
+        best_job: dict[str, Any] | None = None,
+        best_score: dict[str, Any] | None = None,
         failures: tuple[str, ...],
         notify_enabled: bool,
         notify_on_failure: bool,
@@ -1263,19 +1289,16 @@ class JobTrailAutomation:
         """
 
         match_body: str | None = None
-        if best is not None and notify_enabled:
-            score_for_notification = dict(best_score or {})
-            if best.get("searchProfiles"):
-                score_for_notification["searchProfiles"] = best["searchProfiles"]
-            match_body = json.dumps(
-                build_notification_summary(
-                    best_job or {},
-                    score_for_notification,
-                    base_url=base_url,
-                ),
-                ensure_ascii=False,
-                sort_keys=True,
-            )
+        selected = selected or ([] if best is None else [("", best, best_job or {}, best_score or {})])
+        if selected and notify_enabled:
+            entries = []
+            for _job_id, summary, job, score in selected:
+                score_for_notification = dict(score)
+                if summary.get("searchProfiles"):
+                    score_for_notification["searchProfiles"] = summary["searchProfiles"]
+                entries.append(build_notification_summary(job, score_for_notification, base_url=base_url))
+            payload: Any = entries[0] if len(entries) == 1 else {"kind": "digest", "entries": entries}
+            match_body = json.dumps(payload, ensure_ascii=False, sort_keys=True)
         failure_body: str | None = None
         if notify_on_failure and failures:
             failure_body = json.dumps(

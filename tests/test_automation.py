@@ -112,6 +112,17 @@ def test_automation_config_parses_dry_run_truthy_env():
     assert AutomationConfig.from_env({"JOBTRAIL_AUTOMATION_DRY_RUN": "off"}).dry_run is False
 
 
+def test_automation_config_digest_top_n_defaults_to_one_and_accepts_three():
+    assert AutomationConfig.from_env({}).digest_top_n == 1
+    assert AutomationConfig.from_env({"WHATSAPP_DIGEST_TOP_N": "3"}).digest_top_n == 3
+
+
+@pytest.mark.parametrize("raw", ["0", "6", "not-an-integer"])
+def test_automation_config_rejects_invalid_digest_top_n(raw):
+    with pytest.raises(ValueError):
+        AutomationConfig.from_env({"WHATSAPP_DIGEST_TOP_N": raw})
+
+
 def test_automation_dry_run_has_no_write_side_effects():
     class Adapter:
         name = "custom"

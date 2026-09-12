@@ -269,6 +269,128 @@ def test_happy_path_drives_full_pipeline(server, state):
         assert forbidden not in rendered
 
 
+def test_digest_top_n_notifies_once_in_score_then_job_id_order():
+    listings = [
+        {**_LISTING_ALPHA, "id": "c-3", "title": "C role"},
+        {**_LISTING_ALPHA, "id": "a-1", "title": "A role"},
+        {**_LISTING_ALPHA, "id": "b-2", "title": "B role"},
+    ]
+
+    class Scorer(StubScorer):
+        scores = {"indeed:c-3": 90, "indeed:a-1": 95, "indeed:b-2": 95}
+
+        def __call__(self, job_id, config_path):
+            self.default_score = self.scores[job_id]
+            super().__call__(job_id, config_path)
+
+    jobspy = StubJobSpy(listings)
+    state = StubJobTrailState(jobspy=jobspy)
+    with StubJobTrailServer(state) as server:
+        scorer = Scorer(state)
+        whatsapp = StubWhatsApp()
+        result = _run(
+            server,
+            scorer=scorer,
+            notifier=whatsapp,
+            config_overrides={"digest_top_n": 3},
+        )
+
+    assert result.selected["score"] == 95
+    assert len(whatsapp.messages) == 1
+    payload = json.loads(whatsapp.messages[0])
+    assert [unquote(entry["jobTrailLink"]).rsplit("/", 1)[-1] for entry in payload["entries"]] == [
+        "indeed:a-1", "indeed:b-2", "indeed:c-3"
+    ]
+    assert [entry["score"] for entry in payload["entries"]] == [95, 95, 90]
+
+
+def test_digest_equal_scores_are_deterministic_when_input_order_reverses():
+    listings = [
+        {**_LISTING_ALPHA, "id": "z-9", "title": "Z role"},
+        {**_LISTING_ALPHA, "id": "a-1", "title": "A role"},
+    ]
+    observed = []
+    for ordered in (listings, list(reversed(listings))):
+        state = StubJobTrailState(jobspy=StubJobSpy(ordered))
+
+        class EqualScorer(StubScorer):
+            def __call__(self, job_id, config_path):
+                self.default_score = 90
+                super().__call__(job_id, config_path)
+
+        with StubJobTrailServer(state) as server:
+            whatsapp = StubWhatsApp()
+            _run(server, scorer=EqualScorer(state), notifier=whatsapp,
+                 config_overrides={"digest_top_n": 3})
+            payload = json.loads(whatsapp.messages[0])
+            observed.append([
+                unquote(entry["jobTrailLink"]).rsplit("/", 1)[-1]
+                for entry in payload["entries"]
+            ])
+
+    assert observed == [["indeed:a-1", "indeed:z-9"]] * 2
+
+
+def test_digest_top_n_dry_run_previews_all_entries_without_notifying():
+    listings = [
+        {**_LISTING_ALPHA, "id": "one", "title": "One role"},
+        {**_LISTING_ALPHA, "id": "two", "title": "Two role"},
+        {**_LISTING_ALPHA, "id": "three", "title": "Three role"},
+    ]
+    state = StubJobTrailState(jobspy=StubJobSpy(listings))
+
+    class PreviewScorer:
+        def __call__(self, job_id, config_path, payload=None):
+            return {
+                "score": 91,
+                "recommendation": "APPLY",
+                "strengths": ["Python"],
+                "gaps": ["None"],
+            }
+
+    with StubJobTrailServer(state) as server:
+        whatsapp = StubWhatsApp()
+        result = _run(
+            server,
+            scorer=PreviewScorer(),
+            notifier=whatsapp,
+            config_overrides={"digest_top_n": 3, "dry_run": True},
+        )
+
+    assert whatsapp.messages == []
+    assert result.notification_preview["kind"] == "digest"
+    assert len(result.notification_preview["entries"]) == 3
+    for entry in result.notification_preview["entries"]:
+        assert set(entry) <= set(ALLOWED_FIELDS)
+
+
+def test_digest_entries_are_allowlisted_bounded_and_redacted():
+    listings = [
+        {**_LISTING_ALPHA, "id": "redact-1", "title": "Safe role"},
+        {**_LISTING_ALPHA, "id": "redact-2", "title": "Another role"},
+        {**_LISTING_ALPHA, "id": "redact-3", "title": "Third role"},
+    ]
+    state = StubJobTrailState(jobspy=StubJobSpy(listings))
+
+    class RedactingScorer(StubScorer):
+        def __call__(self, job_id, config_path):
+            self.default_strengths = ["Python", "RESUME_SENTINEL", "x" * 500]
+            self.default_gaps = ["PROFILE_SENTINEL", "PROMPT_SENTINEL", "CREDENTIAL_SENTINEL"]
+            super().__call__(job_id, config_path)
+
+    with StubJobTrailServer(state) as server:
+        whatsapp = StubWhatsApp()
+        _run(server, scorer=RedactingScorer(state), notifier=whatsapp,
+             config_overrides={"digest_top_n": 3})
+
+    payload = json.loads(whatsapp.messages[0])
+    rendered = json.dumps(payload)
+    assert all(set(entry) <= set(ALLOWED_FIELDS) for entry in payload["entries"])
+    assert all(len(item) <= 200 for entry in payload["entries"] for item in entry["strengths"])
+    for forbidden in ("RESUME_SENTINEL", "PROFILE_SENTINEL", "PROMPT_SENTINEL", "CREDENTIAL_SENTINEL"):
+        assert forbidden not in rendered
+
+
 def test_dry_run_searches_without_writes_and_previews_redacted_notification(
     tmp_path, server, state
 ):
