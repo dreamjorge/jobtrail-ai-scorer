@@ -228,6 +228,32 @@ def test_run_feedback_fetches_before_write_closes_client_and_has_no_apply_side_e
     assert [call[0] for call in calls] == ["get", "note", "close"]
 
 
+def test_run_feedback_accepts_configured_score_marker_and_writes_one_feedback_note(tmp_path):
+    config_path = _config(tmp_path)
+    config_path.write_text(config_path.read_text() + 'marker: "[CUSTOM_SCORE]"\n')
+    writes = []
+
+    class FakeClient:
+        def get_job(self, job_id):
+            return {"id": job_id, "notes": [
+                {"body": '[CUSTOM_SCORE]\n{"score":80}'}
+            ]}
+
+        def add_note(self, job_id, body):
+            writes.append((job_id, body))
+
+        def close(self):
+            pass
+
+    result = main.run_feedback(config_path=config_path, job_id="j1", labels=["good_match"],
+                               client_factory=lambda _: FakeClient())
+
+    assert result["labels"] == ("good_match",)
+    assert len(writes) == 1
+    assert writes[0][0] == "j1"
+    assert writes[0][1].startswith("[AI_JOB_FEEDBACK_V1]")
+
+
 @pytest.mark.parametrize("notes", [[], [{"body": '[AI_JOB_SCORE_V1]\\n{"score":101}'}]])
 def test_run_feedback_rejects_missing_or_invalid_score_marker(notes, tmp_path):
     config_path = _config(tmp_path)

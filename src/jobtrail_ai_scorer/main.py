@@ -20,6 +20,7 @@ from ._atomic_json import read_json
 from .prompt_budget import LoadStatus, PromptBudget
 from .prompt_tokens import estimate_sections, optional_budget_from_env
 from .scoring import (
+    CURRENT_MARKER,
     PROMPT_INSTRUCTIONS,
     PROMPT_SCHEMA,
     ScoreRunResult,
@@ -271,7 +272,7 @@ def run_feedback(*, config_path: Path, job_id: str, labels: list[str], comment: 
     client = (client_factory or (lambda url: JobTrailClient(url)))(str(config.jobtrail_base_url))
     try:
         job = client.get_job(job_id)
-        if not _has_valid_score_marker(job):
+        if not _has_valid_score_marker(job, marker=config.marker):
             raise ValueError("job has no valid score marker")
         body = feedback_note_body(labels, comment=comment, job=job)
         client.add_note(job_id, body)
@@ -282,14 +283,15 @@ def run_feedback(*, config_path: Path, job_id: str, labels: list[str], comment: 
             close()
 
 
-def _has_valid_score_marker(job: object) -> bool:
+def _has_valid_score_marker(job: object, *, marker: str = CURRENT_MARKER) -> bool:
     if not isinstance(job, dict) or not isinstance(job.get("notes"), list):
         return False
-    from .scoring import CURRENT_MARKER, LEGACY_MARKER, parse_score_note
+    from .scoring import LEGACY_MARKER, parse_score_note
+    markers = tuple(dict.fromkeys((marker, CURRENT_MARKER, LEGACY_MARKER)))
     for note in reversed(job["notes"]):
         body = note.get("body") if isinstance(note, dict) else None
-        for marker in (CURRENT_MARKER, LEGACY_MARKER):
-            payload = parse_score_note(body, marker=marker) if isinstance(body, str) else None
+        for score_marker in markers:
+            payload = parse_score_note(body, marker=score_marker) if isinstance(body, str) else None
             score = payload.get("score") if payload else None
             if isinstance(score, int) and not isinstance(score, bool) and 0 <= score <= 100:
                 return True
