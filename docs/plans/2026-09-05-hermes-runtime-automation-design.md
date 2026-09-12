@@ -1,5 +1,7 @@
 # Hermes Runtime Automation Design
 
+> **Superseded notification contract:** the current launcher renders bounded cards and uses Hermes direct `send --to "$HERMES_WHATSAPP_TARGET"`; this earlier design's LLM-mediated formatting is retained only as historical context.
+
 ## Goal
 
 Provide a safe local runner for JobTrail AI scoring on the Orange Pi runtime, with optional WhatsApp notification routed through the existing Hermes `job-search` profile.
@@ -18,7 +20,7 @@ The local deployment uses a small Hermes wrapper executable that forwards provid
 
 - `scripts/hermes-docker-wrapper.example.sh`: example executable wrapper for `docker exec hermes /opt/hermes/.venv/bin/hermes "$@"`.
 - `scripts/run-scorer.example.sh`: example runner that accepts local config paths, supports dry-run first, and captures a concise run summary.
-- `scripts/notify-whatsapp-via-hermes.example.sh`: optional notification helper that sends a run summary to Hermes with `--profile job-search -z ... --cli` when explicitly invoked.
+- `scripts/notify-whatsapp-via-hermes.example.sh`: optional notification helper that sends an already-rendered bounded run summary through Hermes direct `send --to "$HERMES_WHATSAPP_TARGET"` when explicitly invoked.
 - `docs/runtime-automation.md`: documents Orange Pi-safe compose usage, ignored local config, dry-run-first workflow, scheduler options, and WhatsApp/Hermes assumptions.
 
 ## Data flow

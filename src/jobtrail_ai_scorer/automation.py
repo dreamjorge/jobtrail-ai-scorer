@@ -30,7 +30,13 @@ from .sources import (
     build_ats_adapters,
     normalize_jobspy_job,
 )
-from .notify import NotificationBuilder, recommendation_label
+from .notify import (
+    FORBIDDEN_TOKENS,
+    MAX_LIST_ITEMS,
+    MAX_TEXT_LENGTH,
+    NotificationBuilder,
+    recommendation_label,
+)
 from .run_journal import record_run
 
 
@@ -589,6 +595,101 @@ def _format_failure(stage: str, exc: BaseException, *, job_id: str | None = None
     return f"{prefix}:{classification}:{type(exc).__name__}"
 
 
+def _render_card_text(value: Any) -> str:
+    """Return bounded, scrubbed text for the already-built card boundary."""
+
+    text = str(value or "")[:MAX_TEXT_LENGTH]
+    for token in FORBIDDEN_TOKENS:
+        text = text.replace(token, "[REDACTED]")
+    return text
+
+
+def _render_card_items(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [_render_card_text(item) for item in value[:MAX_LIST_ITEMS] if item]
+
+
+def _whatsapp_card(summary: Mapping[str, Any], rank: int | None) -> str:
+    """Render one allowlisted NotificationBuilder summary without raw fallback."""
+
+    title = _render_card_text(summary.get("title"))
+    lines = ["━━━━━━━━━━━━━━━━━━━━"]
+    heading = f"🏆 #{rank} · " if rank is not None else "🏆 "
+    recommendation = _render_card_text(summary.get("recommendation"))
+    recommendation_label = _render_card_text(summary.get("recommendationLabel"))
+    score = summary.get("score")
+    score_text = f"{score}/100" if isinstance(score, (int, float)) else ""
+    lead = " · ".join(
+        part for part in (score_text, recommendation, recommendation_label) if part
+    )
+    lines.append(f"{heading}{lead}" if lead else heading.rstrip())
+    if title:
+        lines.append(title)
+
+    identity = " · ".join(
+        part
+        for part in (
+            f"🏢 {_render_card_text(summary.get('company'))}" if summary.get("company") else "",
+            f"📍 {_render_card_text(summary.get('location'))}" if summary.get("location") else "",
+        )
+        if part
+    )
+    if identity:
+        lines.append(identity)
+    profiles = _render_card_items(summary.get("searchProfiles"))
+    if profiles:
+        lines.append(f"🔎 {', '.join(profiles)}")
+
+    for key, label in (("strengths", "✅ Fortalezas"), ("gaps", "⚠️ Brechas")):
+        items = _render_card_items(summary.get(key))
+        if items:
+            lines.extend(["", label, *[f"• {item}" for item in items]])
+
+    links = []
+    if summary.get("jobTrailLink"):
+        links.append(("Ver en JobTrail", summary.get("jobTrailLink")))
+    if summary.get("jobUrl"):
+        links.append(("Ver publicación", summary.get("jobUrl")))
+    if links:
+        lines.extend(["", *[f"🔗 {label}\n{_render_card_text(url)}" for label, url in links]])
+    lines.append("━━━━━━━━━━━━━━━━━━━━")
+    return "\n".join(lines)
+
+
+MAX_DIGEST_CARDS = 10
+
+
+def _select_notification_matches(
+    candidates: list[tuple[dict[str, Any], dict[str, Any]]],
+) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+    """Select the bounded, score-ordered digest before rendering it."""
+
+    ordered = sorted(
+        candidates,
+        key=lambda candidate: (
+            -(candidate[1].get("score") if isinstance(candidate[1].get("score"), (int, float)) else float("-inf")),
+            str(candidate[0].get("id", candidate[0].get("jobUrl", candidate[0].get("job_url", "")))),
+        ),
+    )
+    return ordered[:MAX_DIGEST_CARDS]
+
+
+def format_whatsapp_cards(summaries: list[Mapping[str, Any]]) -> str:
+    """Render bounded notification summaries while preserving selector order."""
+
+    # Ordering is intentionally owned by _select_notification_matches. This
+    # boundary must not re-sort already-selected summaries.
+    bounded = [summary for summary in summaries if isinstance(summary, Mapping)][:MAX_DIGEST_CARDS]
+    if not bounded:
+        return ""
+    rank = None if len(bounded) == 1 else 1
+    cards = []
+    for index, summary in enumerate(bounded, 1):
+        cards.append(_whatsapp_card(summary, index if rank is not None else None))
+    return "\n".join(cards)
+
+
 def build_failure_summary(
     failures: tuple[str, ...] | list[str], *, max_items: int = 5
 ) -> dict[str, Any]:
@@ -937,31 +1038,49 @@ class JobTrailAutomation:
         best_job = None
         best_score = None
         best_job_id = None
+        qualified_matches: list[tuple[dict[str, Any], dict[str, Any]]] = []
         for job_id in scored_ids:
             try:
                 job = self.gateway.get_job(job_id)
                 score = parse_score_note(job.get("notes"))
-                if (
-                    score
-                    and score.get("score", -1) >= config.score_threshold
-                    and (best is None or score["score"] > best["score"])
-                ):
-                    best = {
-                        "title": job.get("position", job.get("title", "")),
-                        "company": job.get("company", ""),
-                        "location": job.get("location", ""),
-                        "score": score["score"],
-                        "recommendation": score.get("recommendation", ""),
-                        "strengths": score.get("strengths", []),
-                        "gaps": score.get("gaps", []),
-                        "jobUrl": job.get("jobUrl", job.get("job_url", "")),
-                    }
-                    best_job = job
-                    best_score = score
-                    best_job_id = job_id
+                if score and score.get("score", -1) >= config.score_threshold:
+                    candidate_score = dict(score)
+                    if job_id in profiles_by_job_id:
+                        candidate_score["searchProfiles"] = list(profiles_by_job_id[job_id])
+                    qualified_matches.append((job, candidate_score))
+                    if best is None or score["score"] > best["score"]:
+                        best = {
+                            "title": job.get("position", job.get("title", "")),
+                            "company": job.get("company", ""),
+                            "location": job.get("location", ""),
+                            "score": score["score"],
+                            "recommendation": score.get("recommendation", ""),
+                            "strengths": score.get("strengths", []),
+                            "gaps": score.get("gaps", []),
+                            "jobUrl": job.get("jobUrl", job.get("job_url", "")),
+                        }
+                        best_job = job
+                        best_score = score
+                        best_job_id = job_id
             except Exception as exc:
                 failures.append(_format_failure("read", exc, job_id=job_id))
 
+            if best is not None and best_job_id in profiles_by_job_id:
+                best["searchProfiles"] = list(profiles_by_job_id[best_job_id])
+        qualified_matches = _select_notification_matches(qualified_matches)
+        if qualified_matches:
+            best_job, best_score = qualified_matches[0]
+            best_job_id = str(best_job.get("id", ""))
+            best = {
+                "title": best_job.get("position", best_job.get("title", "")),
+                "company": best_job.get("company", ""),
+                "location": best_job.get("location", ""),
+                "score": best_score["score"],
+                "recommendation": best_score.get("recommendation", ""),
+                "strengths": best_score.get("strengths", []),
+                "gaps": best_score.get("gaps", []),
+                "jobUrl": best_job.get("jobUrl", best_job.get("job_url", "")),
+            }
         if best is not None and best_job_id in profiles_by_job_id:
             best["searchProfiles"] = list(profiles_by_job_id[best_job_id])
         notification_body = self._compose_notification(
@@ -972,6 +1091,7 @@ class JobTrailAutomation:
             notify_enabled=config.notify_enabled,
             notify_on_failure=config.notify_on_failure,
             base_url=self.base_url,
+            candidates=qualified_matches,
         )
         if notification_body is not None:
             try:
@@ -1051,6 +1171,12 @@ class JobTrailAutomation:
                 scored += 1
             except Exception as exc:
                 failures.append(_format_failure("score", exc, job_id=job_id))
+        qualified_previews = [
+                (job, {**score, **({"searchProfiles": list(profiles_by_id[job_id])} if job_id in profiles_by_id else {})})
+                for job_id, job, score in scored_previews
+                if score["score"] >= config.score_threshold
+            ]
+        selected_previews = _select_notification_matches(qualified_previews)
         best = best_job = best_score = best_job_id = None
         for job_id, job, score in scored_previews:
             if score["score"] >= config.score_threshold and (best is None or score["score"] > best["score"]):
@@ -1059,17 +1185,35 @@ class JobTrailAutomation:
                         "recommendation": score.get("recommendation", ""), "strengths": score.get("strengths", []),
                         "gaps": score.get("gaps", []), "jobUrl": job.get("jobUrl", job.get("job_url", ""))}
                 best_job, best_score, best_job_id = job, score, job_id
+        if selected_previews:
+                best_job, best_score = selected_previews[0]
+                best_job_id = str(best_job.get("id", ""))
+                best = {"title": best_job.get("position", best_job.get("title", "")), "company": best_job.get("company", ""),
+                        "location": best_job.get("location", ""), "score": best_score["score"],
+                        "recommendation": best_score.get("recommendation", ""), "strengths": best_score.get("strengths", []),
+                        "gaps": best_score.get("gaps", []), "jobUrl": best_job.get("jobUrl", best_job.get("job_url", ""))}
         if best is not None and best_job_id in profiles_by_id:
-            best["searchProfiles"] = list(profiles_by_id[best_job_id])
+                                            best["searchProfiles"] = list(profiles_by_id[best_job_id])
         body = self._compose_notification(best=best, best_job=best_job, best_score=best_score,
                                            failures=tuple(failures), notify_enabled=config.notify_enabled,
-                                           notify_on_failure=config.notify_on_failure, base_url=self.base_url)
+                                           notify_on_failure=config.notify_on_failure, base_url=self.base_url,
+                                               candidates=selected_previews)
         notification_preview = None
         if body is not None:
             planned_notified = 1
-            try:
-                notification_preview = json.loads(body.split("\n", 1)[0])
-            except (TypeError, json.JSONDecodeError):
+            if best is not None:
+                preview_score = dict(best_score or {})
+                if best.get("searchProfiles"):
+                    preview_score["searchProfiles"] = best["searchProfiles"]
+                preview_cards = [
+                        build_notification_summary(job, dict(score), base_url=self.base_url)
+                        for job, score in selected_previews
+                    ]
+                notification_preview = dict(preview_cards[0])
+                notification_preview["selected"] = dict(preview_cards[0])
+                notification_preview["cards"] = preview_cards
+
+            else:
                 notification_preview = {"kind": "notification_preview"}
         return AutomationRun(searched, 0, scored, tuple(failures), best, profile_counts, True,
                              {"searched": searched, "imported": planned_imported, "scored": scored,
@@ -1214,6 +1358,7 @@ class JobTrailAutomation:
         notify_enabled: bool,
         notify_on_failure: bool,
         base_url: str = "",
+        candidates: list[tuple[dict[str, Any], dict[str, Any]]] | None = None,
     ) -> str | None:
         """Assemble the WhatsApp helper message from the run's outcome.
 
@@ -1232,18 +1377,12 @@ class JobTrailAutomation:
 
         match_body: str | None = None
         if best is not None and notify_enabled:
-            score_for_notification = dict(best_score or {})
-            if best.get("searchProfiles"):
-                score_for_notification["searchProfiles"] = best["searchProfiles"]
-            match_body = json.dumps(
-                build_notification_summary(
-                    best_job or {},
-                    score_for_notification,
-                    base_url=base_url,
-                ),
-                ensure_ascii=False,
-                sort_keys=True,
-            )
+            matches = candidates or [(best_job or {}, dict(best_score or {}))]
+            summaries = [
+                build_notification_summary(job, dict(score), base_url=base_url)
+                for job, score in matches
+            ]
+            match_body = format_whatsapp_cards(summaries)
         failure_body: str | None = None
         if notify_on_failure and failures:
             failure_body = json.dumps(
