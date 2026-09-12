@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from typing import Any, Iterable
 
 from .feedback import FEEDBACK_LABELS, latest_feedback_for_job
+from .lifecycle import current_state
 
 
 @dataclass(frozen=True)
@@ -45,6 +46,7 @@ class MetricsView:
     score_bins: dict[str, int] = field(default_factory=dict)
     matches_above_threshold: int = 0
     application_status: dict[str, int] = field(default_factory=dict)
+    lifecycle_counts: dict[str, int] = field(default_factory=dict)
     last_success_at: float | None = None
     last_failure_at: float | None = None
     missing_data: tuple[str, ...] = ()
@@ -86,7 +88,10 @@ def compute_metrics(
 
     selected_runs = [r for r in runs if isinstance(r, dict) and _in_period(r.get("started_at"), since, until)]
     selected_seen = [e for e in seen_entries if isinstance(e, dict) and _in_period(e.get("first_seen"), since, until)]
-    selected_jobs = [j for j in scored_jobs if isinstance(j, dict) and _in_period(j.get("scored_at", j.get("created_at")), since, until, missing_is_valid=True)]
+    selected_jobs = [
+        j for j in scored_jobs
+        if isinstance(j, dict) and _in_period(_job_timestamp(j), since, until)
+    ]
 
     totals = {key: 0 for key in ("searched", "imported", "deduplicated", "scored", "scored_failed", "changed", "rescored")}
     sources: dict[str, dict[str, int]] = {}
@@ -141,6 +146,7 @@ def compute_metrics(
     statuses: dict[str, int] = {}
     feedback_counts = {label: 0 for label in FEEDBACK_LABELS}
     valid_feedback = 0
+    lifecycle_counts: dict[str, int] = {}
     for job in selected_jobs:
         score = _score(job)
         if score is not None and 0 <= score <= 100:
@@ -155,6 +161,9 @@ def compute_metrics(
             sources.setdefault(source, {})["scored"] = sources.get(source, {}).get("scored", 0) + 1
         if isinstance(profile, str) and profile:
             profiles.setdefault(profile, {})["scored"] = profiles.get(profile, {}).get("scored", 0) + 1
+        lifecycle_status = current_state(job)
+        if isinstance(lifecycle_status, str) and lifecycle_status:
+            lifecycle_counts[lifecycle_status] = lifecycle_counts.get(lifecycle_status, 0) + 1
         status = job.get("applicationStatus")
         if isinstance(status, str) and status:
             statuses[status] = statuses.get(status, 0) + 1
@@ -169,6 +178,8 @@ def compute_metrics(
         missing.add("application_status")
     if not selected_jobs or not valid_feedback:
         missing.add("feedback")
+    if not selected_jobs or not lifecycle_counts:
+        missing.add("lifecycle_counts")
 
     source_stats = {name: SourceStats(**{k: int(v) for k, v in data.items() if k in SourceStats.__dataclass_fields__}) for name, data in sources.items()}
     profile_stats = {name: ProfileStats(**{k: int(v) for k, v in data.items() if k in ProfileStats.__dataclass_fields__}) for name, data in profiles.items()}
@@ -189,6 +200,7 @@ def compute_metrics(
         bins,
         totals.get("matches", 0),
         statuses,
+        lifecycle_counts,
         max(success_times, default=None),
         max(failure_times, default=None),
         tuple(sorted(missing)),
@@ -203,6 +215,30 @@ def _number(value: Any) -> float | None:
 def _in_period(value: Any, since: float, until: float, *, missing_is_valid: bool = False) -> bool:
     number = _number(value)
     return missing_is_valid if number is None else since <= number < until
+
+
+def _job_timestamp(job: dict[str, Any]) -> float | None:
+    """Return the first usable JobTrail lifecycle timestamp.
+
+    The API uses camelCase ISO timestamps; retain snake_case numeric support for
+    older fixtures and cached records. Missing timestamps fail closed.
+    """
+    for key in ("scoredAt", "scored_at", "updatedAt", "updated_at",
+                "retrievedAt", "retrieved_at", "createdAt", "created_at"):
+        if key not in job:
+            continue
+        value = job[key]
+        number = _number(value)
+        if number is not None:
+            return number
+        if isinstance(value, str):
+            try:
+                parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+                if parsed.tzinfo is not None:
+                    return parsed.timestamp()
+            except ValueError:
+                pass
+    return None
 
 
 def _merge_run_dimension(target: dict[str, dict[str, int]], name: Any, run: dict[str, Any]) -> None:

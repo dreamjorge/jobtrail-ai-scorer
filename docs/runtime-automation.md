@@ -1,5 +1,9 @@
 # Runtime Automation
 
+## Lifecycle tracking
+
+The read-only commands `track <job-id>` and `seguimiento <job-id>` show the current lifecycle status and bounded event history only; they never apply or submit an application. A lifecycle transition to `applied` requires the explicit `--confirm` flag. Lifecycle events are append-only JobTrail notes.
+
 ## Automated search and scoring
 
 ### Score feedback
