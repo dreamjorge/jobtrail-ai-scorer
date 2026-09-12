@@ -773,7 +773,7 @@ profile, CV, or description content.
 When Hermes is running in Docker, point `hermes_executable` at the copied Hermes Docker wrapper script. The example `scripts/hermes-docker-wrapper.example.sh` runs:
 
 ```sh
-docker exec "$HERMES_CONTAINER" "$HERMES_BIN" "$@"
+docker exec -i "$HERMES_CONTAINER" "$HERMES_BIN" "$@"
 ```
 
 Configure `HERMES_CONTAINER` and `HERMES_BIN` in the scheduler environment if your container name or Hermes path differs.

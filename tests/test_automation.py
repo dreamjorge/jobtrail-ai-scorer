@@ -162,6 +162,52 @@ def test_automation_dry_run_has_no_write_side_effects():
     assert "private prompt" not in json.dumps(run.notification_preview)
 
 
+def test_automation_dry_run_failure_preview_preserves_bounded_summary():
+    class Adapter:
+        name = "custom"
+
+        def search(self, request):
+            return [NormalizedJob(
+                source="custom",
+                source_job_id="source-1",
+                title="Secret role",
+                company="Acme",
+                description="private prompt",
+                source_url="https://jobs.test/1",
+                location="remote",
+            )]
+
+    notifications = []
+
+    def failing_scorer(job_id, path, payload):
+        raise ValueError("private failure details")
+
+    from jobtrail_ai_scorer.retry import RetryPolicy
+
+    run = JobSearchAutomation(
+        FakeJobTrail(),
+        scorer=failing_scorer,
+        notifier=notifications.append,
+        source_adapters=(Adapter(),),
+        retry_policy=RetryPolicy(max_attempts=1, base_delay=0, max_delay=0),
+    ).run(config=AutomationConfig(
+        scorer_config_path="safe.yaml",
+        dry_run=True,
+        notify_on_failure=True,
+    ))
+
+    assert run.selected is None
+    assert run.failures == ("score:source-1:terminal:ValueError",)
+    assert run.notification_preview == {
+        "kind": "failure_summary",
+        "failure_count": 1,
+        "failures": ["score:source-1:terminal:ValueError"],
+    }
+    assert run.planned_operations["notified"] == 1
+    assert notifications == []
+    assert "private failure details" not in json.dumps(run.notification_preview)
+
+
 def test_automation_config_parses_search_profiles_from_env():
     config = AutomationConfig.from_env(
         {

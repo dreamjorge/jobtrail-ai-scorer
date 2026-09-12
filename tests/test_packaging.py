@@ -39,7 +39,7 @@ def test_hermes_docker_wrapper_uses_safe_configurable_exec():
     assert "set -euo pipefail" in script
     assert 'HERMES_CONTAINER="${HERMES_CONTAINER:-hermes}"' in script
     assert 'HERMES_BIN="${HERMES_BIN:-/opt/hermes/.venv/bin/hermes}"' in script
-    assert 'exec docker exec "$HERMES_CONTAINER" "$HERMES_BIN" "$@"' in script
+    assert 'exec docker exec -i "$HERMES_CONTAINER" "$HERMES_BIN" "$@"' in script
 
     destructive_patterns = [
         "docker compose down",

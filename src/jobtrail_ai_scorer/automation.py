@@ -1241,7 +1241,7 @@ class JobTrailAutomation:
                 notification_preview["cards"] = preview_cards
 
             else:
-                notification_preview = {"kind": "notification_preview"}
+                notification_preview = build_failure_summary(failures)
         return AutomationRun(searched, 0, scored, tuple(failures), best, profile_counts, True,
                              {"searched": searched, "imported": planned_imported, "scored": scored,
                               "notified": planned_notified}, notification_preview)
