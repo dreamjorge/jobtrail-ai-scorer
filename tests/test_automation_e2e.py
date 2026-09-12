@@ -250,13 +250,14 @@ def test_happy_path_drives_full_pipeline(server, state):
 
     # Exactly one best-match WhatsApp message with only allowlisted fields.
     assert len(whatsapp.messages) == 1
-    payload = json.loads(whatsapp.messages[0])
-    _assert_allowlisted_notification_payload(payload)
-    assert payload["score"] == 91
-    assert payload["recommendation"] == "PRIORITY_APPLY"
+    message = whatsapp.messages[0]
+    assert "91/100" in message
+    assert "PRIORITY" in message
+    assert "Fortalezas" in message and "Brechas" in message
+    assert "Ver en JobTrail" in message and "Ver publicación" in message
     # The link is percent-encoded; decode it before comparing to the raw id.
-    assert unquote(payload["jobTrailLink"]).endswith(f"/jobs/{job_id_alpha}")
-    rendered = json.dumps(payload).lower()
+    assert f"/jobs/{job_id_alpha}" in unquote(message)
+    rendered = message.lower()
     for forbidden in (
         "description",
         "candidate",
@@ -555,8 +556,7 @@ def test_redaction_strips_forbidden_tokens_from_notification(server, state):
 
     # The parsed payload still exposes the strengths/gaps arrays but with
     # the sentinels replaced by the redacted placeholder.
-    payload = json.loads(body)
-    flat = json.dumps(payload)
+    flat = body
     for sentinel in (
         "RESUME_SENTINEL",
         "PROFILE_SENTINEL",
@@ -611,16 +611,52 @@ def test_single_notification_invariant_above_threshold(server, state):
     _run(server, scorer=scorer, notifier=whatsapp)
 
     assert len(whatsapp.messages) == 1
-    payload = json.loads(whatsapp.messages[0])
-    assert payload["score"] == 92
-    assert payload["recommendation"] == "PRIORITY_APPLY"
-    _assert_allowlisted_notification_payload(payload)
-    # The run id matches the documented ``YYYY-MM-DD-HHMM-<6 hex>`` shape.
-    assert re.match(r"^\d{4}-\d{2}-\d{2}-\d{4}-[a-f0-9]{6}$", payload["runId"])
-    # Exactly one of the two jobs is referenced by the rendered link.
-    decoded_link = unquote(payload["jobTrailLink"])
-    expected_ids = {
+    message = whatsapp.messages[0]
+    assert message.count("/100") == 2
+    assert message.count("#1") == 1
+    assert message.count("#2") == 1
+    assert message.count("Fortalezas") == 2
+    assert message.count("Brechas") == 2
+    assert message.count("Ver en JobTrail") == 2
+    assert message.count("Ver publicación") == 2
+    assert "C++ Backend Engineer" in message
+    assert "Python Engineer" in message
+    assert "{" not in message and "}" not in message
+    assert '"score"' not in message
+    for job_id in (
         state.id_for("indeed", "alpha-1"),
         state.id_for("linkedin", "beta-2"),
-    }
-    assert any(decoded_link.endswith(f"/jobs/{job_id}") for job_id in expected_ids)
+    ):
+        assert f"/jobs/{job_id}" in unquote(message)
+
+
+def test_e2e_tied_candidates_use_id_deterministic_selector_order(server, state, jobspy):
+    """Selector ordering is stable even when the source reverses candidates."""
+
+    jobspy._listings.reverse()
+    scorer = StubScorer(state, default_score=91, recommendation="PRIORITY_APPLY")
+    whatsapp = StubWhatsApp()
+
+    _run(server, scorer=scorer, notifier=whatsapp)
+
+    message = unquote(whatsapp.messages[0])
+    alpha_id = state.id_for("indeed", "alpha-1")
+    beta_id = state.id_for("linkedin", "beta-2")
+    assert message.index(f"/jobs/{alpha_id}") < message.index(f"/jobs/{beta_id}")
+
+
+def test_e2e_notification_is_one_detailed_card_message_not_raw_json(server, state):
+    """The real pipeline delivers a readable card while preserving one call."""
+
+    scorer = StubScorer(state, default_score=91, recommendation="PRIORITY_APPLY")
+    whatsapp = StubWhatsApp()
+
+    _run(server, scorer=scorer, notifier=whatsapp)
+
+    assert len(whatsapp.messages) == 1
+    message = whatsapp.messages[0]
+    assert "Python Engineer" in message
+    assert "Fortalezas" in message and "Brechas" in message
+    assert "Ver en JobTrail" in message and "Ver publicación" in message
+    assert "{" not in message and "}" not in message
+    assert '"score"' not in message
