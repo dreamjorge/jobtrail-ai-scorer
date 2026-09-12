@@ -137,6 +137,43 @@ def test_invalid_provider_json_does_not_save_note():
     assert result.outcomes[0].reason == "invalid_score"
 
 
+@pytest.mark.parametrize(
+    "response",
+    [
+        json.dumps(VALID_SCORE),
+        "```json\n" + json.dumps(VALID_SCORE) + "\n```",
+    ],
+    ids=["plain-json", "fenced-json"],
+)
+def test_provider_accepts_plain_or_single_fenced_json(response):
+    client = FakeClient([candidate("j1")], {"j1": full_job("j1")})
+
+    result = score_jobs(client, FakeProvider(response), "Generic profile", dry_run=True)
+
+    assert result.processed == 1
+    assert result.failed == 0
+    assert result.outcomes[0].score == VALID_SCORE["score"]
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        "Here is the score: " + json.dumps(VALID_SCORE),
+        json.dumps(VALID_SCORE) + json.dumps(VALID_SCORE),
+    ],
+    ids=["surrounding-prose", "repeated-objects"],
+)
+def test_provider_rejects_prose_or_repeated_json(response):
+    client = FakeClient([candidate("j1")], {"j1": full_job("j1")})
+
+    result = score_jobs(client, FakeProvider(response), "Generic profile")
+
+    assert result.processed == 0
+    assert result.failed == 1
+    assert result.outcomes[0].reason == "invalid_score"
+    assert client.notes == []
+
+
 def test_dry_run_does_not_save_valid_note(capsys):
     client = FakeClient([candidate("j1")], {"j1": full_job("j1")})
 
