@@ -159,11 +159,22 @@ def lifecycle_history(job: Mapping[str, Any]) -> list[dict[str, Any]]:
 
 
 def current_state(job: Mapping[str, Any]) -> str:
-    state = "new"
-    for event in lifecycle_history(job):
-        if event["previous_state"] == state:
-            state = event["new_state"]
-    return state
+    history = lifecycle_history(job)
+    if history:
+        state = "new"
+        for event in history:
+            if event["previous_state"] == state:
+                state = event["new_state"]
+        return state
+
+    # Older jobs may have no lifecycle notes.  Only accept backend values that
+    # are part of our lifecycle vocabulary; unknown backend statuses must not
+    # become lifecycle states.
+    for key in ("applicationStatus", "status"):
+        backend_state = job.get(key)
+        if isinstance(backend_state, str) and backend_state in STATES:
+            return backend_state
+    return "new"
 
 
 def make_lifecycle_event(previous_state: str, new_state: str, *, source: str, source_job_id: str, note: str | None = None, confirm: bool | None = None, source_url: str | None = None, provenance: Mapping[str, Any] | None = None, timestamp: str | None = None) -> str:

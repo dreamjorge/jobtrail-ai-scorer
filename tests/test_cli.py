@@ -332,3 +332,26 @@ def test_track_uses_config_url_and_source_job_id(monkeypatch, tmp_path):
     assert result.exit_code == 0
     assert '"source_job_id":"remote-1"' in writes[0]
     assert '"title":"Engineer"' in writes[0]
+
+
+def test_track_source_override_matches_event_provenance(monkeypatch, tmp_path):
+    config_path = _config(tmp_path)
+    writes = []
+
+    class FakeClient:
+        def __init__(self, _url):
+            pass
+        def get_job(self, job_id):
+            return {"id": job_id, "source": "board", "sourceJobId": "remote-1", "notes": []}
+        def add_note(self, _job_id, body):
+            writes.append(body)
+        def close(self):
+            pass
+
+    monkeypatch.setattr(main, "JobTrailClient", FakeClient)
+    result = runner.invoke(main.app, [
+        "track", "--job-id", "internal-1", "--to", "scored", "--source", "manual",
+        "--config", str(config_path),
+    ])
+    assert result.exit_code == 0
+    assert '"source":"manual"' in writes[0]

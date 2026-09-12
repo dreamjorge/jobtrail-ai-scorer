@@ -111,6 +111,17 @@ def test_lifecycle_counts_prefer_valid_notes_and_fallback_to_backend_status():
     assert view.application_status == {"applied": 1, "rejected": 1}
 
 
+def test_lifecycle_counts_are_independent_of_missing_application_status():
+    note = make_lifecycle_event("new", "scored", source="test", source_job_id="j")
+    view = compute_metrics(
+        runs=[], period="today", now=ts(7),
+        scored_jobs=[{"notes": [{"body": note}], "created_at": ts(7)}],
+    )
+    assert view.lifecycle_counts == {"scored": 1}
+    assert "lifecycle_counts" not in view.missing_data
+    assert "application_status" in view.missing_data
+
+
 def test_status_missing_when_jobs_have_no_safe_status():
     view = compute_metrics(runs=[], period="today", now=ts(7), scored_jobs=[{"score": 50}])
     assert view.application_status == {}

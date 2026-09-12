@@ -344,6 +344,8 @@ config: Path = typer.Option(Path("config.yaml"), "--config"),
             provenance = provenance_from_job(job)
             event_source = source or provenance.get("source", "cli")
             event_source_job_id = provenance.get("source_job_id", job_id)
+            if source is not None:
+                provenance = {**provenance, "source": event_source}
             body = make_lifecycle_event(
                 previous, to, source=event_source, source_job_id=event_source_job_id, note=note,
                 confirm=True if confirm else None, source_url=provenance.get("source_url"),

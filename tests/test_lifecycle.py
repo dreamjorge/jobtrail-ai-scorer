@@ -44,3 +44,9 @@ def test_parser_rejects_noncanonical_and_private_provenance():
             make_lifecycle_event("new", "scored", source="other", source_job_id="remote-1", provenance=provenance)
         with pytest.raises(ValueError, match="provenance.source_job_id"):
             make_lifecycle_event("new", "scored", source="board", source_job_id="internal-1", provenance=provenance)
+
+
+def test_current_state_falls_back_to_valid_backend_status_without_inferencing_unknown_values():
+    assert current_state({"applicationStatus": "applied", "notes": []}) == "applied"
+    assert current_state({"status": "interview", "notes": []}) == "interview"
+    assert current_state({"applicationStatus": "unknown", "status": "not-a-state", "notes": []}) == "new"

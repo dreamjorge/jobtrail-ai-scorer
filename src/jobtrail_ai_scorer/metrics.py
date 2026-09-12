@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from typing import Any, Iterable
 
 from .feedback import FEEDBACK_LABELS, latest_feedback_for_job
-from .lifecycle import current_state, lifecycle_history
+from .lifecycle import current_state
 
 
 @dataclass(frozen=True)
@@ -161,8 +161,7 @@ def compute_metrics(
             sources.setdefault(source, {})["scored"] = sources.get(source, {}).get("scored", 0) + 1
         if isinstance(profile, str) and profile:
             profiles.setdefault(profile, {})["scored"] = profiles.get(profile, {}).get("scored", 0) + 1
-        history = lifecycle_history(job)
-        lifecycle_status = current_state(job) if history else job.get("applicationStatus")
+        lifecycle_status = current_state(job)
         if isinstance(lifecycle_status, str) and lifecycle_status:
             lifecycle_counts[lifecycle_status] = lifecycle_counts.get(lifecycle_status, 0) + 1
         status = job.get("applicationStatus")
@@ -175,7 +174,6 @@ def compute_metrics(
                 feedback_counts[label] += 1
     if selected_jobs and not statuses:
         missing.add("application_status")
-        missing.add("lifecycle_counts")
     if not selected_jobs:
         missing.add("application_status")
     if not selected_jobs or not valid_feedback:
