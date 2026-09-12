@@ -8,6 +8,10 @@ enforce the apply-gate contract via `tests/test_runtime_policy.py` and
 
 Keep the fixture minimal: only the sections needed by the policy tests.
 
+## Score feedback
+
+`feedback <job-id> <label> [comment]` maps to the scorer CLI's `feedback --job-id <job-id> --label <label>` command. It only records feedback; it must not apply or submit jobs. Feedback is never included in WhatsApp or public notification templates.
+
 ## Apply / submit intent
 
 When the user asks to apply, submit, or otherwise send an external

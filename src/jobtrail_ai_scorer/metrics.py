@@ -8,6 +8,8 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Iterable
 
+from .feedback import FEEDBACK_LABELS, latest_feedback_for_job
+
 
 @dataclass(frozen=True)
 class SourceStats:
@@ -46,6 +48,7 @@ class MetricsView:
     last_success_at: float | None = None
     last_failure_at: float | None = None
     missing_data: tuple[str, ...] = ()
+    feedback_counts: dict[str, int] = field(default_factory=dict)
 
     @property
     def notification_count(self) -> int:
@@ -136,6 +139,8 @@ def compute_metrics(
     bins = {f"{start}-{start + 9}": 0 for start in range(0, 90, 10)}
     bins["90-100"] = 0
     statuses: dict[str, int] = {}
+    feedback_counts = {label: 0 for label in FEEDBACK_LABELS}
+    valid_feedback = 0
     for job in selected_jobs:
         score = _score(job)
         if score is not None and 0 <= score <= 100:
@@ -153,10 +158,17 @@ def compute_metrics(
         status = job.get("applicationStatus")
         if isinstance(status, str) and status:
             statuses[status] = statuses.get(status, 0) + 1
+        feedback = latest_feedback_for_job(job)
+        if feedback is not None:
+            valid_feedback += 1
+            for label in feedback["labels"]:
+                feedback_counts[label] += 1
     if selected_jobs and not statuses:
         missing.add("application_status")
     if not selected_jobs:
         missing.add("application_status")
+    if not selected_jobs or not valid_feedback:
+        missing.add("feedback")
 
     source_stats = {name: SourceStats(**{k: int(v) for k, v in data.items() if k in SourceStats.__dataclass_fields__}) for name, data in sources.items()}
     profile_stats = {name: ProfileStats(**{k: int(v) for k, v in data.items() if k in ProfileStats.__dataclass_fields__}) for name, data in profiles.items()}
@@ -180,6 +192,7 @@ def compute_metrics(
         max(success_times, default=None),
         max(failure_times, default=None),
         tuple(sorted(missing)),
+        feedback_counts,
     )
 
 

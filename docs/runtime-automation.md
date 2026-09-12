@@ -2,6 +2,29 @@
 
 ## Automated search and scoring
 
+### Score feedback
+
+Hermes maps `feedback <job-id> <label> [comment]` to `jobtrail-ai-scorer feedback --job-id <job-id> --label <label>`. This records feedback only: it never applies or submits jobs, and feedback is never included in WhatsApp or public notification templates.
+
+The seven feedback labels are:
+
+- `good_match` — the score matched the operator's assessment.
+- `false_positive` — the job should not have been considered a match.
+- `too_senior` — the role is above the candidate's level.
+- `too_junior` — the role is below the candidate's level.
+- `wrong_location` — the location or work arrangement is unsuitable.
+- `missing_skill` — an important skill or requirement was missed.
+- `other` — another explanation not covered above.
+
+Direct CLI usage fetches the job, verifies it has a valid score note, then writes one feedback note:
+
+```sh
+jobtrail-ai-scorer feedback --config config.yaml --job-id JOB_ID \
+  --label good_match --label missing_skill --comment "Relevant stack"
+```
+
+Labels may be repeated or comma-separated (`--label good_match,missing_skill`). The command closes its client on success or validation failure and has no apply or notification side effect. Feedback metadata is bounded and timestamps are canonical UTC ISO-8601 values ending in `Z`.
+
 Run `scripts/automated-job-search.example.py` from an operator-controlled scheduler. It searches LinkedIn and Indeed for the combined Python/C++/MATLAB/backend/API/database/automation/CI/CD/Docker/LLM/agent profile in Queretaro and globally remote roles, imports new results, and scores at most 10 imported jobs. `SCORER_CONFIG_PATH` is required.
 
 Defaults are safe and bounded: `JOBTRAIL_BASE_URL=http://127.0.0.1:8000`, `JOB_SEARCH_RESULTS_WANTED=10`, `JOB_SEARCH_HOURS_OLD=72`, `JOB_SEARCH_MAX_SCORE=10`, and `JOB_SCORE_THRESHOLD=80`. Override `JOB_SEARCH_SITES`, `JOB_SEARCH_TERMS`, `JOB_SEARCH_LOCATIONS` (semicolon-separated), `SCORER_COMMAND`, and `WHATSAPP_NOTIFY_COMMAND` as needed. Optional `JOB_SEARCH_PROFILES` is a JSON array for multiple public search profiles; omit it to use the legacy single-search `JOB_SEARCH_*` fallback.
