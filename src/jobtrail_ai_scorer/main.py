@@ -1,4 +1,5 @@
 """Command-line entry point for scoring JobTrail jobs."""
+import contextlib
 import json
 import logging
 import os
@@ -339,43 +340,66 @@ def run_import_jobright(*, config_path: Path, url: str | None = None,
     if not confirm or dry_run:
         typer.echo("dry-run: no import" if dry_run else "preview: use --confirm to import")
         return preview
+    # Validate all configuration before any confirmed import POST or cache mutation.
     config = load_config(config_path)
+    scoring_config = AutomationConfig.from_env({
+        **os.environ,
+        "SCORER_CONFIG_PATH": str(config_path),
+        "JOBTRAIL_AUTOMATION_DRY_RUN": "0",
+        "JOBTRAIL_BASE_URL": base_url or str(config.jobtrail_base_url),
+    })
     client = (client_factory or (lambda base: JobTrailHTTPClient(base)))(base_url or str(config.jobtrail_base_url))
+    cache_path = Path(os.environ.get("JOBTRAIL_SEEN_CACHE_PATH", "") or DEFAULT_SEEN_CACHE_PATH)
+    cache = (cache_factory or (lambda path: SeenCache(path)))(cache_path)
+    cache_txn = getattr(cache, "transaction", None)
+    cache_warning = None
     try:
-        list_jobs = getattr(client, "list_jobs", None)
-        existing = list_jobs() if callable(list_jobs) else []
-        duplicate = next(
-            (
-                item for item in existing
-                if isinstance(item, dict)
-                and item.get("source") == job.source
-                and str(item.get("sourceJobId")) == job.source_job_id
-            ),
-            None,
-        )
-        if duplicate is not None:
-            typer.echo("duplicate: import skipped")
-            return {
-                **preview,
-                "duplicate": True,
-                "existing": _safe_duplicate_record(duplicate),
-            }
-        result = client.import_job(job.to_import_payload())
-        cache_path = Path(os.environ.get("JOBTRAIL_SEEN_CACHE_PATH", "") or DEFAULT_SEEN_CACHE_PATH)
-        cache = (cache_factory or (lambda path: SeenCache(path)))(cache_path)
-        cache.mark_seen(job.source, job.source_job_id)
-        job_id = result.get("id") if isinstance(result, dict) else result
+        with (cache_txn() if callable(cache_txn) else contextlib.nullcontext()):
+            list_jobs = getattr(client, "list_jobs", None)
+            existing = list_jobs() if callable(list_jobs) else []
+            duplicate = next(
+                (
+                    item for item in existing
+                    if isinstance(item, dict)
+                    and item.get("source") == job.source
+                    and str(item.get("sourceJobId")) == job.source_job_id
+                ),
+                None,
+            )
+            if duplicate is None:
+                should_skip = getattr(cache, "should_skip", None)
+                if callable(should_skip):
+                    try:
+                        if should_skip(
+                            job.source, job.source_job_id,
+                            hours_old=scoring_config.hours_old,
+                        ):
+                            duplicate = {}
+                    except Exception as exc:
+                        # Cache reads are advisory and must not abort import.
+                        cache_warning = f"seen-cache:check:{type(exc).__name__}"
+            if duplicate is not None:
+                typer.echo("duplicate: import skipped")
+                return {
+                    **preview,
+                    "duplicate": True,
+                    "existing": _safe_duplicate_record(duplicate),
+                }
+            result = client.import_job(job.to_import_payload())
+            try:
+                cache.mark_seen(job.source, job.source_job_id)
+            except Exception as exc:
+                cache_warning = f"seen-cache:write:{type(exc).__name__}"
+            job_id = result.get("id") if isinstance(result, dict) else result
+
         typer.echo(f"IMPORTED {job_id}")
-        scoring_config = AutomationConfig.from_env({
-            **os.environ,
-            "SCORER_CONFIG_PATH": str(config_path),
-            "JOBTRAIL_AUTOMATION_DRY_RUN": "0",
-            "JOBTRAIL_BASE_URL": base_url or str(config.jobtrail_base_url),
-        })
         scoring = JobSearchAutomation(client).score_imported_job(
             str(job_id), job.scorer_input, config=scoring_config
         )
         response = {**preview, "id": job_id, **scoring}
+        if cache_warning is not None:
+            response["cache_warning"] = cache_warning
+            typer.echo(f"warning: {cache_warning}")
         if not scoring.get("scored"):
             typer.echo("scoring: suppressed")
         elif scoring.get("notification_sent"):

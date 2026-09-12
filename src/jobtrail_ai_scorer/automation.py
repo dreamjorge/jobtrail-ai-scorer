@@ -946,6 +946,7 @@ class JobTrailAutomation:
                             )
                             with cache_txn:
                                 identity = self._cache_identity(job)
+                                duplicate = None
                                 if count_profiles and identity in imported_by_identity:
                                     profile_counts[profile_name]["duplicates"] += 1
                                     deduplicated += 1
@@ -956,6 +957,22 @@ class JobTrailAutomation:
                                         profile_name,
                                     )
                                     continue
+                                # Recheck backend duplicates while holding the cache
+                                # transaction; the initial listing is only an optimization.
+                                if self.seen_cache is not None:
+                                    list_jobs = getattr(self.gateway, "list_jobs", None)
+                                    if callable(list_jobs):
+                                        try:
+                                            for existing in list_jobs():
+                                                existing_identity = self._normalized_identity(
+                                                    existing.get("source"), existing.get("sourceJobId")
+                                                ) if isinstance(existing, dict) else None
+                                                if existing_identity is not None:
+                                                    existing_by_identity[existing_identity] = existing
+                                        except Exception as exc:
+                                            if getattr(getattr(exc, "response", None), "status_code", None) != 404:
+                                                failures.append(f"changed-jobs:list-unavailable:{type(exc).__name__}")
+                                    duplicate = existing_by_identity.get(identity) if identity else None
                                 if self._is_cached(
                                     job,
                                     hours_old=request.hours_old,
@@ -981,6 +998,33 @@ class JobTrailAutomation:
                                                     "id": job_id_str,
                                                     "notes": existing.get("notes", []),
                                                 }
+                                    continue
+                                if duplicate is not None:
+                                    # Existing records are duplicates unless their
+                                    # content changed; changed records are rescored.
+                                    current_payload = job.to_import_payload()
+                                    stored_fingerprint = self._latest_stored_fingerprint(duplicate.get("notes"))
+                                    changed_job = (
+                                        stored_fingerprint is not None
+                                        and stored_fingerprint != job_fingerprint(current_payload)
+                                    )
+                                    if stored_fingerprint is None:
+                                        changed_job = job_fingerprint(duplicate) != job_fingerprint(current_payload)
+                                    deduplicated += 1
+                                    if not changed_job:
+                                        if count_profiles and isinstance(duplicate.get("id"), str):
+                                            profile_counts[profile_name]["duplicates"] += 1
+                                            self._append_profile_provenance(
+                                                profiles_by_job_id, duplicate["id"], profile_name
+                                            )
+                                        continue
+                                    job_id_str = str(duplicate["id"])
+                                    if job_id_str not in changed_payloads:
+                                        changed += 1
+                                        changed_payloads[job_id_str] = {
+                                            **current_payload, "id": job_id_str,
+                                            "notes": duplicate.get("notes", []),
+                                        }
                                     continue
                                 import_payload = job.to_import_payload()
                                 result = self.gateway.import_job(import_payload)

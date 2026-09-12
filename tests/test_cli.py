@@ -402,6 +402,130 @@ def test_import_jobright_confirm_imports_once_and_marks_cache_after_success(monk
     assert "PRIVATE DESCRIPTION" not in result.output
 
 
+def test_import_jobright_releases_cache_lock_before_scoring(monkeypatch, tmp_path):
+    config_path = _config(tmp_path)
+    state = {"locked": False, "scored_while_locked": None}
+
+    class Cache:
+        def transaction(self):
+            class Transaction:
+                def __enter__(self_inner):
+                    state["locked"] = True
+                def __exit__(self_inner, *_args):
+                    state["locked"] = False
+            return Transaction()
+
+        def should_skip(self, *_args, **_kwargs):
+            return False
+
+        def mark_seen(self, *_args):
+            pass
+
+    class Client:
+        def list_jobs(self):
+            return []
+        def import_job(self, _payload):
+            return {"id": "j1"}
+        def close(self):
+            pass
+
+    class Automation:
+        def __init__(self, _client):
+            pass
+        def score_imported_job(self, *_args, **_kwargs):
+            state["scored_while_locked"] = state["locked"]
+            return {"scored": True, "notification_sent": False}
+
+    monkeypatch.setattr(main, "JobSearchAutomation", Automation)
+    result = main.run_import_jobright(
+        config_path=config_path, url="https://jobright.example/jobs/1",
+        title="Engineer", company="Acme", location="Remote", confirm=True,
+        client_factory=lambda _url: Client(), cache_factory=lambda _path: Cache(),
+    )
+    assert result["scored"] is True
+    assert state["scored_while_locked"] is False
+
+
+def test_import_jobright_cache_read_failure_still_imports_and_scores(monkeypatch, tmp_path):
+    config_path = _config(tmp_path)
+    calls = []
+
+    class Cache:
+        def should_skip(self, *_args, **_kwargs):
+            raise OSError("private cache path")
+        def mark_seen(self, *_args):
+            calls.append("mark")
+
+    class Client:
+        def list_jobs(self):
+            return []
+        def import_job(self, _payload):
+            calls.append("import")
+            return {"id": "j1"}
+        def close(self):
+            pass
+
+    class Automation:
+        def __init__(self, _client):
+            pass
+        def score_imported_job(self, *_args, **_kwargs):
+            calls.append("score")
+            return {"scored": True, "notification_sent": False}
+
+    monkeypatch.setattr(main, "JobSearchAutomation", Automation)
+    result = main.run_import_jobright(
+        config_path=config_path, url="https://jobright.example/jobs/1",
+        title="Engineer", company="Acme", location="Remote", confirm=True,
+        client_factory=lambda _url: Client(), cache_factory=lambda _path: Cache(),
+    )
+    assert calls == ["import", "mark", "score"]
+    assert result["cache_warning"] == "seen-cache:check:OSError"
+
+
+def test_import_jobright_invalid_runtime_config_has_no_effects(monkeypatch, tmp_path):
+    config_path = _config(tmp_path)
+    calls = []
+    monkeypatch.setenv("JOB_SEARCH_RESULTS_WANTED", "not-an-integer")
+
+    with pytest.raises(ValueError):
+        main.run_import_jobright(
+            config_path=config_path, url="https://jobright.example/jobs/1",
+            title="Engineer", company="Acme", location="Remote", confirm=True,
+            client_factory=lambda _url: calls.append("client"),
+            cache_factory=lambda _path: calls.append("cache"),
+        )
+    assert calls == []
+
+
+def test_import_jobright_cache_failure_still_scores(monkeypatch, tmp_path):
+    config_path = _config(tmp_path)
+    calls = []
+
+    class Cache:
+        def mark_seen(self, *_args):
+            raise OSError("private cache path")
+
+    class Client:
+        def list_jobs(self): return []
+        def import_job(self, _payload): calls.append("import"); return {"id": "j1"}
+        def close(self): pass
+
+    class Automation:
+        def __init__(self, _client): pass
+        def score_imported_job(self, *_args, **_kwargs):
+            calls.append("score")
+            return {"scored": True, "notification_sent": False}
+
+    monkeypatch.setattr(main, "JobSearchAutomation", Automation)
+    result = main.run_import_jobright(
+        config_path=config_path, url="https://jobright.example/jobs/1",
+        title="Engineer", company="Acme", location="Remote", confirm=True,
+        client_factory=lambda _url: Client(), cache_factory=lambda _path: Cache(),
+    )
+    assert calls == ["import", "score"]
+    assert result["cache_warning"] == "seen-cache:write:OSError"
+
+
 def test_import_jobright_dry_run_overrides_confirm(monkeypatch, tmp_path):
     config_path = _config(tmp_path)
     calls = []
