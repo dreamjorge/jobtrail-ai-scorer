@@ -14,6 +14,7 @@ from .config import AppConfig, load_config
 from .jobtrail import JobTrailClient
 from .metrics import compute_metrics
 from .feedback import feedback_note_body, validate_labels
+from .lifecycle import STATES, current_state, lifecycle_history, make_lifecycle_event, parse_lifecycle_note, provenance_from_job
 from .run_journal import DEFAULT_RUN_JOURNAL_PATH, iter_runs
 from .seen_cache import DEFAULT_SEEN_CACHE_PATH
 from ._atomic_json import read_json
@@ -312,6 +313,61 @@ def feedback(
     except ValueError as error:
         raise typer.BadParameter(str(error)) from error
     typer.echo(f"FEEDBACK {job_id}")
+
+
+@app.command()
+@app.command("seguimiento")
+def track(
+    job_id: str = typer.Option(..., "--job-id"),
+    to: str | None = typer.Option(None, "--to"),
+    note: str | None = typer.Option(None, "--note"),
+    source: str | None = typer.Option(None, "--source"),
+    confirm: bool = typer.Option(False, "--confirm"),
+    json_output: bool = typer.Option(False, "--json"),
+    base_url: str | None = typer.Option(None, "--base-url"),
+config: Path = typer.Option(Path("config.yaml"), "--config"),
+) -> None:
+    """Show lifecycle status/history, optionally appending one event."""
+    if to is not None and to not in STATES:
+        raise typer.BadParameter("must be a valid lifecycle state", param_hint="--to")
+    if confirm and to is None:
+        raise typer.BadParameter("--confirm requires --to applied")
+    app_config = load_config(config)
+    resolved_base_url = base_url or str(app_config.jobtrail_base_url)
+    client = JobTrailClient(resolved_base_url)
+    try:
+        job = client.get_job(job_id)
+        previous = current_state(job)
+        if to is not None:
+            if confirm and to != "applied":
+                raise typer.BadParameter("--confirm is only valid with --to applied")
+            provenance = provenance_from_job(job)
+            event_source = source or provenance.get("source", "cli")
+            event_source_job_id = provenance.get("source_job_id", job_id)
+            body = make_lifecycle_event(
+                previous, to, source=event_source, source_job_id=event_source_job_id, note=note,
+                confirm=True if confirm else None, source_url=provenance.get("source_url"),
+                provenance=provenance,
+            )
+            client.add_note(job_id, body)
+            history = lifecycle_history(job) + [parse_lifecycle_note(body)]
+            status = to
+        else:
+            history = lifecycle_history(job)
+            status = previous
+        safe_history = [
+            {key: event[key] for key in ("timestamp", "previous_state", "new_state", "source", "source_job_id", "confirmed") if key in event}
+            for event in history if event is not None
+        ]
+        payload = {"job_id": job_id, "current_state": status, "history": safe_history}
+        if json_output:
+            typer.echo(json.dumps(payload, sort_keys=True, separators=(",", ":")))
+        else:
+            typer.echo(f"status={status}")
+            for event in safe_history:
+                typer.echo(f"{event['timestamp']} {event['previous_state']} -> {event['new_state']} ({event['source']})")
+    finally:
+        client.close()
 
 
 @app.command()

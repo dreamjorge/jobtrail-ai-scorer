@@ -187,6 +187,44 @@ def test_score_returns_nonzero_on_failures(monkeypatch, tmp_path):
     assert result.exit_code == 1
 
 
+def test_track_is_read_only_and_json_is_bounded(monkeypatch, tmp_path):
+    calls = []
+
+    class FakeClient:
+        def __init__(self, _url):
+            pass
+        def get_job(self, job_id):
+            return {"id": job_id, "description": "private", "source_url": "https://secret", "notes": []}
+        def add_note(self, *_args):
+            calls.append("add_note")
+        def close(self):
+            pass
+
+    monkeypatch.setattr(main, "JobTrailClient", FakeClient)
+    config_path = _config(tmp_path)
+    result = runner.invoke(main.app, ["track", "--job-id", "j1", "--json", "--config", str(config_path)])
+    assert result.exit_code == 0
+    assert '"current_state":"new"' in result.output
+    assert "description" not in result.output and "https://secret" not in result.output
+    assert calls == []
+
+
+def test_track_fetches_before_transition_and_applied_needs_confirmation(monkeypatch, tmp_path):
+    calls = []
+    class FakeClient:
+        def __init__(self, _url): pass
+        def get_job(self, job_id): calls.append("get"); return {"id": job_id, "notes": []}
+        def add_note(self, *_args): calls.append("add")
+        def close(self): pass
+    monkeypatch.setattr(main, "JobTrailClient", FakeClient)
+    config_path = _config(tmp_path)
+    args = ["--config", str(config_path)]
+    result = runner.invoke(main.app, ["track", "--job-id", "j1", "--to", "scored", *args])
+    assert result.exit_code == 0 and calls == ["get", "add"]
+    result = runner.invoke(main.app, ["track", "--job-id", "j1", "--to", "applied", *args])
+    assert result.exit_code != 0 and calls == ["get", "add", "get"]
+
+
 def test_cli_does_not_duplicate_status_lines(monkeypatch, tmp_path):
     config_path = _config(tmp_path)
     monkeypatch.setattr(main, "run_score", lambda **_: ScoreRunResult(
@@ -273,3 +311,24 @@ def test_run_feedback_rejects_missing_or_invalid_score_marker(notes, tmp_path):
         main.run_feedback(config_path=config_path, job_id="j1", labels=["other"],
                           client_factory=lambda _: FakeClient())
     assert state == {"writes": 0, "closed": True}
+
+
+def test_track_uses_config_url_and_source_job_id(monkeypatch, tmp_path):
+    config_path = _config(tmp_path)
+    writes = []
+
+    class FakeClient:
+        def __init__(self, url):
+            assert url == "http://localhost:3000/"
+        def get_job(self, job_id):
+            return {"id": job_id, "source": "board", "sourceJobId": "remote-1", "position": "Engineer", "notes": []}
+        def add_note(self, job_id, body):
+            writes.append(body)
+        def close(self):
+            pass
+
+    monkeypatch.setattr(main, "JobTrailClient", FakeClient)
+    result = runner.invoke(main.app, ["track", "--job-id", "internal-1", "--to", "scored", "--config", str(config_path)])
+    assert result.exit_code == 0
+    assert '"source_job_id":"remote-1"' in writes[0]
+    assert '"title":"Engineer"' in writes[0]

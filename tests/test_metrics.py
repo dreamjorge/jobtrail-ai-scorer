@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 import pytest
 
 from jobtrail_ai_scorer.metrics import compute_metrics
+from jobtrail_ai_scorer.lifecycle import make_lifecycle_event
 
 
 def ts(day, hour=0):
@@ -55,13 +56,13 @@ def test_empty_and_missing_data_are_explicit():
 
 def test_score_bins_edges_threshold_and_status():
     view = compute_metrics(
-        runs=[], period="30d", now=ts(7), threshold=80,
+        runs=[], period="30d", now=ts(8), threshold=80,
         scored_jobs=[
-            {"source": "a", "searchProfile": "p", "score": 0, "applicationStatus": "new"},
-            {"source": "a", "profile": "p", "score": 9, "applicationStatus": "applied"},
-            {"source": "b", "profile": "q", "score": 10, "applicationStatus": "new"},
-            {"source": "b", "profile": "q", "score": 80, "applicationStatus": "rejected"},
-            {"source": "b", "profile": "q", "score": 100, "applicationStatus": "new"},
+            {"source": "a", "searchProfile": "p", "score": 0, "applicationStatus": "new", "created_at": ts(7)},
+            {"source": "a", "profile": "p", "score": 9, "applicationStatus": "applied", "created_at": ts(7)},
+            {"source": "b", "profile": "q", "score": 10, "applicationStatus": "new", "created_at": ts(7)},
+            {"source": "b", "profile": "q", "score": 80, "applicationStatus": "rejected", "created_at": ts(7)},
+            {"source": "b", "profile": "q", "score": 100, "applicationStatus": "new", "created_at": ts(7)},
         ],
     )
     assert view.score_bins["0-9"] == 2
@@ -89,7 +90,7 @@ def test_source_profile_aggregation_and_redaction():
         runs=[{"started_at": ts(7), "source_counts": {"board": {"searched": 2}},
                "profile_counts": {"senior": {"searched": 2}}}],
         seen_entries=[{"source": "board", "first_seen": ts(7)}, {"source": "board", "first_seen": ts(7)}],
-        scored_jobs=[{"source": "board", "profile": "senior", "score": 81,
+        scored_jobs=[{"source": "board", "profile": "senior", "score": 81, "created_at": ts(7),
                       "description": "secret", "notes": [{"body": "secret"}],
                       "metadata": {"secret": 1}, "jobUrl": "https://secret"}],
         period="today", now=ts(7, 12),
@@ -100,7 +101,32 @@ def test_source_profile_aggregation_and_redaction():
     assert all(secret not in raw for secret in ("secret", "https://secret"))
 
 
+def test_lifecycle_counts_prefer_valid_notes_and_fallback_to_backend_status():
+    note = make_lifecycle_event("new", "scored", source="test", source_job_id="j")
+    view = compute_metrics(
+        runs=[], period="today", now=ts(7),
+        scored_jobs=[{"notes": [{"body": note}], "applicationStatus": "applied", "created_at": ts(7)}, {"applicationStatus": "rejected", "created_at": ts(7)}],
+    )
+    assert view.lifecycle_counts == {"rejected": 1, "scored": 1}
+    assert view.application_status == {"applied": 1, "rejected": 1}
+
+
 def test_status_missing_when_jobs_have_no_safe_status():
     view = compute_metrics(runs=[], period="today", now=ts(7), scored_jobs=[{"score": 50}])
     assert view.application_status == {}
     assert "application_status" in view.missing_data
+
+
+def test_jobtrail_camel_case_timestamps_filter_jobs_and_missing_fails_closed():
+    now = ts(7, 12)
+    view = compute_metrics(
+        runs=[], period="30d", now=now,
+        scored_jobs=[
+            {"createdAt": "2025-01-07T01:00:00Z", "score": 80, "applicationStatus": "new"},
+            {"updatedAt": "2024-12-01T01:00:00Z", "score": 90, "applicationStatus": "old"},
+            {"score": 100, "applicationStatus": "unknown"},
+        ],
+    )
+    assert view.score_bins["80-89"] == 1
+    assert view.score_bins["90-100"] == 0
+    assert view.application_status == {"new": 1}

@@ -12,6 +12,12 @@ Keep the fixture minimal: only the sections needed by the policy tests.
 
 `feedback <job-id> <label> [comment]` maps to the scorer CLI's `feedback --job-id <job-id> --label <label>` command. It only records feedback; it must not apply or submit jobs. Feedback is never included in WhatsApp or public notification templates.
 
+## Read-only lifecycle tracking
+
+- `track <job-id>` and `seguimiento <job-id>` map to read-only lifecycle status/history display.
+- These commands show status/history only and never apply or submit.
+- A transition to `applied` requires explicit confirmation (`--confirm`).
+
 ## Apply / submit intent
 
 When the user asks to apply, submit, or otherwise send an external
