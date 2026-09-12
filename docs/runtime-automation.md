@@ -4,6 +4,52 @@
 
 The read-only commands `track <job-id>` and `seguimiento <job-id>` show the current lifecycle status and bounded event history only; they never apply or submit an application. A lifecycle transition to `applied` requires the explicit `--confirm` flag. Lifecycle events are append-only JobTrail notes.
 
+## Safe manual Jobright import
+
+Use `jobtrail-ai-scorer import-jobright` when an operator has manually copied a
+Jobright posting. The command accepts fields locally and does not fetch the URL.
+With only a URL, it runs interactively and prompts for title, company, location,
+and an optional description:
+
+```sh
+jobtrail-ai-scorer import-jobright --config config.yaml \
+  --url https://jobright.example/jobs/placeholder
+```
+
+For non-interactive use, provide the complete JSON object. This example contains
+placeholders only:
+
+```sh
+jobtrail-ai-scorer import-jobright --config config.yaml --input '{
+  "url": "https://jobright.example/jobs/placeholder",
+  "title": "Example engineering role",
+  "company": "Example company",
+  "location": "Remote",
+  "description": "Placeholder description for local scoring"
+}' --confirm
+```
+
+The command emits a sanitized preview before any write. It includes the fixed
+`jobright_manual` provenance, deterministic URL-derived `sourceJobId`, URL,
+title, company, location, and a `scoring_will_run` indicator. It does not emit
+descriptions, notes, credentials, or other private context. Preview is the
+normal default: an import requires explicit `--confirm`.
+
+`--dry-run` dominates `--confirm`; with both flags, the command reports
+`dry-run: no import` and performs no client, import, scoring, notification, or
+seen-cache operation. Confirmed imports check for an existing matching pair of
+`(source, sourceJobId)` before posting. A duplicate is reported as
+`duplicate: import skipped`; it is not imported again, scored, notified, or
+marked in the cache. The source is always `jobright_manual`, and the identity is
+derived from the normalized HTTPS URL.
+
+After a new confirmed import succeeds, the existing scoring and notification
+pipeline is reused. Its score validation, threshold, score-note deduplication,
+and optional notification behavior are unchanged. This flow is deliberately
+not a scraper or application agent: it does not scrape Jobright, control a
+browser, autofill forms, message recruiters, submit an application, or set the
+lifecycle state to `applied`. No public Jobright API integration is implemented.
+
 ## Automated search and scoring
 
 ### Score feedback
