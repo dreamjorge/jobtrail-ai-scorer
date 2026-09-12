@@ -1,4 +1,6 @@
 """Focused tests for the public scorer command."""
+import json
+
 import pytest
 from pydantic import ValidationError
 
@@ -355,3 +357,122 @@ def test_track_source_override_matches_event_provenance(monkeypatch, tmp_path):
     ])
     assert result.exit_code == 0
     assert '"source":"manual"' in writes[0]
+
+
+def test_import_jobright_preview_requires_confirmation_and_redacts_description(monkeypatch, tmp_path):
+    config_path = _config(tmp_path)
+    calls = []
+    class FakeClient:
+        def __init__(self, _url): pass
+        def list_jobs(self): calls.append("list"); return []
+        def import_job(self, payload): calls.append(("import", payload)); return {"id": "j1"}
+        def close(self): calls.append("close")
+    monkeypatch.setattr(main, "JobTrailHTTPClient", FakeClient)
+    result = runner.invoke(main.app, ["import-jobright", "--url", "https://jobright.example/jobs/1", "--title", "Engineer", "--company", "Acme", "--location", "Remote", "--description", "PRIVATE DESCRIPTION", "--config", str(config_path)])
+    assert result.exit_code == 0
+    assert "Engineer" in result.output and "Acme" in result.output
+    assert "PRIVATE DESCRIPTION" not in result.output
+    assert calls == []
+
+
+def test_import_jobright_confirm_imports_once_and_marks_cache_after_success(monkeypatch, tmp_path):
+    config_path = _config(tmp_path)
+    calls = []
+    scorer_payloads = []
+    class Cache:
+        def mark_seen(self, source, source_job_id): calls.append(("cache", source, source_job_id))
+    class FakeClient:
+        def __init__(self, _url): pass
+        def list_jobs(self): calls.append("list"); return []
+        def import_job(self, payload): calls.append(("import", payload)); return {"id": "j1"}
+        def close(self): calls.append("close")
+    class FakeAutomation:
+        def __init__(self, _client): pass
+        def score_imported_job(self, _job_id, payload, *, config):
+            scorer_payloads.append(payload)
+            return {"scored": False, "notification_sent": False}
+    monkeypatch.setattr(main, "JobSearchAutomation", FakeAutomation)
+    monkeypatch.setattr(main, "JobTrailHTTPClient", FakeClient)
+    monkeypatch.setattr(main, "SeenCache", lambda _path: Cache())
+    result = runner.invoke(main.app, ["import-jobright", "--url", "https://jobright.example/jobs/1", "--title", "Engineer", "--company", "Acme", "--location", "Remote", "--description", "PRIVATE DESCRIPTION", "--confirm", "--config", str(config_path)])
+    assert result.exit_code == 0
+    assert [item if isinstance(item, str) else item[0] for item in calls] == ["list", "import", "cache", "close"]
+    assert calls[1][1].get("description") is None
+    assert scorer_payloads == [{"title": "Engineer", "company": "Acme", "location": "Remote", "source": "jobright_manual", "sourceUrl": "https://jobright.example/jobs/1", "description": "PRIVATE DESCRIPTION"}]
+    assert "PRIVATE DESCRIPTION" not in result.output
+
+
+def test_import_jobright_dry_run_overrides_confirm(monkeypatch, tmp_path):
+    config_path = _config(tmp_path)
+    calls = []
+    class FakeClient:
+        def __init__(self, _url): calls.append("client")
+        def import_job(self, _payload): calls.append("import"); return {"id": "j1"}
+        def close(self): calls.append("close")
+    monkeypatch.setattr(main, "JobTrailHTTPClient", FakeClient)
+    result = runner.invoke(main.app, ["import-jobright", "--url", "https://jobright.example/jobs/1", "--title", "Engineer", "--company", "Acme", "--location", "Remote", "--confirm", "--dry-run", "--config", str(config_path)])
+    assert result.exit_code == 0 and "dry-run" in result.output
+    assert calls == []
+
+
+def test_import_jobright_duplicate_does_not_post(monkeypatch, tmp_path):
+    config_path = _config(tmp_path)
+    calls = []
+    job = {"url": "https://jobright.example/jobs/1", "title": "Engineer", "company": "Acme", "location": "Remote"}
+    source_job_id = main.normalize_jobright_manual(job).source_job_id
+    existing = {"id": "existing", "source": "jobright_manual", "sourceJobId": source_job_id,
+                "title": "Engineer", "company": "Acme", "location": "Remote",
+                "sourceUrl": job["url"], "description": "PRIVATE EXISTING DESCRIPTION",
+                "notes": [{"body": "PRIVATE NOTE"}]}
+    class FakeClient:
+        def __init__(self, _url): pass
+        def list_jobs(self): return [existing]
+        def import_job(self, _payload): calls.append("import"); return {"id": "new"}
+        def close(self): calls.append("close")
+    class NeverAutomation:
+        def __init__(self, _client): calls.append("scoring")
+    monkeypatch.setattr(main, "JobTrailHTTPClient", FakeClient)
+    monkeypatch.setattr(main, "JobSearchAutomation", NeverAutomation)
+    result = main.run_import_jobright(config_path=config_path, url=job["url"], title=job["title"],
+                                      company=job["company"], location=job["location"], confirm=True)
+    assert result["duplicate"] is True
+    assert result["existing"] == {"id": "existing", "source": "jobright_manual", "sourceJobId": source_job_id,
+                                   "title": "Engineer", "company": "Acme", "location": "Remote",
+                                   "url": job["url"]}
+    assert calls == ["close"]
+    assert "PRIVATE EXISTING DESCRIPTION" not in json.dumps(result)
+
+
+def test_import_jobright_url_only_prompts_for_required_fields(monkeypatch, tmp_path):
+    config_path = _config(tmp_path)
+    calls = []
+    class FakeClient:
+        def __init__(self, _url): calls.append("client")
+        def close(self): pass
+    monkeypatch.setattr(main, "JobTrailHTTPClient", FakeClient)
+    result = runner.invoke(main.app, ["import-jobright", "--url", "https://jobright.example/jobs/1", "--config", str(config_path)], input="Engineer\nAcme\nRemote\n\n")
+    assert result.exit_code == 0
+    assert "Engineer" in result.output and calls == []
+
+
+def test_import_jobright_backend_failure_does_not_mark_cache(monkeypatch, tmp_path):
+    config_path = _config(tmp_path)
+    marked = []
+    class Cache:
+        def mark_seen(self, *_args): marked.append(True)
+    class FakeClient:
+        def __init__(self, _url): pass
+        def list_jobs(self): return []
+        def import_job(self, _payload): raise RuntimeError("backend unavailable")
+        def close(self): pass
+    monkeypatch.setattr(main, "JobTrailHTTPClient", FakeClient)
+    monkeypatch.setattr(main, "SeenCache", lambda _path: Cache())
+    result = runner.invoke(main.app, ["import-jobright", "--url", "https://jobright.example/jobs/1", "--title", "Engineer", "--company", "Acme", "--location", "Remote", "--confirm", "--config", str(config_path)])
+    assert result.exit_code != 0 and marked == []
+
+
+def test_import_jobright_invalid_input_has_no_client(monkeypatch, tmp_path):
+    config_path = _config(tmp_path)
+    monkeypatch.setattr(main, "JobTrailHTTPClient", lambda _: pytest.fail("client must not be created"))
+    result = runner.invoke(main.app, ["import-jobright", "--url", "http://not-https", "--confirm", "--config", str(config_path)])
+    assert result.exit_code != 0

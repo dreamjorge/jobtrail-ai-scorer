@@ -699,6 +699,13 @@ class JobTrailAutomation:
                 )
         self.source_adapters = source_adapters
 
+    def _configure_runtime(self, config: AutomationConfig) -> None:
+        """Apply the per-run settings used by scorer and notifier calls."""
+        self._scorer_command = config.scorer_command
+        self._whatsapp_command = config.whatsapp_command
+        self._dry_run = config.dry_run
+        self.base_url = config.base_url
+
     def _invoke_scorer(self, job_id: str, config_path: str,
                        payload: dict[str, Any] | None = None) -> Any:
         """Call injected scorers with payload when supported."""
@@ -781,14 +788,64 @@ class JobTrailAutomation:
             shlex.split(self._whatsapp_command), input=message, text=True, check=True
         )
 
+    def score_imported_job(
+        self,
+        job_id: str,
+        payload: Mapping[str, Any],
+        *,
+        config: AutomationConfig,
+    ) -> dict[str, Any]:
+        """Score one already-imported job and apply normal alert policy.
+
+        This narrower path never searches, imports, changes lifecycle state, or
+        touches the application API. Scorer failures are bounded and do not
+        cause the already-completed import to be retried.
+        """
+        self._configure_runtime(config)
+        try:
+            retry_call(
+                self._invoke_scorer,
+                job_id,
+                config.scorer_config_path,
+                dict(payload),
+                policy=self._scorer_retry_policy,
+                sleep=self._scorer_retry_sleep,
+                label=f"scorer score {job_id}",
+            )
+            job = self.gateway.get_job(job_id)
+            score = parse_score_note(job.get("notes"))
+            if not isinstance(score, Mapping):
+                return {"scored": False, "notification_sent": False, "reason": "score_unavailable"}
+            if score.get("score", -1) < config.score_threshold:
+                return {
+                    "scored": True,
+                    "score": score.get("score"),
+                    "notification_sent": False,
+                    "reason": "below_threshold",
+                }
+            body = self._compose_notification(
+                selected=[(job_id, {}, job, dict(score))],
+                failures=(),
+                notify_enabled=config.notify_enabled,
+                notify_on_failure=config.notify_on_failure,
+                base_url=config.base_url,
+            )
+            if body is None:
+                return {"scored": True, "score": score.get("score"), "notification_sent": False}
+            self.notifier(body)
+            return {"scored": True, "score": score.get("score"), "notification_sent": True}
+        except Exception as exc:
+            return {
+                "scored": False,
+                "notification_sent": False,
+                "reason": type(exc).__name__,
+            }
+
     def run(self, *, config: AutomationConfig) -> AutomationRun:
         started_at = self._clock()
         if not config.scorer_config_path:
             raise ValueError("SCORER_CONFIG_PATH is required")
-        self._scorer_command = config.scorer_command
-        self._whatsapp_command = config.whatsapp_command
-        self._dry_run = config.dry_run
-        self.base_url = config.base_url
+        self._configure_runtime(config)
 
         if config.dry_run:
             if self._preflight_runner is not None:
