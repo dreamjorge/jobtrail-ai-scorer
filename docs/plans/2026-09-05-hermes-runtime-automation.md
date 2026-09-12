@@ -1,5 +1,7 @@
 # Hermes Runtime Automation Implementation Plan
 
+> **Historical plan note:** the notification helper now uses Hermes direct `send --to "$HERMES_WHATSAPP_TARGET"` with pre-rendered bounded text; the earlier LLM-mediated invocation below is superseded.
+
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** Add safe example automation for running JobTrail AI scorer against the existing Hermes Docker/WhatsApp runtime without committing private config or secrets.
@@ -122,7 +124,7 @@ Run targeted test.
 Assert the helper:
 - requires an explicit `WHATSAPP_NOTIFY_ENABLED=1`
 - uses `HERMES_PROFILE`, defaulting to `job-search`
-- invokes Hermes with `--profile "$HERMES_PROFILE" -z "$PROMPT" --cli`
+- invokes Hermes direct `send --to "$HERMES_WHATSAPP_TARGET"` with the already-rendered summary
 - sends only summary/log metadata, not raw job descriptions or candidate profile content
 - does not contain destructive Docker commands.
 
@@ -132,7 +134,7 @@ Run targeted test.
 
 **Step 3: Implement helper**
 
-Create a script that accepts summary text as arguments/stdin, builds a short prompt requesting WhatsApp delivery through connected Hermes tools, and exits nonzero if Hermes fails.
+Create a script that accepts already-rendered summary text as arguments/stdin, sends it unchanged through Hermes direct `send`, and exits nonzero if Hermes fails.
 
 **Step 4: Run test to verify it passes**
 

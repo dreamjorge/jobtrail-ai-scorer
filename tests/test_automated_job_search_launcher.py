@@ -8,6 +8,10 @@ package (hyphenated filename), so it is loaded by path like the other
 from __future__ import annotations
 
 import importlib.util
+import os
+import shutil
+import stat
+import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -270,6 +274,97 @@ def test_dry_run_env_propagates_without_flag(monkeypatch, launcher) -> None:
 
     assert launcher.main() == 0
     assert captured == {"seen_cache": None, "dry_run": True}
+
+
+def _copy_notify_helper(tmp_path: Path) -> Path:
+    helper = tmp_path / "notify-whatsapp-via-hermes.example.sh"
+    shutil.copy2(ROOT / "scripts/notify-whatsapp-via-hermes.example.sh", helper)
+    helper.chmod(helper.stat().st_mode | stat.S_IXUSR)
+    return helper
+
+
+def test_whatsapp_launcher_direct_sends_rendered_stdin_unchanged(tmp_path) -> None:
+    helper = _copy_notify_helper(tmp_path)
+    fake_hermes = tmp_path / "fake-hermes"
+    args_path = tmp_path / "args.txt"
+    body_path = tmp_path / "body.txt"
+    fake_hermes.write_text(
+        "#!/usr/bin/env bash\n"
+        "printf '%s\\n' \"$@\" > \"$FAKE_ARGS_PATH\"\n"
+        "cat > \"$FAKE_BODY_PATH\"\n"
+    )
+    fake_hermes.chmod(fake_hermes.stat().st_mode | stat.S_IXUSR)
+    rendered = "#1 Python Engineer\nVer publicación: https://jobs.test/1\n"
+    env = {
+        **os.environ,
+        "WHATSAPP_NOTIFY_ENABLED": "1",
+        "HERMES_EXECUTABLE": str(fake_hermes),
+        "FAKE_ARGS_PATH": str(args_path),
+        "FAKE_BODY_PATH": str(body_path),
+        "HERMES_WHATSAPP_TARGET": "whatsapp:Test Recipient",
+    }
+
+    result = subprocess.run(
+        [str(helper)], input=rendered, env=env, text=True,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+    )
+
+    assert result.returncode == 0
+    assert args_path.read_text().splitlines() == [
+        "send", "--to", "whatsapp:Test Recipient"
+    ]
+    assert body_path.read_text() == rendered
+
+
+def test_whatsapp_launcher_requires_explicit_target(tmp_path) -> None:
+    helper = _copy_notify_helper(tmp_path)
+    fake_hermes = tmp_path / "fake-hermes"
+    args_path = tmp_path / "args.txt"
+    body_path = tmp_path / "body.txt"
+    fake_hermes.write_text(
+        "#!/usr/bin/env bash\n"
+        "printf '%s\\n' \"$@\" > \"$FAKE_ARGS_PATH\"\n"
+        "cat > \"$FAKE_BODY_PATH\"\n"
+    )
+    fake_hermes.chmod(fake_hermes.stat().st_mode | stat.S_IXUSR)
+    env = {
+        **os.environ,
+        "WHATSAPP_NOTIFY_ENABLED": "1",
+        "HERMES_EXECUTABLE": str(fake_hermes),
+        "FAKE_ARGS_PATH": str(args_path),
+        "FAKE_BODY_PATH": str(body_path),
+    }
+    rendered = "2 new matches; log: /tmp/jobtrail.log"
+
+    result = subprocess.run(
+        [str(helper), rendered], env=env, text=True,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+    )
+
+    assert result.returncode == 2
+    assert "HERMES_WHATSAPP_TARGET" in result.stderr
+    assert "non-empty" in result.stderr
+    assert not args_path.exists()
+    assert not body_path.exists()
+
+
+def test_whatsapp_launcher_empty_input_fails_without_invoking_hermes(tmp_path) -> None:
+    helper = _copy_notify_helper(tmp_path)
+    marker = tmp_path / "called"
+    fake_hermes = tmp_path / "fake-hermes"
+    fake_hermes.write_text(f"#!/usr/bin/env bash\ntouch {marker}\n")
+    fake_hermes.chmod(fake_hermes.stat().st_mode | stat.S_IXUSR)
+
+    result = subprocess.run(
+        [str(helper)], input="  \n", env={
+            **os.environ,
+            "WHATSAPP_NOTIFY_ENABLED": "1",
+            "HERMES_EXECUTABLE": str(fake_hermes),
+        }, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+    )
+
+    assert result.returncode == 2
+    assert not marker.exists()
 
 
 def test_container_defaults_when_neither_flag_nor_env_set(

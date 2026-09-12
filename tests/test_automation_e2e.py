@@ -250,13 +250,14 @@ def test_happy_path_drives_full_pipeline(server, state):
 
     # Exactly one best-match WhatsApp message with only allowlisted fields.
     assert len(whatsapp.messages) == 1
-    payload = json.loads(whatsapp.messages[0])
-    _assert_allowlisted_notification_payload(payload)
-    assert payload["score"] == 91
-    assert payload["recommendation"] == "PRIORITY_APPLY"
+    message = whatsapp.messages[0]
+    assert "91/100" in message
+    assert "PRIORITY" in message
+    assert "Fortalezas" in message and "Brechas" in message
+    assert "Ver en JobTrail" in message and "Ver publicación" in message
     # The link is percent-encoded; decode it before comparing to the raw id.
-    assert unquote(payload["jobTrailLink"]).endswith(f"/jobs/{job_id_alpha}")
-    rendered = json.dumps(payload).lower()
+    assert f"/jobs/{job_id_alpha}" in unquote(message)
+    rendered = message.lower()
     for forbidden in (
         "description",
         "candidate",
@@ -297,11 +298,15 @@ def test_digest_top_n_notifies_once_in_score_then_job_id_order():
 
     assert result.selected["score"] == 95
     assert len(whatsapp.messages) == 1
-    payload = json.loads(whatsapp.messages[0])
-    assert [unquote(entry["jobTrailLink"]).rsplit("/", 1)[-1] for entry in payload["entries"]] == [
-        "indeed:a-1", "indeed:b-2", "indeed:c-3"
-    ]
-    assert [entry["score"] for entry in payload["entries"]] == [95, 95, 90]
+    message = unquote(whatsapp.messages[0])
+    assert "A role" in message and "B role" in message and "C role" in message
+    assert message.index("/jobs/indeed:a-1") < message.index("/jobs/indeed:b-2")
+    assert message.index("/jobs/indeed:b-2") < message.index("/jobs/indeed:c-3")
+    assert "Fortalezas" in message and "Brechas" in message
+    assert "{" not in message and "}" not in message
+
+    assert message.count("95/100") == 2
+    assert message.count("90/100") == 1
 
 
 def test_digest_equal_scores_are_deterministic_when_input_order_reverses():
@@ -322,11 +327,10 @@ def test_digest_equal_scores_are_deterministic_when_input_order_reverses():
             whatsapp = StubWhatsApp()
             _run(server, scorer=EqualScorer(state), notifier=whatsapp,
                  config_overrides={"digest_top_n": 3})
-            payload = json.loads(whatsapp.messages[0])
-            observed.append([
-                unquote(entry["jobTrailLink"]).rsplit("/", 1)[-1]
-                for entry in payload["entries"]
-            ])
+            message = unquote(whatsapp.messages[0])
+            observed.append(sorted(
+                ("indeed:a-1", "indeed:z-9"), key=message.index
+                                ))
 
     assert observed == [["indeed:a-1", "indeed:z-9"]] * 2
 
@@ -383,12 +387,12 @@ def test_digest_entries_are_allowlisted_bounded_and_redacted():
         _run(server, scorer=RedactingScorer(state), notifier=whatsapp,
              config_overrides={"digest_top_n": 3})
 
-    payload = json.loads(whatsapp.messages[0])
-    rendered = json.dumps(payload)
-    assert all(set(entry) <= set(ALLOWED_FIELDS) for entry in payload["entries"])
-    assert all(len(item) <= 200 for entry in payload["entries"] for item in entry["strengths"])
+    message = whatsapp.messages[0]
+    assert "[REDACTED]" in message
+    assert "x" * 201 not in message
     for forbidden in ("RESUME_SENTINEL", "PROFILE_SENTINEL", "PROMPT_SENTINEL", "CREDENTIAL_SENTINEL"):
-        assert forbidden not in rendered
+        assert forbidden not in message
+    assert "{" not in message and "}" not in message
 
 
 def test_dry_run_searches_without_writes_and_previews_redacted_notification(
@@ -555,8 +559,7 @@ def test_redaction_strips_forbidden_tokens_from_notification(server, state):
 
     # The parsed payload still exposes the strengths/gaps arrays but with
     # the sentinels replaced by the redacted placeholder.
-    payload = json.loads(body)
-    flat = json.dumps(payload)
+    flat = body
     for sentinel in (
         "RESUME_SENTINEL",
         "PROFILE_SENTINEL",
@@ -611,16 +614,46 @@ def test_single_notification_invariant_above_threshold(server, state):
     _run(server, scorer=scorer, notifier=whatsapp)
 
     assert len(whatsapp.messages) == 1
-    payload = json.loads(whatsapp.messages[0])
-    assert payload["score"] == 92
-    assert payload["recommendation"] == "PRIORITY_APPLY"
-    _assert_allowlisted_notification_payload(payload)
-    # The run id matches the documented ``YYYY-MM-DD-HHMM-<6 hex>`` shape.
-    assert re.match(r"^\d{4}-\d{2}-\d{2}-\d{4}-[a-f0-9]{6}$", payload["runId"])
-    # Exactly one of the two jobs is referenced by the rendered link.
-    decoded_link = unquote(payload["jobTrailLink"])
-    expected_ids = {
-        state.id_for("indeed", "alpha-1"),
-        state.id_for("linkedin", "beta-2"),
-    }
-    assert any(decoded_link.endswith(f"/jobs/{job_id}") for job_id in expected_ids)
+    message = whatsapp.messages[0]
+    assert message.count("/100") == 1
+    assert message.count("Fortalezas") == 1
+    assert message.count("Brechas") == 1
+    assert message.count("Ver en JobTrail") == 1
+    assert message.count("Ver publicación") == 1
+    assert "Python Engineer" in message
+    assert "{" not in message and "}" not in message
+    assert '"score"' not in message
+    assert f"/jobs/{state.id_for('indeed', 'alpha-1')}" in unquote(message)
+
+
+def test_e2e_tied_candidates_use_id_deterministic_selector_order(server, state, jobspy):
+    """Selector ordering is stable even when the source reverses candidates."""
+
+    jobspy._listings.reverse()
+    scorer = StubScorer(state, default_score=91, recommendation="PRIORITY_APPLY")
+    whatsapp = StubWhatsApp()
+
+    _run(server, scorer=scorer, notifier=whatsapp,
+         config_overrides={"digest_top_n": 2})
+
+    message = unquote(whatsapp.messages[0])
+    alpha_id = state.id_for("indeed", "alpha-1")
+    beta_id = state.id_for("linkedin", "beta-2")
+    assert message.index(f"/jobs/{alpha_id}") < message.index(f"/jobs/{beta_id}")
+
+
+def test_e2e_notification_is_one_detailed_card_message_not_raw_json(server, state):
+    """The real pipeline delivers a readable card while preserving one call."""
+
+    scorer = StubScorer(state, default_score=91, recommendation="PRIORITY_APPLY")
+    whatsapp = StubWhatsApp()
+
+    _run(server, scorer=scorer, notifier=whatsapp)
+
+    assert len(whatsapp.messages) == 1
+    message = whatsapp.messages[0]
+    assert "Python Engineer" in message
+    assert "Fortalezas" in message and "Brechas" in message
+    assert "Ver en JobTrail" in message and "Ver publicación" in message
+    assert "{" not in message and "}" not in message
+    assert '"score"' not in message

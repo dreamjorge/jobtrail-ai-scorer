@@ -33,7 +33,7 @@ Run `scripts/automated-job-search.example.py` from an operator-controlled schedu
 
 Defaults are safe and bounded: `JOBTRAIL_BASE_URL=http://127.0.0.1:8000`, `JOB_SEARCH_RESULTS_WANTED=10`, `JOB_SEARCH_HOURS_OLD=72`, `JOB_SEARCH_MAX_SCORE=10`, and `JOB_SCORE_THRESHOLD=80`. Override `JOB_SEARCH_SITES`, `JOB_SEARCH_TERMS`, `JOB_SEARCH_LOCATIONS` (semicolon-separated), `SCORER_COMMAND`, and `WHATSAPP_NOTIFY_COMMAND` as needed. Optional `JOB_SEARCH_PROFILES` is a JSON array for multiple public search profiles; omit it to use the legacy single-search `JOB_SEARCH_*` fallback. `WHATSAPP_DIGEST_TOP_N` is an opt-in integer from 1 to 5 (default 1) controlling how many qualifying matches are included in one bounded digest, ordered by descending score and then job ID.
 
-Set `WHATSAPP_NOTIFY_COMMAND=./notify-whatsapp-via-hermes.local.sh` (the helper accepts the summary on stdin), then set `WHATSAPP_NOTIFY_ENABLED=1` only when the configured Hermes notification helper is ready. At most one summary is sent per run, and only when one or more validated scores reach the threshold. With the default `WHATSAPP_DIGEST_TOP_N=1` this preserves the single highest-score behavior; larger values include the ordered top-N entries in one bounded digest. Each entry contains title, company, location, score, recommendation, recommendation label, strengths, gaps, the external job URL, the JobTrail link, and the run identifier, plus optional selected public `searchProfiles` names only when profile provenance exists. See [Daily WhatsApp summary fields](#daily-whatsapp-summary-fields) for the contract and the optional `WHATSAPP_SHORT_URL_BASE` shortener. This workflow writes `[AI_JOB_SCORE_V1]` notes and sends WhatsApp when enabled, but **never applies to jobs automatically**. It must not expose descriptions, profiles, prompts, notes, credentials, or secrets.
+Set `WHATSAPP_NOTIFY_COMMAND=./notify-whatsapp-via-hermes.local.sh` (the helper accepts the already-rendered card on stdin), then set `WHATSAPP_NOTIFY_ENABLED=1` only when the Hermes direct-send helper is ready. The run invokes the helper at most once: one WhatsApp message may contain the configured top-N score-ordered cards (bounded to 5), plus one bounded failure line when `WHATSAPP_NOTIFY_ON_FAILURE` is enabled. See [Daily WhatsApp summary fields](#daily-whatsapp-summary-fields) for the detailed card layout, allowlisted fields, and the optional `WHATSAPP_SHORT_URL_BASE` shortener. This workflow writes `[AI_JOB_SCORE_V1]` notes and sends WhatsApp when enabled, but **never applies to jobs automatically**. It must not expose descriptions, profiles, prompts, notes, credentials, or secrets.
 
 ### Full-automation dry-run
 
@@ -543,7 +543,42 @@ absent:
 | `jobUrl` | `job.jobUrl` / `job.job_url` | External apply URL. |
 | `jobTrailLink` | derived | `base_url` (after `JOBTRAIL_BASE_URL` resolution) joined with `/jobs/<id>`, percent-encoded. Omitted when the job has no id. |
 | `runId` | derived | `YYYY-MM-DD-HHMM-<6-char hex>` for the daily run; deterministic for the same stamp + seed. |
-| `searchProfiles` | selected profile provenance | Optional public profile names for the selected job only; first 5 entries, each clipped to 200 characters and scrubbed like every other string. |
+| `searchProfiles` | selected profile provenance | Optional public profile names for each selected card; first 5 entries, each clipped to 200 characters and scrubbed like every other string. |
+
+This is a closed allowlist: fields not listed above are discarded before rendering. All emitted text is bounded and scrubbed; descriptions, prompts, candidate profiles, notes, reasoning, credentials, and secrets are never notification fields.
+
+### Rendered card layout and one-message invariant
+
+The notification is rendered as one plain-text message. Each card has this shape:
+
+```text
+━━━━━━━━━━━━━━━━━━━━
+🏆 #N · <score>/100 · <recommendation> · <recommendation label>
+<title>
+🏢 <company> · 📍 <location>
+🔎 <selected public search profile names>       # only when provenance exists
+
+✅ Fortalezas
+• <up to 5 bounded strengths>
+
+⚠️ Brechas
+• <up to 5 bounded gaps>
+
+🔗 Ver en JobTrail
+<jobTrailLink>
+🔗 Ver publicación
+<jobUrl>
+━━━━━━━━━━━━━━━━━━━━
+```
+
+The title, company, location, URLs, and list items are each clipped to 200
+characters; strengths, gaps, and profile names are capped at five entries.
+Empty optional sections and links are omitted. A single selected match has
+no rank; a digest with multiple matches is score-ordered and capped at 10
+cards. The automation calls `WHATSAPP_NOTIFY_COMMAND` once per run, passing
+this complete rendered message through stdin unchanged. If failure alerts
+are enabled, their bounded JSON is appended to that same message rather
+than sent separately.
 
 ### URL shortener (opt-in)
 
@@ -587,8 +622,8 @@ orchestration boundary, not just in unit tests.
 ### WHATSAPP_NOTIFY_ON_FAILURE opt-in
 
 `WHATSAPP_NOTIFY_ON_FAILURE=1` (or `true`/`yes`/`on`) appends a bounded
-failure summary to the WhatsApp helper message when the run finishes with at
-least one failure. It is independent of `WHATSAPP_NOTIFY_ENABLED`:
+failure summary to the same WhatsApp helper message when the run finishes
+with at least one failure. It is independent of `WHATSAPP_NOTIFY_ENABLED`:
 
 - `notify_enabled=False`, `notify_on_failure=True`: a failure summary is sent
   only when failures were recorded.
@@ -738,41 +773,33 @@ profile, CV, or description content.
 When Hermes is running in Docker, point `hermes_executable` at the copied Hermes Docker wrapper script. The example `scripts/hermes-docker-wrapper.example.sh` runs:
 
 ```sh
-docker exec "$HERMES_CONTAINER" "$HERMES_BIN" "$@"
+docker exec -i "$HERMES_CONTAINER" "$HERMES_BIN" "$@"
 ```
 
 Configure `HERMES_CONTAINER` and `HERMES_BIN` in the scheduler environment if your container name or Hermes path differs.
 
 ## Runner usage
 
-> **Deprecated.** The `run-scorer.example.sh` runner was moved under
-> [`scripts/legacy/`](scripts/legacy/README.md) in Issue #8 and is kept only
-> as a historical reference. New scheduler units must drive
-> `scripts/automated-job-search.example.py` directly. The guidance below is
-> retained verbatim so existing operators can keep their local `run-scorer.local.sh`
-> copies running until they migrate; the wrapper itself is marked
-> `DEPRECATED` and will be removed.
+The canonical scheduler entry point is
+`scripts/automated-job-search.example.py`; it performs the bounded search,
+import, scoring, and optional notification workflow. `SCORER_CONFIG_PATH`
+must point to the local ignored scorer YAML. The launcher supplies the
+configured scorer command for each job; do not invoke the historical
+`scripts/legacy/run-scorer.example.sh` wrapper.
 
-Start with dry-run mode:
+Start with a full-automation dry run:
 
 ```sh
 export SCORER_CONFIG_PATH="$PWD/config.yaml"
-export SCORER_COMMAND=jobtrail-ai-scorer  # direct CLI/launcher only; never run-scorer.sh
-export WHATSAPP_NOTIFY_COMMAND=./notify-whatsapp-via-hermes.local.sh  # reads summary from stdin
-export SCORER_LIMIT=1
-export SCORER_DRY_RUN=1
-export SCORER_LOG_DIR=/tmp/jobtrail-ai-scorer-logs
-./run-scorer.local.sh
+export WHATSAPP_NOTIFY_COMMAND=./notify-whatsapp-via-hermes.local.sh
+export JOBTRAIL_AUTOMATION_DRY_RUN=1
+./scripts/automated-job-search.example.py --no-discover
 ```
 
-After reviewing the dry-run log, run real mode only when you are ready for the scorer to write JobTrail notes:
-
-```sh
-export SCORER_DRY_RUN=0
-./run-scorer.local.sh
-```
-
-Use `SCORER_COMMAND` when the direct scorer CLI/launcher is not on `PATH`; it defaults to `jobtrail-ai-scorer`. It is invoked as `SCORER_COMMAND score --config CONFIG --job-id ID`; do not set it to the batch `run-scorer.sh` runner. Use a small `SCORER_LIMIT` until scheduling behavior is proven. The runner preserves the scorer exit code and prints the log path.
+After reviewing the output, remove `JOBTRAIL_AUTOMATION_DRY_RUN` (or set it
+to `0`) only when you are ready for the scorer to write JobTrail notes.
+Use `--base-url` or the documented discovery flags when selecting the
+backend; the launcher prints the resolved source to stderr.
 
 ## Scheduler choices
 
@@ -784,18 +811,28 @@ Choose one scheduler; do not enable duplicate schedules.
 
 Keep the first scheduled run in dry-run first mode, then switch to real mode after reviewing output.
 
-## WhatsApp via Hermes `job-search`
+## WhatsApp via Hermes direct send
 
-WhatsApp notification is optional and disabled unless `WHATSAPP_NOTIFY_ENABLED=1`. The helper sends through Hermes with the `job-search` profile by default:
+WhatsApp notification is optional and disabled unless
+`WHATSAPP_NOTIFY_ENABLED=1`. The helper receives the fully rendered card
+message on stdin and invokes Hermes directly; it does not call an LLM to
+format, summarize, or reinterpret the message.
 
 ```sh
 export WHATSAPP_NOTIFY_ENABLED=1
+export WHATSAPP_NOTIFY_COMMAND=./notify-whatsapp-via-hermes.local.sh
 export HERMES_EXECUTABLE=./hermes-docker-wrapper.local.sh
-export HERMES_PROFILE=job-search
-./notify-whatsapp-via-hermes.local.sh "2 new high-confidence matches; log: /tmp/jobtrail-ai-scorer-logs/scorer-example.log"
+export HERMES_WHATSAPP_TARGET="whatsapp:operator"
+./scripts/automated-job-search.example.py --no-discover
 ```
 
-Send summaries only. Do not include raw prompts, candidate profile content, job descriptions, notes, tokens, credentials, or secrets in WhatsApp messages. Include counts, status, and log metadata that an operator can use to inspect the local log securely.
+The launcher passes the rendered stdin unchanged. The helper sends exactly
+`"$HERMES_EXECUTABLE" send --to "$HERMES_WHATSAPP_TARGET"`; `HERMES_WHATSAPP_TARGET` must
+be set to a non-blank recipient in the local scheduler environment when notifications
+are enabled. There is no example recipient fallback: configure the real target locally
+and never commit it. Do not include raw prompts,
+candidate profile content, job descriptions, notes, tokens, credentials, or
+secrets in WhatsApp messages. Send summaries only.
 
 ## Hermetic end-to-end tests
 

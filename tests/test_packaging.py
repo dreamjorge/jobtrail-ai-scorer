@@ -39,7 +39,7 @@ def test_hermes_docker_wrapper_uses_safe_configurable_exec():
     assert "set -euo pipefail" in script
     assert 'HERMES_CONTAINER="${HERMES_CONTAINER:-hermes}"' in script
     assert 'HERMES_BIN="${HERMES_BIN:-/opt/hermes/.venv/bin/hermes}"' in script
-    assert 'exec docker exec "$HERMES_CONTAINER" "$HERMES_BIN" "$@"' in script
+    assert 'exec docker exec -i "$HERMES_CONTAINER" "$HERMES_BIN" "$@"' in script
 
     destructive_patterns = [
         "docker compose down",
@@ -316,16 +316,17 @@ def test_run_scorer_example_captures_pipeline_status_immediately():
         assert lines[index + 1].strip() == 'scorer_exit="${PIPESTATUS[0]}"'
 
 
-def test_whatsapp_notification_helper_uses_safe_hermes_defaults():
+def test_whatsapp_notification_helper_requires_safe_hermes_target():
     script = (ROOT / "scripts/notify-whatsapp-via-hermes.example.sh").read_text()
 
     assert "set -euo pipefail" in script
     assert 'WHATSAPP_NOTIFY_ENABLED" != "1"' in script
-    assert 'HERMES_PROFILE="${HERMES_PROFILE:-job-search}"' in script
+    assert 'HERMES_WHATSAPP_TARGET="${HERMES_WHATSAPP_TARGET:-}"' in script
+    assert "HERMES_WHATSAPP_TARGET must be set to a non-empty local recipient" in script
+    assert "whatsapp:" not in script
     assert 'HERMES_EXECUTABLE="${HERMES_EXECUTABLE:-hermes}"' in script
-    assert '"$HERMES_EXECUTABLE" --profile "$HERMES_PROFILE" -z "$PROMPT" --cli' in script
+    assert 'printf \'%s\' "$SUMMARY_TEXT" | "$HERMES_EXECUTABLE" send --to "$HERMES_WHATSAPP_TARGET"' in script
     assert "summary" in script.lower()
-    assert "log" in script.lower()
 
     forbidden_sensitive_inputs = [
         "JOB_DESCRIPTION",
@@ -384,16 +385,18 @@ def test_whatsapp_notification_helper_disabled_does_not_invoke_hermes(tmp_path):
     assert not marker.exists()
 
 
-def test_whatsapp_notification_helper_invokes_configured_hermes_with_metadata(tmp_path):
+def test_whatsapp_notification_helper_sends_summary_directly_to_configured_target(tmp_path):
     helper = tmp_path / "notify-whatsapp-via-hermes.example.sh"
     shutil.copy2(ROOT / "scripts/notify-whatsapp-via-hermes.example.sh", helper)
     helper.chmod(helper.stat().st_mode | stat.S_IXUSR)
 
     fake_hermes = tmp_path / "fake-hermes"
     args_path = tmp_path / "hermes-args.txt"
+    body_path = tmp_path / "hermes-body.txt"
     fake_hermes.write_text(
         "#!/usr/bin/env bash\n"
         "printf '%s\\n' \"$@\" > \"$FAKE_HERMES_ARGS_PATH\"\n"
+        "cat > \"$FAKE_HERMES_BODY_PATH\"\n"
         "exit 0\n"
     )
     fake_hermes.chmod(fake_hermes.stat().st_mode | stat.S_IXUSR)
@@ -402,8 +405,9 @@ def test_whatsapp_notification_helper_invokes_configured_hermes_with_metadata(tm
         **os.environ,
         "WHATSAPP_NOTIFY_ENABLED": "1",
         "HERMES_EXECUTABLE": str(fake_hermes),
-        "HERMES_PROFILE": "job-search-test",
+        "HERMES_WHATSAPP_TARGET": "whatsapp:Test Recipient",
         "FAKE_HERMES_ARGS_PATH": str(args_path),
+        "FAKE_HERMES_BODY_PATH": str(body_path),
     }
 
     result = subprocess.run(
@@ -417,12 +421,11 @@ def test_whatsapp_notification_helper_invokes_configured_hermes_with_metadata(tm
 
     assert result.returncode == 0
     args = args_path.read_text().splitlines()
-    assert args[:3] == ["--profile", "job-search-test", "-z"]
-    assert args[-1] == "--cli"
-    prompt = "\n".join(args[3:-1])
+    assert args == ["send", "--to", "whatsapp:Test Recipient"]
+    prompt = body_path.read_text()
     assert "2 new matches" in prompt
     assert "log: /tmp/jobtrail.log" in prompt
-    assert "WhatsApp" in prompt
+    assert "WhatsApp" not in prompt
     for sensitive_phrase in [
         "job description:",
         "candidate profile:",

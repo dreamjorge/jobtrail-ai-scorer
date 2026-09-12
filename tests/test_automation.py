@@ -14,6 +14,7 @@ from jobtrail_ai_scorer.automation import (
     DISCOVER_DEFAULT_CONTAINER,
     map_jobspy_job,
     build_notification_summary,
+    format_whatsapp_cards,
     merge_resolved_base_url,
     parse_score_note,
     resolve_automation_base_url,
@@ -159,6 +160,52 @@ def test_automation_dry_run_has_no_write_side_effects():
     assert run.planned_operations == {"searched": 1, "imported": 1, "scored": 1, "notified": 1}
     assert run.notification_preview["company"] == "Acme"
     assert "private prompt" not in json.dumps(run.notification_preview)
+
+
+def test_automation_dry_run_failure_preview_preserves_bounded_summary():
+    class Adapter:
+        name = "custom"
+
+        def search(self, request):
+            return [NormalizedJob(
+                source="custom",
+                source_job_id="source-1",
+                title="Secret role",
+                company="Acme",
+                description="private prompt",
+                source_url="https://jobs.test/1",
+                location="remote",
+            )]
+
+    notifications = []
+
+    def failing_scorer(job_id, path, payload):
+        raise ValueError("private failure details")
+
+    from jobtrail_ai_scorer.retry import RetryPolicy
+
+    run = JobSearchAutomation(
+        FakeJobTrail(),
+        scorer=failing_scorer,
+        notifier=notifications.append,
+        source_adapters=(Adapter(),),
+        retry_policy=RetryPolicy(max_attempts=1, base_delay=0, max_delay=0),
+    ).run(config=AutomationConfig(
+        scorer_config_path="safe.yaml",
+        dry_run=True,
+        notify_on_failure=True,
+    ))
+
+    assert run.selected is None
+    assert run.failures == ("score:source-1:terminal:ValueError",)
+    assert run.notification_preview == {
+        "kind": "failure_summary",
+        "failure_count": 1,
+        "failures": ["score:source-1:terminal:ValueError"],
+    }
+    assert run.planned_operations["notified"] == 1
+    assert notifications == []
+    assert "private failure details" not in json.dumps(run.notification_preview)
 
 
 def test_automation_config_parses_search_profiles_from_env():
@@ -1059,8 +1106,9 @@ def test_selected_notification_includes_public_search_profiles():
     )
 
     assert result.selected["searchProfiles"] == ["python", "backend"]
-    message = json.loads(notifier.messages[0])
-    assert message["searchProfiles"] == ["python", "backend"]
+    message = notifier.messages[0]
+    assert "python" in message
+    assert "backend" in message
 
 
 def test_selected_notification_contains_job_and_score_data(monkeypatch):
@@ -1086,33 +1134,16 @@ def test_selected_notification_contains_job_and_score_data(monkeypatch):
 
     assert summary_args[0][0] is gateway.jobs["j1"]
     assert summary_args[0][1]["score"] == 91
-    message = json.loads(notifier.messages[0])
-    assert set(message) == {
-        "title",
-        "company",
-        "location",
-        "score",
-        "recommendation",
-        "recommendationLabel",
-        "strengths",
-        "gaps",
-        "jobUrl",
-        "jobTrailLink",
-        "runId",
-    }
-    assert message["title"] == "Python Engineer"
-    assert message["company"] == "Acme"
-    assert message["location"] == "Queretaro"
-    assert message["jobUrl"] == "https://jobs.test/1"
-    assert message["score"] == 91
-    assert message["recommendation"] == "PRIORITY_APPLY"
-    assert message["recommendationLabel"] == "Priority Apply"
-    assert message["strengths"] == ["Python"]
-    assert message["gaps"] == ["None"]
-    assert message["jobTrailLink"] == "http://jobtrail.example.com/jobs/j1"
-    import re as _re
-
-    assert _re.match(r"^\d{4}-\d{2}-\d{2}-\d{4}-[a-f0-9]{6}$", message["runId"])
+    message = notifier.messages[0]
+    assert "Python Engineer" in message
+    assert "Acme" in message and "Queretaro" in message
+    assert "91/100" in message
+    assert "PRIORITY" in message and "Priority Apply" in message
+    assert "• Python" in message and "• None" in message
+    assert "http://jobtrail.example.com/jobs/j1" in message
+    assert "Fortalezas" in message and "Brechas" in message
+    assert "runId" not in message
+    assert "{\"" not in message
 
 
 def test_no_notification_when_score_below_threshold():
@@ -1849,12 +1880,11 @@ def test_compose_notification_includes_three_new_fields_in_run():
     )
 
     assert len(notifier.messages) == 1
-    message = json.loads(notifier.messages[0])
-    # The three new fields are present and stable.
-    assert message["jobTrailLink"].endswith("/jobs/j1")
-    assert message["jobTrailLink"].startswith("http://jobtrail.example.com")
-    assert message["recommendationLabel"] in {"Apply", "Priority Apply", "Review", "Skip"}
-    assert _RUN_ID_PATTERN.match(message["runId"])
+    message = notifier.messages[0]
+    # The card preserves the public link and recommendation label without JSON keys.
+    assert "http://jobtrail.example.com/jobs/j1" in message
+    assert "Priority Apply" in message
+    assert "runId" not in message
 
 
 def test_compose_notification_link_uses_whatsapp_short_url_base(monkeypatch):
@@ -1874,10 +1904,9 @@ def test_compose_notification_link_uses_whatsapp_short_url_base(monkeypatch):
         )
     )
 
-    message = json.loads(notifier.messages[0])
-    assert message["jobTrailLink"].startswith("https://sho.rt/")
-    assert message["jobTrailLink"].endswith("/jobs/j1")
-    assert "jobtrail.example.com" not in message["jobTrailLink"]
+    message = notifier.messages[0]
+    assert "https://sho.rt/jobs/j1" in message
+    assert "jobtrail.example.com" not in message
 
 
 def test_compose_notification_redacts_sensitive_substrings_in_run():
@@ -2769,6 +2798,110 @@ def test_run_journal_records_breaker_open_once(tmp_path):
     result = automation.run(config=AutomationConfig(scorer_config_path="safe/config.yaml", run_journal_path=str(tmp_path / "runs.jsonl")))
     assert result.failures == ("breaker:open",)
     assert len(calls) == 1
+
+
+# --- detailed WhatsApp card formatting ----------------------------------------
+
+
+def _bounded_card_summary(**overrides):
+    summary = {
+        "title": "Software Engineer (AI Training)",
+        "company": "Alignerr",
+        "location": "Remote",
+        "score": 93,
+        "recommendation": "PRIORITY_APPLY",
+        "recommendationLabel": "Priority Apply",
+        "strengths": ["Python", "Distributed systems"],
+        "gaps": ["Limited Go experience"],
+        "jobUrl": "https://jobs.example/offer-1",
+        "jobTrailLink": "https://jobtrail.example/jobs/j1",
+        "runId": "2025-04-19-0930-a1b2c3",
+    }
+    summary.update(overrides)
+    return summary
+
+
+def test_format_whatsapp_cards_single_card_has_detailed_readable_structure():
+    rendered = format_whatsapp_cards([_bounded_card_summary()])
+
+    assert "Software Engineer (AI Training)" in rendered
+    assert "Alignerr" in rendered and "Remote" in rendered
+    assert "93/100" in rendered
+    assert "PRIORITY" in rendered
+    assert "Fortalezas" in rendered and "• Python" in rendered
+    assert "Brechas" in rendered and "• Limited Go experience" in rendered
+    assert "Ver en JobTrail" in rendered
+    assert "Ver publicación" in rendered
+    assert "#1" not in rendered
+    assert "{" not in rendered and "}" not in rendered
+    assert '"score"' not in rendered and "runId" not in rendered
+
+
+def test_format_whatsapp_cards_numbers_and_separates_multi_card_digest():
+    rendered = format_whatsapp_cards([
+        _bounded_card_summary(title="First", score=95),
+        _bounded_card_summary(title="Second", score=94),
+        _bounded_card_summary(title="Third", score=90),
+    ])
+
+    separator = "━━━━━━━━━━━━━━━━━━━━"
+    assert rendered.count("#1") == 1
+    assert rendered.count("#2") == 1
+    assert rendered.count("#3") == 1
+    assert rendered.index("First") < rendered.index("Second") < rendered.index("Third")
+    assert rendered.count(separator) >= 4
+    sections = rendered.split(separator)
+    assert any("First" in section and "#1" in section for section in sections)
+    assert any("Second" in section and "#2" in section for section in sections)
+    assert any("Third" in section and "#3" in section for section in sections)
+    assert rendered.count("Ver en JobTrail") == 3
+
+
+def test_format_whatsapp_cards_preserves_selector_input_order():
+    cards = [
+        _bounded_card_summary(title="Zulu", company="Zeta", score=91),
+        _bounded_card_summary(title="Alpha", company="Acme", score=91),
+    ]
+
+    rendered = format_whatsapp_cards(cards)
+    assert rendered.index("Zulu") < rendered.index("Alpha")
+
+
+def test_format_whatsapp_cards_omits_empty_fields_and_missing_links():
+    card = _bounded_card_summary(strengths=[], gaps=[], jobUrl="", jobTrailLink="")
+    card.pop("location")
+    card.pop("recommendationLabel")
+    rendered = format_whatsapp_cards([card])
+
+    assert "Fortalezas" not in rendered
+    assert "Brechas" not in rendered
+    assert "Remote" not in rendered
+    assert "Ver en JobTrail" not in rendered
+    assert "Ver publicación" not in rendered
+    assert "Software Engineer (AI Training)" in rendered
+
+
+def test_format_whatsapp_cards_preserves_allowlist_bounds_and_forbidden_token_safety():
+    strengths = [f"strength-{index}-" + "S" * 200 for index in range(10)]
+    gaps = [f"gap-{index}-" + "G" * 200 for index in range(10)]
+    rendered = format_whatsapp_cards([_bounded_card_summary(
+        title="RESUME_SENTINEL " + "T" * 200,
+        company="PROFILE_SENTINEL",
+        strengths=["PROMPT_SENTINEL", "CREDENTIAL_SENTINEL", *strengths],
+        gaps=["/DATA/private", *gaps],
+        unexpected_field="UNEXPECTED_FIELD_SENTINEL",
+        another_unexpected_field={"description": "private"},
+    )])
+
+    for forbidden in ("RESUME_SENTINEL", "PROFILE_SENTINEL", "PROMPT_SENTINEL",
+                      "CREDENTIAL_SENTINEL", "/DATA/"):
+        assert forbidden not in rendered
+    assert "UNEXPECTED_FIELD_SENTINEL" not in rendered
+    assert "description" not in rendered.lower()
+    assert rendered.count("• strength-") <= 5
+    assert rendered.count("• gap-") <= 5
+    assert len(rendered) <= 2500
+    assert "{" not in rendered and "}" not in rendered
 
 
 def test_run_journal_records_preflight_abort_once(tmp_path):
