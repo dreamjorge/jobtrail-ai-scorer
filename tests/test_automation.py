@@ -2911,3 +2911,85 @@ def test_run_journal_records_preflight_abort_once(tmp_path):
     result = automation.run(config=AutomationConfig(scorer_config_path="safe/config.yaml", run_journal_path=str(tmp_path / "runs.jsonl")))
     assert result.searched == 0
     assert len(calls) == 1
+
+
+def test_score_imported_job_notifies_only_after_threshold():
+    gateway = FakeJobTrail()
+    gateway.import_job({"source": "jobright_manual", "sourceJobId": "manual-1", "position": "Engineer", "description": "work"})
+    notifications = []
+    scorer = FakeScorer()
+    scorer.jobs = gateway.jobs
+    instance = JobSearchAutomation(gateway, scorer=scorer, notifier=notifications.append)
+    result = instance.score_imported_job("j1", gateway.jobs["j1"], config=AutomationConfig(scorer_config_path="safe.yaml", notify_enabled=True))
+    assert result["scored"] is True
+    assert result["notification_sent"] is True
+    assert len(notifications) == 1
+    assert gateway.searches == []
+
+
+def test_score_imported_job_suppresses_threshold_and_scoring_failure():
+    gateway = FakeJobTrail()
+    gateway.import_job({"source": "jobright_manual", "sourceJobId": "manual-1", "position": "Engineer", "description": "work"})
+    notifications = []
+
+    def low_score(job_id, _config_path, payload=None):
+        gateway.jobs[job_id]["notes"] = [{"body": "[AI_JOB_SCORE_V1]\n{\"score\":79}"}]
+
+    instance = JobSearchAutomation(gateway, scorer=low_score, notifier=notifications.append)
+    low = instance.score_imported_job("j1", gateway.jobs["j1"], config=AutomationConfig(scorer_config_path="safe.yaml", notify_enabled=True))
+    assert low["reason"] == "below_threshold"
+    assert notifications == []
+
+    failing = JobSearchAutomation(gateway, scorer=lambda *_: (_ for _ in ()).throw(RuntimeError("provider response secret")), notifier=notifications.append)
+    failed = failing.score_imported_job("j1", gateway.jobs["j1"], config=AutomationConfig(scorer_config_path="safe.yaml", notify_enabled=True))
+    assert failed["scored"] is False
+    assert failed["notification_sent"] is False
+    assert "secret" not in str(failed)
+
+
+def test_score_imported_job_uses_configured_runtime_after_manual_import(monkeypatch):
+    gateway = FakeJobTrail()
+    gateway.import_job({
+        "source": "jobright_manual",
+        "sourceJobId": "manual-configured",
+        "position": "Engineer",
+        "company": "Acme",
+        "location": "Remote",
+    })
+    subprocess_calls = []
+
+    def fake_run(args, **kwargs):
+        subprocess_calls.append((args, kwargs))
+        if "score" in args:
+            gateway.jobs["j1"]["notes"] = [{
+                "body": "[AI_JOB_SCORE_V1]\n{\"score\":95}",
+            }]
+        return None
+
+    monkeypatch.setattr(automation.subprocess, "run", fake_run)
+    config = AutomationConfig(
+        scorer_command="/opt/custom-scorer --profile cv-review",
+        scorer_config_path="/etc/jobtrail/custom-cv.yaml",
+        whatsapp_command="/opt/custom-notifier --account reviewed",
+        base_url="http://configured-jobtrail:9100",
+        notify_enabled=True,
+    )
+
+    result = JobSearchAutomation(gateway).score_imported_job(
+        "j1", gateway.jobs["j1"], config=config
+    )
+
+    assert result == {
+        "scored": True,
+        "score": 95,
+        "notification_sent": True,
+    }
+    scorer_args, scorer_kwargs = subprocess_calls[0]
+    assert scorer_args[:4] == ["/opt/custom-scorer", "--profile", "cv-review", "score"]
+    assert "--config" in scorer_args
+    assert "/etc/jobtrail/custom-cv.yaml" in scorer_args
+    assert scorer_args[scorer_args.index("--base-url") + 1] == "http://configured-jobtrail:9100"
+    assert scorer_kwargs["input"]
+    notifier_args, notifier_kwargs = subprocess_calls[1]
+    assert notifier_args == ["/opt/custom-notifier", "--account", "reviewed"]
+    assert "http://configured-jobtrail:9100" in notifier_kwargs["input"]

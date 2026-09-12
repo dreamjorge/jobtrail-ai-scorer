@@ -163,6 +163,10 @@ def _make_handler(state: StubJobTrailState) -> type[BaseHTTPRequestHandler]:
         def do_GET(self) -> None:  # noqa: N802
             parsed = urlparse(self.path)
             parts = parsed.path.split("/")
+            if parsed.path == "/api/jobs":
+                with state.lock:
+                    self._write_json(200, list(state.jobs.values()))
+                return
             # /api/jobs/<id> — ``id`` may itself contain URL-encoded slashes
             if len(parts) >= 4 and parts[1] == "api" and parts[2] == "jobs":
                 job_id = unquote("/".join(parts[3:]))

@@ -28,6 +28,47 @@ Run `jobtrail-ai-scorer score --config config.yaml [OPTIONS]`. Options include `
 The default marker enables deduplication: jobs with a marked score are skipped; `--force` re-scores them.
 `score --dry-run` is scorer-only: it validates and reports scores without writing notes. It does not run the full search/import/notification automation.
 
+### Safe manual Jobright import
+
+`import-jobright` accepts a Jobright posting copied by an operator. It never
+fetches the posting: the URL and fields are entered locally. URL-only usage is
+interactive and prompts for the required title, company, and location (plus
+an optional description):
+
+```sh
+jobtrail-ai-scorer import-jobright \
+  --config config.yaml \
+  --url https://jobright.example/jobs/placeholder
+```
+
+For a complete non-interactive run, pass a JSON object with placeholder data:
+
+```sh
+jobtrail-ai-scorer import-jobright --config config.yaml --input '{
+  "url": "https://jobright.example/jobs/placeholder",
+  "title": "Example engineering role",
+  "company": "Example company",
+  "location": "Remote",
+  "description": "Placeholder description for local scoring"
+}' --confirm
+```
+
+The command first prints a sanitized preview containing provenance, a
+deterministic URL-derived identity, URL, title, company, location, and
+whether scoring will run. Descriptions and existing notes are never printed.
+Nothing is imported without explicit `--confirm`. `--dry-run` dominates
+`--confirm`, prints `dry-run: no import`, and performs no network or cache
+operation. A duplicate `(source, sourceJobId)` is reported and skipped
+without another import, scoring, or cache mark. Provenance is always the
+fixed source `jobright_manual`.
+
+After a new confirmed import, the existing scoring and notification pipeline
+is reused; normal score validation, threshold, deduplication, and optional
+notification rules apply. This is strictly a manual import aid: it does not
+scrape Jobright, control a browser, autofill forms, message recruiters,
+submit applications, or set a lifecycle state to `applied`. No public
+Jobright API integration is implemented.
+
 For Hermes, configure `hermes_executable`, `hermes_profile`, and optional
 `provider_timeout_seconds` in your local YAML (the executable must already be installed).
 OpenAI-compatible providers use an endpoint/model and an API-key environment variable.

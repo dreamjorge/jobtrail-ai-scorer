@@ -1,4 +1,5 @@
 """Command-line entry point for scoring JobTrail jobs."""
+import contextlib
 import json
 import logging
 import os
@@ -12,11 +13,13 @@ import typer
 
 from .config import AppConfig, load_config
 from .jobtrail import JobTrailClient
+from .automation import AutomationConfig, JobSearchAutomation, JobTrailHTTPClient
+from .jobright_manual import normalize_jobright_manual
 from .metrics import compute_metrics
 from .feedback import feedback_note_body, validate_labels
 from .lifecycle import STATES, current_state, lifecycle_history, make_lifecycle_event, parse_lifecycle_note, provenance_from_job
 from .run_journal import DEFAULT_RUN_JOURNAL_PATH, iter_runs
-from .seen_cache import DEFAULT_SEEN_CACHE_PATH
+from .seen_cache import DEFAULT_SEEN_CACHE_PATH, SeenCache
 from ._atomic_json import read_json
 from .prompt_budget import LoadStatus, PromptBudget
 from .prompt_tokens import estimate_sections, optional_budget_from_env
@@ -264,6 +267,173 @@ def _read_seen_entries(path: Path) -> list[dict]:
         source, source_job_id = key.split("\x1f", 1)
         result.append({"source": source, "sourceJobId": source_job_id, "first_seen": value.get("first_seen")})
     return result
+
+
+def _manual_input(*, url: str | None, title: str | None, company: str | None,
+                  location: str | None, description: str | None,
+                  input_text: str | None) -> object:
+    """Resolve and validate manual fields before constructing any client."""
+    values: dict[str, object] = {}
+    if input_text is not None:
+        try:
+            parsed = json.loads(input_text)
+        except json.JSONDecodeError as exc:
+            raise ValueError("input must be valid JSON") from exc
+        if not isinstance(parsed, dict):
+            raise ValueError("input must be a JSON object")
+        values.update(parsed)
+    for key, value in (("url", url), ("title", title), ("company", company),
+                       ("location", location), ("description", description)):
+        if value is not None:
+            values[key] = value
+    required_missing = False
+    for key, label in (("url", "Jobright URL"), ("title", "Title"),
+                       ("company", "Company"), ("location", "Location")):
+        if key not in values:
+            required_missing = True
+            values[key] = typer.prompt(label)
+    if "description" not in values:
+        values["description"] = (
+            typer.prompt("Description (optional)", default="")
+            if required_missing else ""
+        )
+    return normalize_jobright_manual(values)
+
+
+def _safe_duplicate_record(record: object) -> dict[str, str]:
+    """Return bounded, non-sensitive details for a duplicate response."""
+    if not isinstance(record, dict):
+        return {}
+    values = {
+        "id": record.get("id"),
+        "source": record.get("source"),
+        "sourceJobId": record.get("sourceJobId"),
+        "title": record.get("title") or record.get("position"),
+        "company": record.get("company"),
+        "location": record.get("location"),
+        "url": record.get("url") or record.get("sourceUrl"),
+    }
+    return {
+        key: str(value)[:512]
+        for key, value in values.items()
+        if value is not None and not isinstance(value, (dict, list, tuple, set))
+    }
+
+
+def run_import_jobright(*, config_path: Path, url: str | None = None,
+                        title: str | None = None, company: str | None = None,
+                        location: str | None = None, description: str | None = None,
+                        input_text: str | None = None, confirm: bool = False,
+                        dry_run: bool = False, base_url: str | None = None,
+                        client_factory: ClientFactory | None = None,
+                        cache_factory: Callable[[Path], object] | None = None) -> dict[str, object]:
+    """Preview a manual Jobright record and optionally import it once."""
+    if input_text == "-":
+        input_text = sys.stdin.read()
+    job = _manual_input(url=url, title=title, company=company, location=location,
+                        description=description, input_text=input_text)
+    preview = {"source": job.source, "sourceJobId": job.source_job_id,
+               "url": job.source_url, "title": job.title,
+               "company": job.company, "location": job.location,
+               "scoring_will_run": bool(confirm and not dry_run)}
+    typer.echo(json.dumps(preview, sort_keys=True, separators=(",", ":")))
+    if not confirm or dry_run:
+        typer.echo("dry-run: no import" if dry_run else "preview: use --confirm to import")
+        return preview
+    # Validate all configuration before any confirmed import POST or cache mutation.
+    config = load_config(config_path)
+    scoring_config = AutomationConfig.from_env({
+        **os.environ,
+        "SCORER_CONFIG_PATH": str(config_path),
+        "JOBTRAIL_AUTOMATION_DRY_RUN": "0",
+        "JOBTRAIL_BASE_URL": base_url or str(config.jobtrail_base_url),
+    })
+    client = (client_factory or (lambda base: JobTrailHTTPClient(base)))(base_url or str(config.jobtrail_base_url))
+    cache_path = Path(os.environ.get("JOBTRAIL_SEEN_CACHE_PATH", "") or DEFAULT_SEEN_CACHE_PATH)
+    cache = (cache_factory or (lambda path: SeenCache(path)))(cache_path)
+    cache_txn = getattr(cache, "transaction", None)
+    cache_warning = None
+    try:
+        with (cache_txn() if callable(cache_txn) else contextlib.nullcontext()):
+            list_jobs = getattr(client, "list_jobs", None)
+            existing = list_jobs() if callable(list_jobs) else []
+            duplicate = next(
+                (
+                    item for item in existing
+                    if isinstance(item, dict)
+                    and item.get("source") == job.source
+                    and str(item.get("sourceJobId")) == job.source_job_id
+                ),
+                None,
+            )
+            if duplicate is None:
+                should_skip = getattr(cache, "should_skip", None)
+                if callable(should_skip):
+                    try:
+                        if should_skip(
+                            job.source, job.source_job_id,
+                            hours_old=scoring_config.hours_old,
+                        ):
+                            duplicate = {}
+                    except Exception as exc:
+                        # Cache reads are advisory and must not abort import.
+                        cache_warning = f"seen-cache:check:{type(exc).__name__}"
+            if duplicate is not None:
+                typer.echo("duplicate: import skipped")
+                return {
+                    **preview,
+                    "duplicate": True,
+                    "existing": _safe_duplicate_record(duplicate),
+                }
+            result = client.import_job(job.to_import_payload())
+            try:
+                cache.mark_seen(job.source, job.source_job_id)
+            except Exception as exc:
+                cache_warning = f"seen-cache:write:{type(exc).__name__}"
+            job_id = result.get("id") if isinstance(result, dict) else result
+
+        typer.echo(f"IMPORTED {job_id}")
+        scoring = JobSearchAutomation(client).score_imported_job(
+            str(job_id), job.scorer_input, config=scoring_config
+        )
+        response = {**preview, "id": job_id, **scoring}
+        if cache_warning is not None:
+            response["cache_warning"] = cache_warning
+            typer.echo(f"warning: {cache_warning}")
+        if not scoring.get("scored"):
+            typer.echo("scoring: suppressed")
+        elif scoring.get("notification_sent"):
+            typer.echo("notification: sent")
+        return response
+    finally:
+        close = getattr(client, "close", None)
+        if callable(close):
+            close()
+
+
+@app.command()
+def import_jobright(
+    url: str | None = typer.Option(None, "--url"),
+    title: str | None = typer.Option(None, "--title"),
+    company: str | None = typer.Option(None, "--company"),
+    location: str | None = typer.Option(None, "--location"),
+    description: str | None = typer.Option(None, "--description"),
+    input_text: str | None = typer.Option(None, "--input", help="JSON object or '-' for stdin."),
+    confirm: bool = typer.Option(False, "--confirm"),
+    dry_run: bool = typer.Option(False, "--dry-run"),
+    base_url: str | None = typer.Option(None, "--base-url"),
+    config: Path = typer.Option(Path("config.yaml"), "--config"),
+) -> None:
+    """Preview and confirmation-gated import of a manually copied Jobright posting."""
+    try:
+        run_import_jobright(config_path=config, url=url, title=title, company=company,
+                            location=location, description=description, input_text=input_text,
+                            confirm=confirm, dry_run=dry_run, base_url=base_url)
+    except Exception as error:
+        # Never expose backend response bodies or imported descriptions.
+        raise typer.BadParameter(
+            f"import failed ({type(error).__name__})"
+        ) from error
 
 
 def run_feedback(*, config_path: Path, job_id: str, labels: list[str], comment: str | None = None,
