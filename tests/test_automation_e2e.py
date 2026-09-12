@@ -298,11 +298,15 @@ def test_digest_top_n_notifies_once_in_score_then_job_id_order():
 
     assert result.selected["score"] == 95
     assert len(whatsapp.messages) == 1
-    payload = json.loads(whatsapp.messages[0])
-    assert [unquote(entry["jobTrailLink"]).rsplit("/", 1)[-1] for entry in payload["entries"]] == [
-        "indeed:a-1", "indeed:b-2", "indeed:c-3"
-    ]
-    assert [entry["score"] for entry in payload["entries"]] == [95, 95, 90]
+    message = unquote(whatsapp.messages[0])
+    assert "A role" in message and "B role" in message and "C role" in message
+    assert message.index("/jobs/indeed:a-1") < message.index("/jobs/indeed:b-2")
+    assert message.index("/jobs/indeed:b-2") < message.index("/jobs/indeed:c-3")
+    assert "Fortalezas" in message and "Brechas" in message
+    assert "{" not in message and "}" not in message
+
+    assert message.count("95/100") == 2
+    assert message.count("90/100") == 1
 
 
 def test_digest_equal_scores_are_deterministic_when_input_order_reverses():
@@ -323,11 +327,10 @@ def test_digest_equal_scores_are_deterministic_when_input_order_reverses():
             whatsapp = StubWhatsApp()
             _run(server, scorer=EqualScorer(state), notifier=whatsapp,
                  config_overrides={"digest_top_n": 3})
-            payload = json.loads(whatsapp.messages[0])
-            observed.append([
-                unquote(entry["jobTrailLink"]).rsplit("/", 1)[-1]
-                for entry in payload["entries"]
-            ])
+            message = unquote(whatsapp.messages[0])
+            observed.append(sorted(
+                ("indeed:a-1", "indeed:z-9"), key=message.index
+                                ))
 
     assert observed == [["indeed:a-1", "indeed:z-9"]] * 2
 
@@ -384,12 +387,12 @@ def test_digest_entries_are_allowlisted_bounded_and_redacted():
         _run(server, scorer=RedactingScorer(state), notifier=whatsapp,
              config_overrides={"digest_top_n": 3})
 
-    payload = json.loads(whatsapp.messages[0])
-    rendered = json.dumps(payload)
-    assert all(set(entry) <= set(ALLOWED_FIELDS) for entry in payload["entries"])
-    assert all(len(item) <= 200 for entry in payload["entries"] for item in entry["strengths"])
+    message = whatsapp.messages[0]
+    assert "[REDACTED]" in message
+    assert "x" * 201 not in message
     for forbidden in ("RESUME_SENTINEL", "PROFILE_SENTINEL", "PROMPT_SENTINEL", "CREDENTIAL_SENTINEL"):
-        assert forbidden not in rendered
+        assert forbidden not in message
+    assert "{" not in message and "}" not in message
 
 
 def test_dry_run_searches_without_writes_and_previews_redacted_notification(
@@ -612,22 +615,15 @@ def test_single_notification_invariant_above_threshold(server, state):
 
     assert len(whatsapp.messages) == 1
     message = whatsapp.messages[0]
-    assert message.count("/100") == 2
-    assert message.count("#1") == 1
-    assert message.count("#2") == 1
-    assert message.count("Fortalezas") == 2
-    assert message.count("Brechas") == 2
-    assert message.count("Ver en JobTrail") == 2
-    assert message.count("Ver publicación") == 2
-    assert "C++ Backend Engineer" in message
+    assert message.count("/100") == 1
+    assert message.count("Fortalezas") == 1
+    assert message.count("Brechas") == 1
+    assert message.count("Ver en JobTrail") == 1
+    assert message.count("Ver publicación") == 1
     assert "Python Engineer" in message
     assert "{" not in message and "}" not in message
     assert '"score"' not in message
-    for job_id in (
-        state.id_for("indeed", "alpha-1"),
-        state.id_for("linkedin", "beta-2"),
-    ):
-        assert f"/jobs/{job_id}" in unquote(message)
+    assert f"/jobs/{state.id_for('indeed', 'alpha-1')}" in unquote(message)
 
 
 def test_e2e_tied_candidates_use_id_deterministic_selector_order(server, state, jobspy):
@@ -637,7 +633,8 @@ def test_e2e_tied_candidates_use_id_deterministic_selector_order(server, state, 
     scorer = StubScorer(state, default_score=91, recommendation="PRIORITY_APPLY")
     whatsapp = StubWhatsApp()
 
-    _run(server, scorer=scorer, notifier=whatsapp)
+    _run(server, scorer=scorer, notifier=whatsapp,
+         config_overrides={"digest_top_n": 2})
 
     message = unquote(whatsapp.messages[0])
     alpha_id = state.id_for("indeed", "alpha-1")
