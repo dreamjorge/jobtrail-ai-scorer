@@ -594,16 +594,18 @@ class PlannedOperations:
     redacted: bool = True
 
     def to_envelope(self) -> dict[str, Any]:
-        return {
-            "scenario": self.scenario,
-            "searched": self.searched,
-            "planned_imports": self.planned_imports,
-            "planned_scores": self.planned_scores,
-            "would_notify": self.would_notify,
-            "best": self.best,
-            "clock": self.clock,
-            "redacted": self.redacted,
-        }
+        return _scrub_simulation_value(
+            {
+                "scenario": self.scenario,
+                "searched": self.searched,
+                "planned_imports": self.planned_imports,
+                "planned_scores": self.planned_scores,
+                "would_notify": self.would_notify,
+                "best": self.best,
+                "clock": self.clock,
+                "redacted": self.redacted,
+            }
+        )
 
 
 # Strings the dry-run envelope MUST scrub from any captured payload.
@@ -713,13 +715,18 @@ def build_planned_operations(
     for job in scenario.jobs:
         identity = (job.source, job.source_job_id)
         note_body = (job.metadata or {}).get("score_note")
+        history_by_identity.setdefault(identity, [])
         if isinstance(note_body, str):
-            history_by_identity.setdefault(identity, []).append(
-                note_body
-            )
+            notes = history_by_identity[identity]
+            notes.append(note_body)
+
         jobs_by_identity.setdefault(identity, job)
     candidates: list[tuple[int, int, tuple[str, str], NormalizedJob]] = []
+    max_score = max(0, int(config.max_score or 0))
+    eligible_identities = set(list(history_by_identity)[:max_score])
     for index, (identity, notes) in enumerate(history_by_identity.items()):
+        if identity not in eligible_identities:
+            continue
         score = parse_score_note([{"body": body} for body in notes])
         if score is None:
             continue
@@ -732,7 +739,7 @@ def build_planned_operations(
         (_score, job)
         for _score, _order, _identity, job in candidates
         if _score >= config.score_threshold
-    ][: max(0, int(config.max_score or 0))]
+    ]
 
     best: dict[str, Any] | None = None
     if eligible:
@@ -751,7 +758,7 @@ def build_planned_operations(
     return PlannedOperations(
         scenario=scenario.name,
         searched=len(scenario.jobs),
-        planned_imports=len(scenario.jobs),
+        planned_imports=len(jobs_by_identity),
         planned_scores=len(candidates),
         would_notify=bool(scrubbed_best and config.notify_enabled),
         best=scrubbed_best,

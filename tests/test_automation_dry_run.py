@@ -308,6 +308,28 @@ def test_simulation_deduplicates_jobs_inside_the_scenario() -> None:
     assert result.selected is not None
     # The later (highest) score wins per the parse_score_note convention.
     assert result.selected["score"] == 88
+    assert result.envelope["planned_imports"] == 1
+
+
+def test_simulation_caps_discovery_order_before_ranking() -> None:
+    SimulationScenario = require_optional("SimulationScenario")
+    build_planned_operations = require_optional("build_planned_operations")
+    scenario = SimulationScenario(
+        name="cap",
+        jobs=(
+            _job(source_job_id="78", score=80, title="First"),
+            _job(source_job_id="91", score=99, title="Higher"),
+        ),
+    )
+    config = AutomationConfig(score_threshold=70, max_score=1)
+
+    envelope = build_planned_operations(
+        scenario, config, clock_iso="fixed"
+    ).to_envelope()
+
+    assert envelope["planned_imports"] == 2
+    assert envelope["planned_scores"] == 1
+    assert envelope["best"]["sourceJobId"] == "78"
 
 
 def test_simulation_breaks_ties_by_input_order() -> None:
@@ -390,7 +412,7 @@ def test_simulation_envelope_redacts_sensitive_substrings() -> None:
     SimulationScenario = require_optional("SimulationScenario")
     build_planned_operations = require_optional("build_planned_operations")
     scenario = SimulationScenario(
-        name="redact",
+        name="scenario RESUME_SENTINEL /DATA/private",
         jobs=(
             _job(
                 source_job_id="x",
@@ -507,6 +529,58 @@ def test_simulation_envelope_does_not_leak_credential_substrings() -> None:
     rendered = str(planned.to_envelope())
     assert "SECRET_ID" not in rendered
     assert "SECRET_KEY" not in rendered
+
+
+def test_simulation_caps_deduplicated_discovery_and_scrubs_complete_envelope() -> None:
+    SimulationScenario = require_optional("SimulationScenario")
+    build_planned_operations = require_optional("build_planned_operations")
+    scenario = SimulationScenario(
+        name="scenario RESUME_SENTINEL /DATA/private",
+        jobs=(
+            _job(source_job_id="78", score=80, title="First"),
+            _job(source_job_id="78", score=81, title="First latest"),
+            _job(source_job_id="91", score=99, title="Higher"),
+        ),
+    )
+    config = AutomationConfig(score_threshold=70, max_score=1)
+
+    envelope = build_planned_operations(
+        scenario,
+        config,
+        clock_iso="2025-01-01T00:00:00+00:00?secret=SECRET_QUERY",
+    ).to_envelope()
+    rendered = str(envelope)
+
+    assert envelope["planned_imports"] == 2
+    assert envelope["planned_scores"] == 1
+    assert envelope["best"]["sourceJobId"] == "78"
+    assert envelope["best"]["title"] == "First"
+    assert "RESUME_SENTINEL" not in rendered
+    assert "/DATA/" not in rendered
+    assert "SECRET_QUERY" not in rendered
+    assert envelope["clock"] == "2025-01-01T00:00:00+00:00"
+
+
+def test_simulation_cap_includes_unscored_discovery_identity() -> None:
+    SimulationScenario = require_optional("SimulationScenario")
+    build_planned_operations = require_optional("build_planned_operations")
+    scenario = SimulationScenario(
+        name="unscored-first",
+        jobs=(
+            _job(source_job_id="78"),
+            _job(source_job_id="91", score=99),
+        ),
+    )
+
+    envelope = build_planned_operations(
+        scenario,
+        AutomationConfig(score_threshold=70, max_score=1),
+        clock_iso="fixed",
+    ).to_envelope()
+
+    assert envelope["planned_imports"] == 2
+    assert envelope["planned_scores"] == 0
+    assert envelope["best"] is None
 
 
 def _normalised_with_url(url: str) -> NormalizedJob:
