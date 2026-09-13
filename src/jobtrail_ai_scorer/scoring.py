@@ -11,8 +11,75 @@ from pydantic import ValidationError
 from .models import ScoreResult
 from .providers.base import ScoreProvider
 
+
 CURRENT_MARKER = "[AI_JOB_SCORE_V1]"
 LEGACY_MARKER = "[HERMES_JOB_SCORE_V1]"
+
+
+def _coerce_int(value: Any) -> int | None:
+    """Return ``value`` as ``int`` when it is a real number, otherwise ``None``.
+
+    Booleans are explicitly rejected because Pydantic ``StrictInt`` rejects them
+    while Python's ``int(True)`` would silently succeed. The helper keeps the
+    parsing logic focused on numeric coercion without leaking Pydantic
+    specifics.
+    """
+
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        if value != value or value in (float("inf"), float("-inf")):
+            return None
+        return int(value)
+    return None
+
+
+def parse_score_note(
+    notes: Any, *, marker: str = CURRENT_MARKER
+) -> dict[str, Any] | None:
+    """Return the latest valid score payload found in ``notes``.
+
+    The parser is intentionally pure: it depends only on Python builtins. It
+    does not touch the JobTrail gateway, the seen cache, or any I/O boundary,
+    so the offline automation dry-run slice (see #36) can reuse it on
+    captured scenario notes without re-entering the production pipeline.
+
+    A note is considered only when ``body`` is a string that contains
+    ``marker``. The JSON payload must be an object whose ``score`` field
+    parses as an integer in ``[0, 100]``. When multiple notes match, the
+    **last** valid one in the input list wins, matching how the orchestrator
+    appends fresh scores after stale ones.
+
+    Returns ``None`` when ``notes`` is malformed, no note carries a valid
+    payload, or every candidate payload fails the range check. The schema
+    must already be enforced by the score writer; downstream code that needs
+    stricter validation can pipe the result through :class:`ScoreResult`.
+    """
+
+    if not isinstance(notes, list):
+        return None
+    for note in reversed(notes):
+        body = note.get("body") if isinstance(note, dict) else None
+        if not isinstance(body, str) or marker not in body:
+            continue
+        payload_text = body.split(marker, 1)[1].strip()
+        if not payload_text:
+            continue
+        try:
+            value = json.loads(payload_text)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            continue
+        if not isinstance(value, dict):
+            continue
+        coerced = _coerce_int(value.get("score"))
+        if coerced is None or coerced < 0 or coerced > 100:
+            continue
+        value["score"] = coerced
+        return value
+    return None
+
 
 PROMPT_INSTRUCTIONS = (
     "Evaluate this job against the candidate profile. "

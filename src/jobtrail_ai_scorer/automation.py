@@ -429,19 +429,16 @@ def map_jobspy_job(job: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def parse_score_note(notes: Any) -> dict[str, Any] | None:
-    if not isinstance(notes, list):
-        return None
-    for note in reversed(notes):
-        body = note.get("body") if isinstance(note, dict) else None
-        if not isinstance(body, str) or "[AI_JOB_SCORE_V1]" not in body:
-            continue
-        try:
-            value = json.loads(body.split("[AI_JOB_SCORE_V1]", 1)[1].strip())
-            if isinstance(value, dict) and isinstance(value.get("score"), (int, float)):
-                return value
-        except (json.JSONDecodeError, TypeError, ValueError):
-            continue
-    return None
+    """Return the latest valid score payload found in ``notes``.
+
+    Thin re-export of :func:`jobtrail_ai_scorer.scoring.parse_score_note`. The
+    helper lives in ``scoring`` so it can be reused by the offline automation
+    dry-run slice (see #36) without pulling in the orchestrator module.
+    """
+
+    from .scoring import parse_score_note as _parse_score_note
+
+    return _parse_score_note(notes)
 
 
 def build_notification_summary(
@@ -545,6 +542,229 @@ class AutomationRun:
     failures: tuple[str, ...] = ()
     selected: dict[str, Any] | None = None
     profile_counts: dict[str, dict[str, int]] = field(default_factory=dict)
+    envelope: dict[str, Any] | None = None
+
+
+# --- Simulation seam (issue #36) --------------------------------------------
+#
+# The offline automation dry-run slice swaps the production pipeline for a
+# deterministic replay built from a :class:`SimulationScenario`. No
+# ``AutomationGateway``, ``SeenCache``, score subprocess or WhatsApp helper is
+# invoked while the seam is active. Output is shaped like an
+# :class:`AutomationRun` so callers and the launcher can introspect it without
+# special-casing the simulation branch.
+
+@dataclass(frozen=True)
+class SimulationScenario:
+    """A reproducible, in-memory dataset for the automation dry-run.
+
+    ``jobs`` is the captured set the orchestrator would otherwise import from
+    JobSpy, Lever, Greenhouse or Adzuna. ``score`` is provided as a captured
+    :class:`NormalizedJob` ``metadata['score_note']`` entry so the parser from
+    :mod:`jobtrail_ai_scorer.scoring` can extract it without ever invoking a
+    live provider.
+    """
+
+    name: str
+    jobs: tuple["NormalizedJob", ...] = ()
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.name, str):
+            raise ValueError("SimulationScenario.name must be a string")
+        if not isinstance(self.jobs, tuple):
+            raise ValueError("SimulationScenario.jobs must be a tuple")
+
+
+@dataclass(frozen=True)
+class PlannedOperations:
+    """Bounded envelope describing the operations the dry-run would perform.
+
+    The envelope is deterministic for a fixed clock and scenario. It is the
+    payload emitted by the launcher (``scripts/automated-job-search.example.py``)
+    when ``--automation-dry-run`` is requested.
+    """
+
+    scenario: str
+    searched: int
+    planned_imports: int
+    planned_scores: int
+    would_notify: bool
+    best: dict[str, Any] | None
+    clock: str
+    redacted: bool = True
+
+    def to_envelope(self) -> dict[str, Any]:
+        return _scrub_simulation_value(
+            {
+                "scenario": self.scenario,
+                "searched": self.searched,
+                "planned_imports": self.planned_imports,
+                "planned_scores": self.planned_scores,
+                "would_notify": self.would_notify,
+                "best": self.best,
+                "clock": self.clock,
+                "redacted": self.redacted,
+            }
+        )
+
+
+# Strings the dry-run envelope MUST scrub from any captured payload.
+_SIMULATION_FORBIDDEN_SUBSTRINGS: tuple[str, ...] = (
+    "/DATA/",
+    "RESUME_SENTINEL",
+    "PROMPT_SENTINEL",
+    "/AppData/",
+)
+
+# Query-string keys whose values the envelope MUST NOT expose.
+_SIMULATION_FORBIDDEN_QUERY_KEYS: tuple[str, ...] = (
+    "app_id",
+    "app_key",
+    "api_key",
+    "apikey",
+    "token",
+    "access_token",
+    "secret",
+    "password",
+    "client_secret",
+)
+
+
+def _scrub_simulation_value(value: Any) -> Any:
+    """Recursively scrub forbidden substrings and query credentials from ``value``.
+
+    The scrubber preserves structure (dicts/lists/scalars) so the envelope
+    still round-trips through ``json.dumps`` without losing shape. Strings
+    that contain a forbidden substring are rewritten to a generic marker so
+    downstream consumers can still see that something was there. URLs whose
+    query string carries a recognised credential key have that key removed.
+    """
+
+    if isinstance(value, str):
+        cleaned = _scrub_query_string(value)
+        for needle in _SIMULATION_FORBIDDEN_SUBSTRINGS:
+            if needle in cleaned:
+                cleaned = cleaned.replace(needle, "[redacted]")
+        return cleaned
+    if isinstance(value, dict):
+        return {key: _scrub_simulation_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_scrub_simulation_value(item) for item in value]
+    return value
+
+
+_SIMULATION_QUERY_STRING_SPLIT = "&"
+
+
+def _scrub_query_string(value: str) -> str:
+    """Return ``value`` with any forbidden query-string credentials removed."""
+
+    if "?" not in value or "=" not in value:
+        return value
+    head, _, query = value.partition("?")
+    cleaned_pairs: list[str] = []
+    changed = False
+    for pair in query.split(_SIMULATION_QUERY_STRING_SPLIT):
+        if not pair:
+            continue
+        key, sep, _ = pair.partition("=")
+        if key.lower() in _SIMULATION_FORBIDDEN_QUERY_KEYS:
+            changed = True
+            continue
+        cleaned_pairs.append(pair)
+    if not changed:
+        return value
+    cleaned_query = _SIMULATION_QUERY_STRING_SPLIT.join(cleaned_pairs)
+    return f"{head}?{cleaned_query}" if cleaned_query else head
+
+
+def _resolve_simulation_clock(clock_iso: str | None) -> str:
+    """Return the deterministic clock string used by the dry-run envelope."""
+
+    if clock_iso is not None:
+        return clock_iso
+    # Import locally so callers that never opt in do not pay the cost.
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc).isoformat()
+
+
+def build_planned_operations(
+    scenario: "SimulationScenario",
+    config: "AutomationConfig",
+    *,
+    clock_iso: str | None = None,
+) -> PlannedOperations:
+    """Compute the dry-run envelope from a scenario and the resolved config.
+
+    The function performs scenario-only deduplication (same
+    ``(source, source_job_id)`` identity), parses captured score notes
+    through :func:`jobtrail_ai_scorer.scoring.parse_score_note`, applies
+    ``config.score_threshold`` and ``config.max_score``, and redacts
+    forbidden substrings from any value that would leak to the launcher.
+    """
+
+    from .scoring import parse_score_note
+
+    # Scenario-only dedup: collect every score note for the same identity
+    # (source, source_job_id) so we can later resolve to the latest
+    # valid score, matching how ``parse_score_note`` would handle a
+    # multi-note history on a real JobTrail record.
+    history_by_identity: dict[tuple[str, str], list[str]] = {}
+    jobs_by_identity: dict[tuple[str, str], NormalizedJob] = {}
+    for job in scenario.jobs:
+        identity = (job.source, job.source_job_id)
+        note_body = (job.metadata or {}).get("score_note")
+        history_by_identity.setdefault(identity, [])
+        if isinstance(note_body, str):
+            notes = history_by_identity[identity]
+            notes.append(note_body)
+
+        jobs_by_identity.setdefault(identity, job)
+    candidates: list[tuple[int, int, tuple[str, str], NormalizedJob]] = []
+    max_score = max(0, int(config.max_score or 0))
+    eligible_identities = set(list(history_by_identity)[:max_score])
+    for index, (identity, notes) in enumerate(history_by_identity.items()):
+        if identity not in eligible_identities:
+            continue
+        score = parse_score_note([{"body": body} for body in notes])
+        if score is None:
+            continue
+        candidates.append(
+            (score["score"], -index, identity, jobs_by_identity[identity])
+        )
+
+    candidates.sort(key=lambda item: (-item[0], item[1]))
+    eligible = [
+        (_score, job)
+        for _score, _order, _identity, job in candidates
+        if _score >= config.score_threshold
+    ]
+
+    best: dict[str, Any] | None = None
+    if eligible:
+        score, winner = eligible[0]
+        best = {
+            "title": winner.title or "",
+            "company": winner.company or "",
+            "location": winner.location or "",
+            "score": score,
+            "jobUrl": winner.source_url or "",
+            "sourceJobId": winner.source_job_id or "",
+            "source": winner.source or "",
+        }
+
+    scrubbed_best = _scrub_simulation_value(best) if best is not None else None
+    return PlannedOperations(
+        scenario=scenario.name,
+        searched=len(scenario.jobs),
+        planned_imports=len(jobs_by_identity),
+        planned_scores=len(candidates),
+        would_notify=bool(scrubbed_best and config.notify_enabled),
+        best=scrubbed_best,
+        clock=_resolve_simulation_clock(clock_iso),
+    )
+
 
 
 def _format_failure(stage: str, exc: BaseException, *, job_id: str | None = None) -> str:
@@ -595,7 +815,13 @@ class JobTrailAutomation:
         ats_boards: AtsBoardConfig | None = None,
         preflight_runner: Callable[["AutomationConfig"], Any] | None = None,
         circuit_breaker: Any | None = None,
+            simulation: "SimulationScenario | None" = None,
     ) -> None:
+        if simulation is not None and not isinstance(simulation, SimulationScenario):
+            raise ValueError(
+                "simulation must be a SimulationScenario instance or None"
+            )
+        self._simulation = simulation
         self.gateway, self.scorer, self.notifier = (
             gateway,
             scorer or self._score,
@@ -682,7 +908,40 @@ class JobTrailAutomation:
             shlex.split(self._whatsapp_command), input=message, text=True, check=True
         )
 
+    def _run_simulation(self, config: AutomationConfig) -> AutomationRun:
+        """Return a deterministic ``AutomationRun`` from the configured scenario.
+
+        The dry-run path never touches ``self.gateway``, ``self.scorer`` or
+        ``self.notifier``. The :class:`AutomationRun` mirrors the production
+        shape (searched, imported=0, scored=0, selected) so callers and the
+        launcher can introspect a uniform object. The ``envelope`` attribute
+        is the bounded JSON payload printed by the launcher; it carries the
+        :class:`PlannedOperations` envelope produced by
+        :func:`build_planned_operations`.
+        """
+
+        assert self._simulation is not None
+        scenario = self._simulation
+        planned = build_planned_operations(scenario, config)
+        envelope = planned.to_envelope()
+        selected = envelope["best"]
+        return AutomationRun(
+            searched=envelope["searched"],
+            imported=0,
+            scored=0,
+            failures=(),
+            selected=selected,
+            profile_counts={},
+            envelope=envelope,
+        )
+
     def run(self, *, config: AutomationConfig) -> AutomationRun:
+        # Offline automation dry-run (issue #36). When the constructor
+        # was given a SimulationScenario, the production pipeline is
+        # bypassed entirely: no gateway, no scorer subprocess, no
+        # notifier, no production-state mutation.
+        if self._simulation is not None:
+            return self._run_simulation(config)
         if not config.scorer_config_path:
             raise ValueError("SCORER_CONFIG_PATH is required")
         self._scorer_command = config.scorer_command
