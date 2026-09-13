@@ -26,7 +26,7 @@ The implementation uses the repository's existing technical-message convention u
 
 ## Data Flow
 
-1. `JobSearchAutomation.run()` finishes discovery and scoring.
+1. `JobTrailAutomation.run()` finishes discovery and scoring.
 2. If no job is selected, no failure exists, notifications are enabled, and the run is not dry-run, `_compose_notification()` returns the no-match summary.
 3. The existing notifier invokes the configured WhatsApp helper.
 4. `AutomationRun.notification_sent` records whether the helper succeeded.

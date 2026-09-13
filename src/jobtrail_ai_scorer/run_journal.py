@@ -155,9 +155,14 @@ def _line_for_run(
         profile_counts=profile_counts,
     )
     scored_failed = sum(1 for f in failures if f.startswith(_SCORE_FAILURE_PREFIX))
-    notified = bool(selected) or bool(failures)
+    notification_sent = getattr(run, "notification_sent", None)
+    notified = (
+        bool(notification_sent)
+        if notification_sent is not None
+        else bool(selected) or bool(failures)
+    )
     notification_kind = _classify_notification_kind(
-        selected=selected, failures=failures
+        selected=selected, failures=failures, notification_sent=notification_sent
     )
 
     run_id = _build_run_id(started_at=started_at, clock=clock)
@@ -215,6 +220,7 @@ def _classify_notification_kind(
     *,
     selected: Any,
     failures: list[str],
+    notification_sent: bool | None = None,
 ) -> str:
     """Return the notification kind for one run.
 
@@ -226,6 +232,8 @@ def _classify_notification_kind(
 
     if selected is not None:
         return "match"
+    if notification_sent is True and not failures:
+        return "no_match"
     if any(f.startswith(_BREAKER_FAILURE_PREFIX) for f in failures):
         return "breaker"
     if any(f.startswith(_PREFLIGHT_FAILURE_PREFIX) for f in failures):

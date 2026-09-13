@@ -543,6 +543,7 @@ class AutomationRun:
     selected: dict[str, Any] | None = None
     profile_counts: dict[str, dict[str, int]] = field(default_factory=dict)
     envelope: dict[str, Any] | None = None
+    notification_sent: bool | None = None
 
 
 # --- Simulation seam (issue #36) --------------------------------------------
@@ -1116,11 +1117,16 @@ class JobTrailAutomation:
             failures=tuple(failures),
             notify_enabled=config.notify_enabled,
             notify_on_failure=config.notify_on_failure,
+            searched=searched,
+            scored=scored,
+            score_threshold=config.score_threshold,
             base_url=self.base_url,
         )
+        notification_sent = False
         if notification_body is not None:
             try:
                 self.notifier(notification_body)
+                notification_sent = True
             except Exception:
                 failures.append("notify")
         run = AutomationRun(
@@ -1130,6 +1136,7 @@ class JobTrailAutomation:
             tuple(failures),
             best,
             profile_counts,
+            notification_sent=notification_sent,
         )
         # Step N: record the run outcome on the breaker so it can open
         # after consecutive failures or close after a clean run.
@@ -1267,6 +1274,9 @@ class JobTrailAutomation:
         failures: tuple[str, ...],
         notify_enabled: bool,
         notify_on_failure: bool,
+        searched: int,
+        scored: int,
+        score_threshold: int,
         base_url: str = "",
     ) -> str | None:
         """Assemble the WhatsApp helper message from the run's outcome.
@@ -1298,6 +1308,15 @@ class JobTrailAutomation:
                 ensure_ascii=False,
                 sort_keys=True,
             )
+        no_match_body: str | None = None
+        if notify_enabled and best is None and not failures:
+            no_match_body = (
+                "JobTrail — sin coincidencias\n"
+                f"Buscadas: {searched}\n"
+                f"Puntuadas: {scored}\n"
+                f"Umbral: {score_threshold}\n"
+                "No hubo ofertas que calificaran."
+            )
         failure_body: str | None = None
         if notify_on_failure and failures:
             failure_body = json.dumps(
@@ -1305,9 +1324,10 @@ class JobTrailAutomation:
                 ensure_ascii=False,
                 sort_keys=True,
             )
-        if match_body is not None and failure_body is not None:
-            return f"{match_body}\n{failure_body}"
-        return match_body or failure_body
+        primary_body = match_body or no_match_body
+        if primary_body is not None and failure_body is not None:
+            return f"{primary_body}\n{failure_body}"
+        return primary_body or failure_body
 
     @staticmethod
     def _normalized_identity(
