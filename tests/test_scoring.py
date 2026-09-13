@@ -1,4 +1,5 @@
 import json
+import time
 from dataclasses import dataclass, field
 
 import pytest
@@ -6,6 +7,7 @@ import pytest
 from jobtrail_ai_scorer.scoring import (
     CURRENT_MARKER,
     ScoreOutcome,
+    _decode_provider_score,
     job_fingerprint,
     render_prompt,
     score_jobs,
@@ -137,6 +139,24 @@ def test_invalid_provider_json_does_not_save_note():
     assert result.outcomes[0].reason == "invalid_score"
 
 
+def test_oversized_provider_response_is_rejected_with_bounded_error():
+    response = "{" + ("x" * 1_000_000)
+
+    with pytest.raises(json.JSONDecodeError) as error:
+        _decode_provider_score(response)
+
+    assert error.value.msg == "provider response exceeds maximum size"
+    assert error.value.doc == ""
+
+    client = FakeClient([candidate("j1")], {"j1": full_job("j1")})
+    result = score_jobs(client, FakeProvider(response), "Generic profile")
+
+    assert result.processed == 0
+    assert result.failed == 1
+    assert result.outcomes[0].reason == "invalid_score"
+    assert client.notes == []
+
+
 @pytest.mark.parametrize(
     "response",
     [
@@ -168,6 +188,21 @@ def test_provider_rejects_prose_or_repeated_json(response):
 
     result = score_jobs(client, FakeProvider(response), "Generic profile")
 
+    assert result.processed == 0
+    assert result.failed == 1
+    assert result.outcomes[0].reason == "invalid_score"
+    assert client.notes == []
+
+
+def test_truncated_fence_with_substantial_whitespace_is_rejected_promptly():
+    client = FakeClient([candidate("j1")], {"j1": full_job("j1")})
+    response = "```json" + (" " * 100_000)
+
+    started = time.monotonic()
+    result = score_jobs(client, FakeProvider(response), "Generic profile")
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 1.0
     assert result.processed == 0
     assert result.failed == 1
     assert result.outcomes[0].reason == "invalid_score"
