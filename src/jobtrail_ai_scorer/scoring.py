@@ -89,7 +89,7 @@ class JobTrailGateway(Protocol):
 _MAX_OUTPUT_STRING = 500
 _MAX_OUTPUT_ITEMS = 20
 _MAX_OUTPUT_ITEM_STRING = 200
-_FENCED_JSON_RE = re.compile(r"```json\s*(.*?)\s*```", re.DOTALL)
+_MAX_PROVIDER_RESPONSE = 1_000_000
 
 
 @dataclass(frozen=True)
@@ -268,10 +268,13 @@ def _decode_provider_score(raw_score: str) -> dict[str, Any]:
 
     if not isinstance(raw_score, str):
         raise TypeError("provider score must be a string")
+    if len(raw_score) > _MAX_PROVIDER_RESPONSE:
+        raise json.JSONDecodeError("provider response exceeds maximum size", "", 0)
     payload = raw_score.strip()
-    fenced = _FENCED_JSON_RE.fullmatch(payload)
-    if fenced is not None:
-        payload = fenced.group(1).strip()
+    if payload.startswith("```json"):
+        if not payload.endswith("```"):
+            raise json.JSONDecodeError("unterminated JSON fence", payload, 0)
+        payload = payload[len("```json"):-len("```")].strip()
     decoded = json.loads(payload)
     if not isinstance(decoded, dict):
         raise json.JSONDecodeError("expected a JSON object", payload, 0)
