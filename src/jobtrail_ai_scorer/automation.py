@@ -429,19 +429,16 @@ def map_jobspy_job(job: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def parse_score_note(notes: Any) -> dict[str, Any] | None:
-    if not isinstance(notes, list):
-        return None
-    for note in reversed(notes):
-        body = note.get("body") if isinstance(note, dict) else None
-        if not isinstance(body, str) or "[AI_JOB_SCORE_V1]" not in body:
-            continue
-        try:
-            value = json.loads(body.split("[AI_JOB_SCORE_V1]", 1)[1].strip())
-            if isinstance(value, dict) and isinstance(value.get("score"), (int, float)):
-                return value
-        except (json.JSONDecodeError, TypeError, ValueError):
-            continue
-    return None
+    """Return the latest valid score payload found in ``notes``.
+
+    Thin re-export of :func:`jobtrail_ai_scorer.scoring.parse_score_note`. The
+    helper lives in ``scoring`` so it can be reused by the offline automation
+    dry-run slice (see #36) without pulling in the orchestrator module.
+    """
+
+    from .scoring import parse_score_note as _parse_score_note
+
+    return _parse_score_note(notes)
 
 
 def build_notification_summary(
