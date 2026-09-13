@@ -17,6 +17,7 @@ discovery and uses the URL verbatim (highest priority).
 """
 
 import argparse
+import json
 import os
 import sys
 
@@ -26,13 +27,128 @@ from jobtrail_ai_scorer.automation import (
     DISCOVER_DEFAULT_CONTAINER,
     JobSearchAutomation,
     JobTrailHTTPClient,
+    SimulationScenario,
+    build_planned_operations,
     merge_resolved_base_url,
     resolve_automation_base_url,
 )
+from jobtrail_ai_scorer.sources import NormalizedJob
 from jobtrail_ai_scorer.seen_cache import DEFAULT_SEEN_CACHE_PATH, SeenCache
 
 
 _TRUTHY = {"1", "true", "yes", "on"}
+_FALSY = {"0", "false", "no", "off"}
+
+
+def _parse_truthy(value: str | None) -> bool | None:
+    """Return a tristate bool for an env-style value.
+
+    ``True``/``False`` reflect the recognised truthy/falsy tokens; ``None``
+    signals an unparseable value so the caller can fail closed without
+    silently accepting the input.
+    """
+
+    if value is None:
+        return None
+    lowered = value.strip().lower()
+    if lowered in _TRUTHY:
+        return True
+    if lowered in _FALSY:
+        return False
+    return None
+
+
+def _resolve_automation_dry_run(args: argparse.Namespace) -> bool | None:
+    """Return whether the automation dry-run is requested, or ``None`` on bad input.
+
+    Precedence: ``--automation-dry-run`` CLI flag >
+    ``JOBTRAIL_AUTOMATION_DRY_RUN`` environment variable. ``False`` means
+    "explicitly disabled", ``True`` means "enabled", ``None`` means
+    "unparseable input; fail closed".
+    """
+
+    if getattr(args, "automation_dry_run", False):
+        return True
+    raw = os.environ.get("JOBTRAIL_AUTOMATION_DRY_RUN")
+    if raw is None or raw.strip() == "":
+        return False
+    return _parse_truthy(raw)
+
+
+def _build_default_scenario() -> SimulationScenario:
+    """Return a deterministic, hermetic scenario for the offline dry-run.
+
+    The launcher never reads the operator profile, CV, environment
+    variables beyond the ones listed in :mod:`scripts.automated-job-search`,
+    or runtime state. The scenario data is hard-coded so every invocation
+    produces the same envelope, which the launcher emits as JSON.
+    """
+
+    from jobtrail_ai_scorer.scoring import CURRENT_MARKER
+
+    def _note(score: int) -> str:
+        body = json.dumps(
+            {
+                "score": score,
+                "recommendation": "APPLY",
+                "strengths": [],
+                "gaps": [],
+                "needs_confirmation": [],
+                "hard_requirements_missing": [],
+                "career_value": "Medium",
+                "reasoning": "dry-run scenario",
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return f"{CURRENT_MARKER}\n{body}"
+
+    def _job(source: str, source_job_id: str, score: int, title: str) -> NormalizedJob:
+        return NormalizedJob(
+            source=source,
+            source_job_id=source_job_id,
+            title=title,
+            company="DryRunCo",
+            description="Synthetic scenario job for offline dry-run.",
+            source_url=f"https://example.test/dry-run/{source_job_id}",
+            location="Remote",
+            metadata={"score_note": _note(score)},
+        )
+
+    return SimulationScenario(
+        name="built-in",
+        jobs=(
+            _job("synthetic", "1", 78, "Backend Engineer"),
+            _job("synthetic", "2", 91, "Senior Backend Engineer"),
+            _job("synthetic", "3", 55, "Junior Engineer"),
+        ),
+    )
+
+
+def _run_automation_dry_run(config: AutomationConfig) -> int:
+    """Run the offline simulation and emit the bounded envelope on stdout.
+
+    The dry-run path never instantiates ``JobTrailHTTPClient``,
+    ``SeenCache`` or the production ``JobSearchAutomation``. The
+    :func:`build_planned_operations` helper produces a deterministic
+    envelope which the launcher serialises as JSON.
+    """
+
+    scenario = _build_default_scenario()
+    planned = build_planned_operations(scenario, config)
+    envelope = planned.to_envelope()
+    summary = {
+        "mode": "automation-dry-run",
+        "searched": envelope["searched"],
+        "planned_imports": envelope["planned_imports"],
+        "planned_scores": envelope["planned_scores"],
+        "would_notify": envelope["would_notify"],
+        "selected": envelope["best"],
+        "envelope": envelope,
+        "failures": [],
+    }
+    print(json.dumps(summary, sort_keys=True))
+    return 0
 
 
 def _resolve_reset_request(args: argparse.Namespace) -> bool:
@@ -108,7 +224,38 @@ def main() -> int:
             "re-imported (also set by JOBTRAIL_RESET_SEEN_CACHE=1)."
         ),
     )
+    parser.add_argument(
+        "--automation-dry-run",
+        action="store_true",
+        help=(
+            "Run the offline automation dry-run instead of the production"
+            " pipeline. Uses an in-process SimulationScenario; never touches"
+            " the gateway, the scorer subprocess, the WhatsApp helper or the"
+            " runtime seen cache. Also enabled by JOBTRAIL_AUTOMATION_DRY_RUN."
+        ),
+    )
     args = parser.parse_args()
+
+    # Offline automation dry-run short-circuit (issue #36). The flag/env
+    # MUST be evaluated before any gateway, cache or production-state
+    # construction so the forbidden boundary is respected. Fail closed
+    # when the env var carries an unrecognised value.
+    dry_run_choice = _resolve_automation_dry_run(args)
+    if dry_run_choice is None:
+        print(
+            "JOBTRAIL_AUTOMATION_DRY_RUN must be one of 1/true/yes/on or 0/false/no/off",
+            file=sys.stderr,
+        )
+        return 2
+    if dry_run_choice:
+        config = AutomationConfig.from_env()
+        print(
+            "automation-dry-run: offline simulation enabled; "
+            "no gateway, scorer or notifier will be invoked",
+            file=sys.stderr,
+        )
+        return _run_automation_dry_run(config)
+
     config = AutomationConfig.from_env()
     if not config.whatsapp_command:
         overrides = {
