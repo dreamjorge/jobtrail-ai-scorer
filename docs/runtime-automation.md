@@ -564,6 +564,98 @@ The summary exposes only the failure count and the first five abstract labels.
 It never includes descriptions, profiles, prompts, notes, credentials, or
 secrets. Default is off; opt in explicitly.
 
+## Offline automation dry-run (Issue #36)
+
+Operators can preview a full automation run without contacting any live
+source, provider or the JobTrail backend. The dry-run builds a
+deterministic `SimulationScenario` with three synthetic jobs and runs
+them through `build_planned_operations`, then prints a bounded JSON
+envelope on stdout. Use it to confirm threshold, cap and dedup
+behaviour without burning API quota or hitting the runtime database.
+
+### Flag and environment variable
+
+Trigger the dry-run with either:
+
+```sh
+python scripts/automated-job-search.example.py --automation-dry-run
+JOBTRAIL_AUTOMATION_DRY_RUN=1 python scripts/automated-job-search.example.py
+```
+
+The CLI flag wins over the environment variable. Recognised values for
+`JOBTRAIL_AUTOMATION_DRY_RUN` are `1/true/yes/on` (enable) and
+`0/false/no/off` (disable). Any other value fails closed with exit code
+2 **before** any gateway, cache or production `JobSearchAutomation` is
+constructed.
+
+### Forbidden side effects
+
+When the dry-run is enabled, the launcher never:
+
+- instantiates `JobTrailHTTPClient`,
+- reads, writes or resets the seen cache (`JOBTRAIL_SEEN_CACHE_PATH` is
+  ignored),
+- spawns the scorer subprocess,
+- invokes the configured provider (Hermes, OpenAI-compatible, ...),
+- sends a WhatsApp message through the configured helper,
+- probes the published port or the Docker container for backend discovery,
+- reads the operator profile, CV or any environment variables beyond the
+  ones listed above.
+
+Tests pin every one of these boundaries: see
+`tests/test_automation_dry_run.py` and
+`tests/test_launcher_automation_dry_run.py`.
+
+### JSON envelope
+
+The launcher emits one JSON object on stdout. The shape is stable and
+safe to diff across runs because the scenario is hard-coded and the
+optional clock parameter defaults to a fixed value for hermetic tests.
+
+```json
+{
+  "mode": "automation-dry-run",
+  "searched": 3,
+  "planned_imports": 3,
+  "planned_scores": 3,
+  "would_notify": false,
+  "selected": {
+    "title": "Senior Backend Engineer",
+    "company": "DryRunCo",
+    "location": "Remote",
+    "score": 91,
+    "jobUrl": "https://example.test/dry-run/2",
+    "sourceJobId": "2",
+    "source": "synthetic"
+  },
+  "envelope": {"scenario": "built-in", "clock": "..."},
+  "failures": []
+}
+```
+
+### Redaction guarantees
+
+The envelope is scrubbed before being printed. The redaction layer:
+
+- replaces private filesystem substrings (`/DATA/`, `/AppData/`,
+  `RESUME_SENTINEL`, `PROMPT_SENTINEL`) with `[redacted]`,
+- removes a fixed allowlist of credential query-string keys
+  (`app_id`, `app_key`, `api_key`, `apikey`, `token`, `access_token`,
+  `secret`, `password`, `client_secret`) so URLs that embed API
+  credentials are safe to share.
+
+The launch does **not** add new fields to the envelope beyond what
+`build_planned_operations` produces; if you need additional fields,
+extend the planner and pin them with a regression test.
+
+### Difference from scorer-only dry-run
+
+`jobtrail-ai-scorer score --dry-run` suppresses the score-note write but
+*still* invokes the configured provider and *still* lists jobs from
+JobTrail. The launcher `--automation-dry-run` mode is offline end to
+end: no source calls, no provider calls, no persistence writes, no
+network. They serve different purposes and are not interchangeable.
+
 ## Safety rules
 
 - **Dry-run first:** keep `SCORER_DRY_RUN=1` until the config, JobTrail connection, provider, and logs look correct.

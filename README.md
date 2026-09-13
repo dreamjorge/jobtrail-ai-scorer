@@ -245,6 +245,49 @@ UTC retrieval timestamp. Malformed rows are skipped. `4xx` errors are
 terminal; `5xx` and transport failures use bounded retries and do not block
 JobSpy or Lever results.
 
+### Offline automation dry-run (Issue #36)
+
+The launcher supports a fully offline simulation that does not contact any
+live source, provider, or the JobTrail backend. Enable it with either:
+
+```sh
+python scripts/automated-job-search.example.py --automation-dry-run
+# or
+JOBTRAIL_AUTOMATION_DRY_RUN=1 python scripts/automated-job-search.example.py
+```
+
+CLI wins over the environment variable. Recognised values are
+`1/true/yes/on` and `0/false/no/off`; any other value fails closed with
+exit code 2 before any dependency is constructed.
+
+When enabled, the launcher runs a hard-coded `SimulationScenario` with
+three synthetic jobs through `build_planned_operations` and prints a
+bounded JSON envelope on stdout:
+
+```json
+{"mode": "automation-dry-run", "searched": 3, "planned_imports": 3,
+ "planned_scores": 3, "would_notify": false, "selected": {...},
+ "envelope": {"scenario": "built-in", "searched": 3, ...},
+ "failures": []}
+```
+
+The dry-run path never:
+
+- instantiates a `JobTrailHTTPClient` or `SeenCache`,
+- invokes the scorer subprocess or any provider,
+- sends a WhatsApp message or reads the operator profile or CV,
+- contacts Docker, the host filesystem, or any external network.
+
+All captured strings are scrubbed before the envelope is emitted. Private
+substrings (`/DATA/`, `/AppData/`, `RESUME_SENTINEL`, `PROMPT_SENTINEL`)
+and credential query-string keys (`app_id`, `app_key`, `api_key`, `token`,
+`secret`, `password`, ...) are removed before printing.
+
+This mode is distinct from the scorer-only `--dry-run` flag of
+`jobtrail-ai-scorer score`, which suppresses score-note writes but still
+invokes the configured provider. The automation dry-run never invokes
+the provider at all and never writes anywhere outside stdout.
+
 ### Preflight checks and circuit breaker (Issue #37)
 
 The daily automation can short-circuit an unhealthy run before it invests in
