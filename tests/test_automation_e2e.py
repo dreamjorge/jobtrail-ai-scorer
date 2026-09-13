@@ -292,7 +292,8 @@ def test_dedup_skip_second_search(tmp_path, server, state):
     assert run_two.imported == 0
     assert run_two.scored == 0
     assert run_two.failures == ()
-    assert whatsapp_two.messages == []
+    assert len(whatsapp_two.messages) == 1
+    assert "No hubo ofertas que calificaran." in whatsapp_two.messages[0]
 
 
 def test_partial_failure_continues_run(server, state):

@@ -877,6 +877,7 @@ def test_run_scores_real_mode_and_notifies_once_for_best_match():
     )
     assert scorer.calls == [("j1", "safe/config.yaml")]
     assert len(notifier.messages) == 1
+    assert result.notification_sent is True
     assert result.selected["score"] == 91
     assert "good" not in notifier.messages[0]
     assert "candidate" not in notifier.messages[0].lower()
@@ -976,7 +977,7 @@ def test_selected_notification_contains_job_and_score_data(monkeypatch):
     assert _re.match(r"^\d{4}-\d{2}-\d{2}-\d{4}-[a-f0-9]{6}$", message["runId"])
 
 
-def test_no_notification_when_score_below_threshold():
+def test_no_match_notification_when_score_below_threshold():
     gateway = FakeJobTrail()
 
     def score(job_id, config_path):
@@ -993,7 +994,47 @@ def test_no_notification_when_score_below_threshold():
         )
     )
     assert result.selected is None
-    assert notifier.messages == []
+    assert result.notification_sent is True
+    assert len(notifier.messages) == 1
+    assert "Buscadas: 2" in notifier.messages[0]
+    assert "Puntuadas: 1" in notifier.messages[0]
+    assert "Umbral: 80" in notifier.messages[0]
+
+
+def test_no_match_notification_has_bounded_summary():
+    message = JobSearchAutomation._compose_notification(
+        best=None,
+        best_job=None,
+        best_score=None,
+        failures=(),
+        notify_enabled=True,
+        notify_on_failure=False,
+        searched=16,
+        scored=2,
+        score_threshold=80,
+    )
+    assert message == (
+        "JobTrail — sin coincidencias\n"
+        "Buscadas: 16\n"
+        "Puntuadas: 2\n"
+        "Umbral: 80\n"
+        "No hubo ofertas que calificaran."
+    )
+
+
+def test_no_match_notification_disabled():
+    message = JobSearchAutomation._compose_notification(
+        best=None,
+        best_job=None,
+        best_score=None,
+        failures=(),
+        notify_enabled=False,
+        notify_on_failure=False,
+        searched=1,
+        scored=1,
+        score_threshold=80,
+    )
+    assert message is None
 
 
 def test_parse_score_note_is_safe_and_uses_latest_valid_marker():
@@ -1639,7 +1680,7 @@ def test_automation_no_notification_when_nothing_to_report():
     scorer.jobs = gateway.jobs
 
     notifier = FakeNotifier()
-    JobSearchAutomation(gateway, scorer=scorer, notifier=notifier).run(
+    result = JobSearchAutomation(gateway, scorer=scorer, notifier=notifier).run(
         config=AutomationConfig(
             scorer_config_path="safe/config.yaml",
             notify_enabled=True,
@@ -1647,18 +1688,43 @@ def test_automation_no_notification_when_nothing_to_report():
     )
 
     # Existing behavior: a best match above the threshold triggers one notification.
+    assert result.notification_sent is True
     assert len(notifier.messages) == 1
 
     # With both flags off and no failures, the notifier must not be called again.
     notifier_off = FakeNotifier()
-    JobSearchAutomation(gateway, scorer=scorer, notifier=notifier_off).run(
+    result_off = JobSearchAutomation(
+        gateway, scorer=scorer, notifier=notifier_off
+    ).run(
         config=AutomationConfig(
             scorer_config_path="safe/config.yaml",
             notify_enabled=False,
             notify_on_failure=False,
         )
     )
+    assert result_off.notification_sent is False
     assert notifier_off.messages == []
+
+
+def test_notification_failure_sets_notification_sent_false():
+    gateway = FakeJobTrail()
+    scorer = FakeScorer()
+    scorer.jobs = gateway.jobs
+
+    def failing_notifier(_message):
+        raise RuntimeError("notifier unavailable")
+
+    result = JobSearchAutomation(
+        gateway, scorer=scorer, notifier=failing_notifier
+    ).run(
+        config=AutomationConfig(
+            scorer_config_path="safe/config.yaml",
+            notify_enabled=True,
+        )
+    )
+
+    assert result.notification_sent is False
+    assert result.failures[-1] == "notify"
 
 
 _RUN_ID_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}-\d{4}-[a-f0-9]{6}$")
