@@ -1,7 +1,25 @@
 from types import SimpleNamespace
 
 from jobtrail_ai_scorer.automation import AutomationRun
-from jobtrail_ai_scorer.run_journal import _line_for_run
+from jobtrail_ai_scorer.run_journal import _line_for_run, _delivery_line
+
+
+def test_delivery_line_links_run_event_and_classification_without_secrets():
+    line = _delivery_line(
+        run_id="run-1", event_id="event-1", result=SimpleNamespace(
+            status="failed", classification="uncertain", attempts=3
+        )
+    )
+    assert line == {
+        "schema_version": 1,
+        "record_type": "delivery",
+        "run_id": "run-1",
+        "event_id": "event-1",
+        "status": "failed",
+        "classification": "uncertain",
+        "attempts": 3,
+    }
+    assert "secret" not in str(line).lower()
 
 
 def test_sent_clean_no_match_is_classified_as_no_match():
