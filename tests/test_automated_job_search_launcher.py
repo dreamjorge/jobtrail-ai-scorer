@@ -41,9 +41,10 @@ class _StopAfterCapture(Exception):
 
 
 def test_launcher_passes_configured_ats_boards_to_automation(
-    monkeypatch, launcher
+    monkeypatch, launcher, tmp_path
 ) -> None:
     captured: dict[str, object] = {}
+    monkeypatch.setenv("JOBTRAIL_RUN_JOURNAL_PATH", str(tmp_path / "journal.jsonl"))
 
     class FakeGateway:
         def __init__(self, base_url):
@@ -84,7 +85,11 @@ def test_launcher_passes_configured_ats_boards_to_automation(
     assert captured["ats_boards"].results_wanted == 15
 
 
-def test_final_output_includes_profile_counts(monkeypatch, capsys, launcher) -> None:
+def test_final_output_includes_profile_counts(
+    monkeypatch, capsys, launcher, tmp_path
+) -> None:
+    monkeypatch.setenv("JOBTRAIL_RUN_JOURNAL_PATH", str(tmp_path / "journal.jsonl"))
+
     class FakeGateway:
         def __init__(self, base_url):
             self.base_url = base_url
