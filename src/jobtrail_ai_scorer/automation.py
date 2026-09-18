@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 import json
 import os
 import shlex
@@ -27,7 +28,8 @@ from .sources import (
     build_ats_adapters,
     normalize_jobspy_job,
 )
-from .notify import NotificationBuilder, recommendation_label
+from .notify import NotificationBuilder, build_run_id, recommendation_label
+from .n8n_outbound import N8nConfig
 
 
 DEFAULT_TERMS = (
@@ -240,6 +242,7 @@ class AutomationConfig:
     breaker_cooldown_seconds: float = 3600.0
     breaker_alert_cooldown_seconds: float = 3600.0
     breaker_state_path: str = ""
+    n8n: N8nConfig = field(default_factory=N8nConfig)
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "AutomationConfig":
@@ -309,6 +312,7 @@ class AutomationConfig:
                 "BREAKER_ALERT_COOLDOWN_SECONDS", cls.breaker_alert_cooldown_seconds
             ),
             breaker_state_path=e.get("BREAKER_STATE_PATH", "").strip(),
+            n8n=N8nConfig.from_env(e),
         )
 
 
@@ -544,6 +548,7 @@ class AutomationRun:
     profile_counts: dict[str, dict[str, int]] = field(default_factory=dict)
     envelope: dict[str, Any] | None = None
     notification_sent: bool | None = None
+    run_id: str = ""
 
 
 # --- Simulation seam (issue #36) --------------------------------------------
@@ -934,6 +939,7 @@ class JobTrailAutomation:
             selected=selected,
             profile_counts={},
             envelope=envelope,
+            run_id=build_run_id(seed=f"simulation:{scenario.name}", clock=lambda: datetime.fromisoformat(envelope["clock"])),
         )
 
     def run(self, *, config: AutomationConfig) -> AutomationRun:
@@ -943,6 +949,8 @@ class JobTrailAutomation:
         # notifier, no production-state mutation.
         if self._simulation is not None:
             return self._run_simulation(config)
+        started_at = datetime.now(timezone.utc)
+        run_id = build_run_id(moment=started_at, seed=started_at.isoformat())
         if not config.scorer_config_path:
             raise ValueError("SCORER_CONFIG_PATH is required")
         self._scorer_command = config.scorer_command
@@ -1101,6 +1109,8 @@ class JobTrailAutomation:
                         "strengths": score.get("strengths", []),
                         "gaps": score.get("gaps", []),
                         "jobUrl": job.get("jobUrl", job.get("job_url", "")),
+                        "source": job.get("source", ""),
+                        "sourceJobId": job.get("sourceJobId", ""),
                     }
                     best_job = job
                     best_score = score
@@ -1137,6 +1147,7 @@ class JobTrailAutomation:
             best,
             profile_counts,
             notification_sent=notification_sent,
+            run_id=run_id,
         )
         # Step N: record the run outcome on the breaker so it can open
         # after consecutive failures or close after a clean run.
