@@ -61,7 +61,8 @@ def test_adapter_acknowledges_2xx_and_reuses_event_id_on_retry():
     envelope = _envelope()
     result = adapter.send(envelope)
     assert result == DeliveryResult("accepted", 1, envelope["event_id"])
-    assert requests[0].json()["event_id"] == envelope["event_id"]
+    import json
+    assert json.loads(requests[0].content)["event_id"] == envelope["event_id"]
 
 
 def test_adapter_does_not_retry_4xx_but_retries_5xx_and_timeout():
