@@ -656,6 +656,16 @@ JobTrail. The launcher `--automation-dry-run` mode is offline end to
 end: no source calls, no provider calls, no persistence writes, no
 network. They serve different purposes and are not interchangeable.
 
+## One-way n8n handoff
+
+JobTrail remains the sole scheduler, source collector, importer, scorer, SeenCache owner, and journal authority. The optional n8n adapter is disabled by default and sends one bounded, versioned, redacted run envelope only after the local run record is written. Hermes WhatsApp remains an independent local channel; n8n delivery never invokes or configures Hermes.
+
+Configure `N8N_ENABLED=1`, `N8N_ENDPOINT`, and optionally `N8N_TIMEOUT_SECONDS`, `N8N_RETRY_ATTEMPTS`, and `N8N_AUTH_HEADER`. Authentication values are configuration-only and are never copied into payloads, logs, or journal records. 2xx responses are acknowledgements; 4xx responses are terminal failures, while bounded 5xx/timeout attempts are recorded as exhausted or uncertain. Remove the endpoint or set `N8N_ENABLED=0` to roll back without disabling local automation.
+
+Delivery records are additive JSONL entries linked by `run_id` and `event_id`; local outcomes are retained when n8n is unavailable. Dry-run mode performs no network delivery and records no delivery acknowledgement. Verification uses only `python -m pytest` with injected `httpx.MockTransport` and fakes; no live automation, Docker, systemd, Hermes, WhatsApp, or public service is required.
+
+Telegram callbacks, public HTTPS ingress, authenticated write-back, Google Sheets as canonical storage, n8n-owned collection, Docker/systemd changes, and generic webhook behavior remain deferred.
+
 ## Safety rules
 
 - **Dry-run first:** keep `SCORER_DRY_RUN=1` until the config, JobTrail connection, provider, and logs look correct.
