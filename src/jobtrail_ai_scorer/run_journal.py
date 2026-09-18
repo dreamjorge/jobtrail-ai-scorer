@@ -93,6 +93,29 @@ def record_run(
         _append_jsonl_line(path, line)
 
 
+def _delivery_line(*, run_id: str, event_id: str, result: Any) -> dict[str, Any]:
+    """Return an additive delivery record containing no request or secret data."""
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "record_type": "delivery",
+        "run_id": str(run_id),
+        "event_id": str(event_id),
+        "status": str(getattr(result, "status", "failed")),
+        "classification": str(getattr(result, "classification", "")),
+        "attempts": max(0, int(getattr(result, "attempts", 0) or 0)),
+    }
+
+
+def record_delivery(
+    path: str | os.PathLike[str], *, run_id: str, event_id: str, result: Any,
+    lock_path: str | os.PathLike[str] | None = None,
+) -> None:
+    """Append a linked delivery outcome after the local run record."""
+    line = json.dumps(_delivery_line(run_id=run_id, event_id=event_id, result=result), sort_keys=True)
+    with _maybe_lock(lock_path):
+        _append_jsonl_line(path, line)
+
+
 def iter_runs(
     path: str | os.PathLike[str],
     *,
@@ -405,5 +428,6 @@ __all__ = [
     "DEFAULT_RUN_JOURNAL_PATH",
     "SCHEMA_VERSION",
     "iter_runs",
+    "record_delivery",
     "record_run",
 ]
