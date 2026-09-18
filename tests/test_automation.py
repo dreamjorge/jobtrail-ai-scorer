@@ -514,6 +514,17 @@ def test_automation_source_adapter_failure_is_partial():
     assert result.failures == ("search:terminal:RuntimeError",)
 
 
+def test_automation_run_exposes_stable_context_and_selected_summary():
+    run = automation.AutomationRun(run_id="run-1", selected={"title": "T", "description": "private"})
+    assert run.run_id == "run-1"
+    assert run.selected == {"title": "T", "description": "private"}
+
+
+def test_automation_config_n8n_delivery_is_disabled_by_default():
+    config = AutomationConfig.from_env({})
+    assert config.n8n.enabled is False
+
+
 def test_automation_run_profile_counts_defaults_empty():
     assert automation.AutomationRun().profile_counts == {}
 
