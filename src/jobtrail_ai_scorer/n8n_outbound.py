@@ -17,6 +17,7 @@ _SELECTED_FIELDS = (
     "recommendationLabel", "jobUrl", "jobTrailLink", "source", "sourceJobId",
 )
 _MAX_TEXT = 200
+_MAX_FAILURE_LABEL = 128
 _MAX_FAILURES = 5
 _MAX_ATTEMPTS = 3
 
@@ -80,7 +81,7 @@ def build_envelope(
     if safe_selected:
         identity = (str(safe_selected.get("source", "")), str(safe_selected.get("sourceJobId", "")))
     event_id = sha256(f"jobtrail-n8n-v1|{run_id}|{identity[0]}|{identity[1]}".encode()).hexdigest()[:32]
-    safe_failures = [_clip(label) for label in list(failures)[:_MAX_FAILURES]]
+    safe_failures = [str(label or "")[:_MAX_FAILURE_LABEL] for label in list(failures)[:_MAX_FAILURES]]
     return {
         "schema_version": 1,
         "event_id": event_id,

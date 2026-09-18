@@ -14,6 +14,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from jobtrail_ai_scorer.n8n_outbound import DeliveryResult, N8nConfig
+
 ROOT = Path(__file__).resolve().parents[1]
 LAUNCHER = ROOT / "scripts" / "automated-job-search.example.py"
 
@@ -178,6 +180,86 @@ def test_container_flag_overrides_env_var(monkeypatch, launcher) -> None:
         launcher.main()
 
     assert captured["container_name"] == "cli-container"
+
+
+def _launcher_result(**overrides):
+    values = {
+        "run_id": "run-123",
+        "searched": 2,
+        "imported": 1,
+        "scored": 1,
+        "selected": None,
+        "failures": (),
+        "profile_counts": {},
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def test_launcher_records_local_run_before_outbound_delivery(monkeypatch, launcher, tmp_path):
+    events = []
+    monkeypatch.setenv("JOBTRAIL_RUN_JOURNAL_PATH", str(tmp_path / "journal.jsonl"))
+    monkeypatch.setattr(launcher, "record_run", lambda *args, **kwargs: events.append("run"))
+    monkeypatch.setattr(launcher, "record_delivery", lambda *args, **kwargs: events.append("delivery"))
+
+    class FakeAdapter:
+        def __init__(self, config):
+            pass
+
+        def send(self, envelope):
+            events.append("outbound")
+            return DeliveryResult("accepted", 1, envelope["event_id"])
+
+    monkeypatch.setattr(launcher, "N8nOutboundAdapter", FakeAdapter)
+    launcher._record_local_then_deliver(
+        _launcher_result(), SimpleNamespace(n8n=N8nConfig()), base_url_source="static"
+    )
+
+    assert events == ["run", "outbound", "delivery"]
+
+
+def test_launcher_disabled_delivery_records_disabled_without_http(monkeypatch, launcher, tmp_path):
+    events = []
+    monkeypatch.setenv("JOBTRAIL_RUN_JOURNAL_PATH", str(tmp_path / "journal.jsonl"))
+    monkeypatch.setattr(launcher, "record_run", lambda *args, **kwargs: events.append(("run", args[1])))
+    monkeypatch.setattr(launcher, "record_delivery", lambda *args, **kwargs: events.append(("delivery", kwargs["result"])))
+
+    def unexpected_http_client(*args, **kwargs):
+        raise AssertionError("disabled delivery must not construct an HTTP client")
+
+    monkeypatch.setattr("jobtrail_ai_scorer.n8n_outbound.httpx.Client", unexpected_http_client)
+    launcher._record_local_then_deliver(
+        _launcher_result(), SimpleNamespace(n8n=N8nConfig()), base_url_source="static"
+    )
+
+    assert events[0][0] == "run"
+    assert events[1][0] == "delivery"
+    assert events[1][1].status == "disabled"
+    assert events[1][1].classification == "disabled"
+
+
+def test_launcher_keeps_pipeline_failure_distinct_from_delivery_failure(monkeypatch, launcher, tmp_path):
+    recorded = {}
+    monkeypatch.setenv("JOBTRAIL_RUN_JOURNAL_PATH", str(tmp_path / "journal.jsonl"))
+    monkeypatch.setattr(launcher, "record_run", lambda path, result, **kwargs: recorded.setdefault("run", result))
+    monkeypatch.setattr(launcher, "record_delivery", lambda path, **kwargs: recorded.setdefault("delivery", kwargs["result"]))
+
+    class FailedAdapter:
+        def __init__(self, config):
+            pass
+
+        def send(self, envelope):
+            return DeliveryResult("failed", 1, envelope["event_id"], "terminal")
+
+    monkeypatch.setattr(launcher, "N8nOutboundAdapter", FailedAdapter)
+    pipeline_result = _launcher_result(failures=("score:terminal:RuntimeError",))
+    launcher._record_local_then_deliver(
+        pipeline_result, SimpleNamespace(n8n=N8nConfig()), base_url_source="static"
+    )
+
+    assert recorded["run"].failures == ("score:terminal:RuntimeError",)
+    assert recorded["delivery"].status == "failed"
+    assert recorded["delivery"].classification == "terminal"
 
 
 def test_container_defaults_when_neither_flag_nor_env_set(

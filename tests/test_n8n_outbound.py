@@ -1,4 +1,3 @@
-from datetime import datetime, timezone
 from hashlib import sha256
 
 import httpx
@@ -34,6 +33,21 @@ def _envelope():
             "notes": "PRIVATE NOTES",
         },
     )
+
+
+def test_failure_labels_are_clipped_to_128_while_selected_text_allows_200():
+    envelope = build_envelope(
+        run_id="run-1",
+        occurred_at="2025-01-01T00:00:00+00:00",
+        searched=0,
+        imported=0,
+        scored=0,
+        failures=("f" * 300,),
+        selected={"title": "T" * 300},
+    )
+
+    assert len(envelope["result"]["failures"][0]) == 128
+    assert len(envelope["selected"]["title"]) == 200
 
 
 def test_envelope_is_versioned_bounded_allowlisted_and_stable():
