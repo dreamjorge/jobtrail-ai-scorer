@@ -7,8 +7,11 @@ from hashlib import sha256
 import os
 import time
 from typing import Any, Mapping
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import httpx
+
+from .notify import FORBIDDEN_TOKENS
 
 
 _EVENT_TYPE = "automation.run.completed"
@@ -34,6 +37,8 @@ class N8nConfig:
     def from_env(cls, env: Mapping[str, str] | None = None) -> "N8nConfig":
         values = os.environ if env is None else env
         truthy = values.get("N8N_ENABLED", "0").strip().lower() in {"1", "true", "yes", "on"}
+        if not truthy:
+            return cls(enabled=False)
         timeout = float(values.get("N8N_TIMEOUT_SECONDS", "5"))
         attempts = int(values.get("N8N_RETRY_ATTEMPTS", str(_MAX_ATTEMPTS)))
         if timeout <= 0 or attempts < 1 or attempts > _MAX_ATTEMPTS:
@@ -60,6 +65,26 @@ def _clip(value: Any) -> str:
     return str(value or "")[:_MAX_TEXT]
 
 
+_CREDENTIAL_QUERY_KEYS = {
+    "token", "api_key", "apikey", "access_token", "password", "client_secret",
+    "secret", "app_id", "app_key",
+}
+
+
+def _redact_text(value: str) -> str:
+    cleaned = value
+    for token in FORBIDDEN_TOKENS:
+        cleaned = cleaned.replace(token, "[redacted]")
+    if "?" not in cleaned or "=" not in cleaned:
+        return cleaned[:_MAX_TEXT]
+    parts = urlsplit(cleaned)
+    query = [
+        (key, val) for key, val in parse_qsl(parts.query, keep_blank_values=True)
+        if key.lower() not in _CREDENTIAL_QUERY_KEYS
+    ]
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))[:_MAX_TEXT]
+
+
 def _selected_summary(selected: Mapping[str, Any] | None) -> dict[str, Any] | None:
     if not selected:
         return None
@@ -67,7 +92,10 @@ def _selected_summary(selected: Mapping[str, Any] | None) -> dict[str, Any] | No
     for key in _SELECTED_FIELDS:
         if key in selected and selected[key] is not None:
             value = selected[key]
-            result[key] = _clip(value) if isinstance(value, str) else value
+            if isinstance(value, str):
+                result[key] = _redact_text(value)
+            elif key == "score" and isinstance(value, (int, float)) and not isinstance(value, bool):
+                result[key] = value
     return result
 
 

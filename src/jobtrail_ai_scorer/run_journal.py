@@ -188,7 +188,7 @@ def _line_for_run(
         selected=selected, failures=failures, notification_sent=notification_sent
     )
 
-    run_id = _build_run_id(started_at=started_at, clock=clock)
+    run_id = getattr(run, "run_id", None) or _build_run_id(started_at=started_at, clock=clock)
     return {
         "schema_version": SCHEMA_VERSION,
         "run_id": run_id,

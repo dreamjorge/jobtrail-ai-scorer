@@ -223,6 +223,36 @@ def test_launcher_records_local_run_before_outbound_delivery(monkeypatch, launch
     assert events == ["run", "outbound", "delivery"]
 
 
+def test_launcher_local_and_delivery_records_share_established_run_id(monkeypatch, launcher, tmp_path):
+    journal = tmp_path / "journal.jsonl"
+    monkeypatch.setenv("JOBTRAIL_RUN_JOURNAL_PATH", str(journal))
+    launcher._record_local_then_deliver(
+        _launcher_result(run_id="run-established"),
+        SimpleNamespace(n8n=N8nConfig()),
+        base_url_source="static",
+        started_at=launcher.datetime.now(launcher.timezone.utc),
+        finished_at=launcher.datetime.now(launcher.timezone.utc),
+    )
+    import json
+    records = [json.loads(line) for line in journal.read_text().splitlines()]
+    assert records[0]["run_id"] == records[1]["run_id"] == "run-established"
+
+
+def test_launcher_passes_distinct_pipeline_timestamps(monkeypatch, launcher, tmp_path):
+    captured = {}
+    monkeypatch.setenv("JOBTRAIL_RUN_JOURNAL_PATH", str(tmp_path / "journal.jsonl"))
+    moments = iter((launcher.datetime(2025, 1, 1, tzinfo=launcher.timezone.utc), launcher.datetime(2025, 1, 1, 0, 0, 1, tzinfo=launcher.timezone.utc)))
+    monkeypatch.setattr(launcher, "datetime", lambda *args, **kwargs: next(moments))
+    monkeypatch.setattr(launcher, "record_run", lambda path, result, **kwargs: captured.update(kwargs))
+    monkeypatch.setattr(launcher, "record_delivery", lambda *args, **kwargs: None)
+    monkeypatch.setattr(launcher, "N8nOutboundAdapter", lambda config: SimpleNamespace(send=lambda envelope: DeliveryResult("disabled", 0, envelope["event_id"], "disabled")))
+    launcher._record_local_then_deliver(
+        _launcher_result(), SimpleNamespace(n8n=N8nConfig()), base_url_source="static",
+        started_at=next(moments), finished_at=next(moments),
+    )
+    assert captured["started_at"] < captured["finished_at"]
+
+
 def test_launcher_disabled_delivery_records_disabled_without_http(monkeypatch, launcher, tmp_path):
     events = []
     monkeypatch.setenv("JOBTRAIL_RUN_JOURNAL_PATH", str(tmp_path / "journal.jsonl"))

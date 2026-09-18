@@ -1,7 +1,14 @@
 from types import SimpleNamespace
 
 from jobtrail_ai_scorer.automation import AutomationRun
-from jobtrail_ai_scorer.run_journal import _line_for_run, _delivery_line
+from jobtrail_ai_scorer.run_journal import _line_for_run, _delivery_line, record_run
+
+
+def test_record_run_uses_established_automation_run_id(tmp_path):
+    path = tmp_path / "runs.jsonl"
+    run = AutomationRun(run_id="run-established")
+    record_run(path, run, started_at=0.0, finished_at=1.0, base_url_source="test")
+    assert next(iter(__import__("jobtrail_ai_scorer.run_journal", fromlist=["iter_runs"]).iter_runs(path)))["run_id"] == "run-established"
 
 
 def test_delivery_line_links_run_event_and_classification_without_secrets():
