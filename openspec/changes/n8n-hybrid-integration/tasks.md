@@ -38,10 +38,10 @@ Chain strategy: pending
 
 ## Phase 3: TRIANGULATE — Full Hermetic Evidence
 
-- [ ] 3.1 Add sensitive/oversized fixtures and assert payload, logs, and journal omit descriptions, notes, prompts, CV/profile data, credentials, and provider blobs; run `python -m pytest`; commit `test: verify n8n redaction boundaries`. <!-- sdd-owner: implementation -->
-- [ ] 3.2 Verify retry/idempotency, disabled-by-default config, dry-run exclusion, launcher ordering, local failure retention, and Hermes non-invocation across focused tests and `python -m pytest`; commit `test: triangulate n8n integration`. <!-- sdd-owner: implementation -->
+- [x] 3.1 Add sensitive/oversized fixtures and assert payload, logs, and journal omit descriptions, notes, prompts, CV/profile data, credentials, and provider blobs; run `python -m pytest`; commit `test: verify n8n redaction boundaries`. <!-- sdd-owner: implementation -->
+- [x] 3.2 Verify retry/idempotency, disabled-by-default config, dry-run exclusion, launcher ordering, local failure retention, and Hermes non-invocation across focused tests and `python -m pytest`; commit `test: triangulate n8n integration`. <!-- sdd-owner: implementation -->
 
 ## Phase 4: REFACTOR — Rollout and Regression
 
-- [ ] 4.1 Refactor only after green evidence, preserving public contracts and existing tests; run `python -m pytest`; commit `refactor: simplify bounded n8n integration`. <!-- sdd-owner: implementation -->
-- [ ] 4.2 Update `docs/runtime-automation.md` with sole scheduler/SeenCache ownership, variables, auth-secret boundary, disable/rollback, journal observability, hermetic verification, and explicit deferred Telegram callbacks/public HTTPS/authenticated write-back/Google Sheets/n8n collection; run `python -m pytest`; commit `docs: document n8n rollout boundaries`. <!-- sdd-owner: implementation -->
+- [x] 4.1 Refactor only after green evidence, preserving public contracts and existing tests; run `python -m pytest`; commit `refactor: simplify bounded n8n integration`. <!-- sdd-owner: implementation -->
+- [x] 4.2 Update `docs/runtime-automation.md` with sole scheduler/SeenCache ownership, variables, auth-secret boundary, disable/rollback, journal observability, hermetic verification, and explicit deferred Telegram callbacks/public HTTPS/authenticated write-back/Google Sheets/n8n collection; run `python -m pytest`; commit `docs: document n8n rollout boundaries`. <!-- sdd-owner: implementation -->

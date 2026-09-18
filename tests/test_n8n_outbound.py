@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+from hashlib import sha256
 
 import httpx
 
@@ -41,7 +42,7 @@ def test_envelope_is_versioned_bounded_allowlisted_and_stable():
     assert first == second
     assert set(first) == {"schema_version", "event_id", "run_id", "event_type", "occurred_at", "result", "selected"}
     assert first["schema_version"] == 1
-    assert len(first["event_id"]) == 32
+    assert first["event_id"] == sha256(b"jobtrail-n8n-v1|run-1|indeed|1").hexdigest()[:32]
     assert first["result"] == {
         "searched": 4,
         "imported": 2,
