@@ -212,9 +212,10 @@ def test_dry_run_output_does_not_leak_env_secrets(launcher, clean_env, monkeypat
     assert "SECRET_TOKEN" not in stderr
 
 
-def test_default_dry_run_is_disabled(launcher, clean_env, monkeypatch):
+def test_default_dry_run_is_disabled(launcher, clean_env, monkeypatch, tmp_path):
     """Without flag or env, the launcher must NOT take the dry-run path."""
 
+    monkeypatch.setenv("JOBTRAIL_RUN_JOURNAL_PATH", str(tmp_path / "journal.jsonl"))
     called = {"automation": False}
 
     def fake_search_automation(*args, **kwargs):
