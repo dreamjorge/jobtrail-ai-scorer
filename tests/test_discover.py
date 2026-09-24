@@ -197,6 +197,21 @@ def test_probe_url_returns_false_on_urllib_error(monkeypatch):
     assert discover._probe_url(DEFAULT_PUBLISHED_URL, timeout=1.0) is False
 
 
+def test_probe_url_rejects_another_service_on_the_published_port(monkeypatch):
+    import urllib.error
+    import urllib.request
+
+    def fake_urlopen(request, *, timeout):
+        assert request.full_url == f"{DEFAULT_PUBLISHED_URL}/api/health"
+        raise urllib.error.HTTPError(
+            request.full_url, 401, "unauthorized", {}, None
+        )
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+
+    assert discover._probe_url(DEFAULT_PUBLISHED_URL, timeout=1.0) is False
+
+
 def test_docker_inspect_ip_extracts_ip_from_docker_output(monkeypatch):
     fake_output = f"{_DOC_IP_2}\n"
 

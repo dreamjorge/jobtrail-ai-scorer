@@ -128,20 +128,19 @@ def _make_default_inspect(timeout: float) -> InspectFn:
 
 
 def _probe_url(url: str, *, timeout: float) -> bool:
-    """Return True iff ``url`` answers an HTTP request within ``timeout`` seconds.
+    """Return True iff the JobTrail health endpoint returns a 2xx response.
 
-    Uses ``urllib.request`` to keep the helper dependency-free. Any
-    ``URLError``/``HTTPError``/timeout/connection issue is treated as
-    "unreachable" so the next branch can be tried.
+    Uses ``urllib.request`` to keep the helper dependency-free. Probing a
+    service-specific endpoint avoids mistaking an unrelated application on the
+    published port for JobTrail (for example, a login redirect from pyLoad).
     """
-    request = urllib.request.Request(url, method="GET")
+    health_url = f"{url.rstrip('/')}/api/health"
+    request = urllib.request.Request(health_url, method="GET")
     try:
-        urllib.request.urlopen(request, timeout=timeout)
-        return True
-    except urllib.error.HTTPError:
-        # The server replied; for discovery purposes an HTTP response means
-        # the backend is reachable (e.g. 404 on root is fine — we want any reply).
-        return True
+        response = urllib.request.urlopen(request, timeout=timeout)
+        return 200 <= getattr(response, "status", 200) < 300
+    except urllib.error.HTTPError as error:
+        return 200 <= error.code < 300
     except (urllib.error.URLError, TimeoutError, ConnectionError, OSError):
         return False
 
