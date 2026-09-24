@@ -201,7 +201,7 @@ def score_jobs(
 
             prompt = render_prompt(full_job, candidate_profile)
             raw_score = provider.score(prompt)
-            score = ScoreResult.model_validate(json.loads(raw_score))
+            score = ScoreResult.model_validate(_decode_provider_score(raw_score))
             note_body = _serialize_note(marker, score)
             if dry_run:
                 processed += 1
@@ -224,6 +224,29 @@ def score_jobs(
                 print(f"FAILED {candidate_id}: {error.__class__.__name__}")
 
     return ScoreRunResult(processed, skipped, failed, tuple(outcomes))
+
+
+_MAX_PROVIDER_RESPONSE = 1_000_000
+
+
+def _decode_provider_score(raw_score: str) -> dict[str, Any]:
+    """Decode one provider JSON object, optionally wrapped in a JSON fence."""
+
+    if not isinstance(raw_score, str):
+        raise TypeError("provider score must be a string")
+    if len(raw_score) > _MAX_PROVIDER_RESPONSE:
+        raise json.JSONDecodeError("provider response exceeds maximum size", "", 0)
+
+    payload = raw_score.strip()
+    if payload.startswith("```json"):
+        if not payload.endswith("```"):
+            raise json.JSONDecodeError("unterminated JSON fence", payload, 0)
+        payload = payload[len("```json") : -len("```")].strip()
+
+    decoded = json.loads(payload)
+    if not isinstance(decoded, dict):
+        raise json.JSONDecodeError("expected a JSON object", payload, 0)
+    return decoded
 
 
 def _select_candidates(
