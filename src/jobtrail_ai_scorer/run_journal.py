@@ -89,7 +89,7 @@ def record_run(
         clock=clock,
     )
     line = json.dumps(payload, ensure_ascii=False, sort_keys=True)
-    with _maybe_lock(lock_path):
+    with _maybe_lock(lock_path or _default_lock_path(path)):
         _append_jsonl_line(path, line)
 
 
@@ -112,8 +112,15 @@ def record_delivery(
 ) -> None:
     """Append a linked delivery outcome after the local run record."""
     line = json.dumps(_delivery_line(run_id=run_id, event_id=event_id, result=result), sort_keys=True)
-    with _maybe_lock(lock_path):
+    with _maybe_lock(lock_path or _default_lock_path(path)):
         _append_jsonl_line(path, line)
+
+
+def _default_lock_path(path: str | os.PathLike[str]) -> Path:
+    """Return the stable sibling lock shared by all journal record writers."""
+
+    target = Path(path)
+    return target.with_name(f"{target.name}.lock")
 
 
 def iter_runs(

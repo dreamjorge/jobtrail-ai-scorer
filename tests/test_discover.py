@@ -197,6 +197,44 @@ def test_probe_url_returns_false_on_urllib_error(monkeypatch):
     assert discover._probe_url(DEFAULT_PUBLISHED_URL, timeout=1.0) is False
 
 
+def test_probe_url_accepts_older_jobtrail_health_head_fallback(monkeypatch):
+    import urllib.error
+    import urllib.request
+
+    methods = []
+
+    def fake_urlopen(request, *, timeout):
+        methods.append(request.method)
+        if request.method == "GET":
+            raise urllib.error.HTTPError(request.full_url, 404, "not found", {}, None)
+        return type("Response", (), {"status": 204})()
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    assert discover._probe_url(DEFAULT_PUBLISHED_URL, timeout=1.0) is True
+    assert methods == ["GET", "HEAD"]
+
+
+def test_probe_url_falls_back_to_legacy_health_endpoint(monkeypatch):
+    import urllib.error
+    import urllib.request
+
+    methods_and_urls = []
+
+    def fake_urlopen(request, *, timeout):
+        methods_and_urls.append((request.method, request.full_url))
+        if request.full_url.endswith("/api/health"):
+            raise urllib.error.HTTPError(request.full_url, 404, "not found", {}, None)
+        return type("Response", (), {"status": 200})()
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    assert discover._probe_url(DEFAULT_PUBLISHED_URL, timeout=1.0) is True
+    assert methods_and_urls == [
+        ("GET", f"{DEFAULT_PUBLISHED_URL}/api/health"),
+        ("HEAD", f"{DEFAULT_PUBLISHED_URL}/api/health"),
+        ("GET", f"{DEFAULT_PUBLISHED_URL}/health"),
+    ]
+
+
 def test_probe_url_rejects_another_service_on_the_published_port(monkeypatch):
     import urllib.error
     import urllib.request

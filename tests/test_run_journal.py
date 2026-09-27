@@ -1,7 +1,43 @@
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
 from jobtrail_ai_scorer.automation import AutomationRun
-from jobtrail_ai_scorer.run_journal import _line_for_run, _delivery_line, record_run
+from jobtrail_ai_scorer.run_journal import (
+    _line_for_run,
+    _delivery_line,
+    iter_runs,
+    record_delivery,
+    record_run,
+)
+
+
+def test_record_run_and_delivery_default_lock_preserves_concurrent_records(tmp_path):
+    path = tmp_path / "runs.jsonl"
+    result = SimpleNamespace(status="sent", classification="success", attempts=1)
+
+    def write(index):
+        if index % 2:
+            record_run(
+                path,
+                AutomationRun(run_id=f"run-{index}"),
+                started_at=float(index),
+                finished_at=float(index + 1),
+                base_url_source="test",
+            )
+        else:
+            record_delivery(
+                path,
+                run_id=f"run-{index}",
+                event_id=f"event-{index}",
+                result=result,
+            )
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        list(executor.map(write, range(20)))
+
+    records = list(iter_runs(path))
+    assert len(records) == 20
+    assert {record["run_id"] for record in records} == {f"run-{i}" for i in range(20)}
 
 
 def test_record_run_uses_established_automation_run_id(tmp_path):
