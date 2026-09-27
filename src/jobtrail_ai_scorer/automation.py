@@ -450,6 +450,7 @@ def build_notification_summary(
     score: Mapping[str, Any],
     *,
     base_url: str = "",
+    run_id: str = "",
 ) -> dict[str, Any]:
     """Build a bounded notification from explicitly allowlisted fields.
 
@@ -462,6 +463,8 @@ def build_notification_summary(
 
     builder = NotificationBuilder.from_env(base_url=base_url)
     summary = builder.build(score=score, job=job)
+    if run_id:
+        summary["runId"] = run_id
     if "recommendationLabel" not in summary:
         # Defensive fallback for the no-base-url path so the legacy callers
         # still get a stable, normalized recommendation label.
@@ -1171,6 +1174,7 @@ class JobTrailAutomation:
             scored=scored,
             score_threshold=config.score_threshold,
             base_url=self.base_url,
+            run_id=run_id,
         )
         notification_sent = False
         if notification_body is not None:
@@ -1329,6 +1333,7 @@ class JobTrailAutomation:
         scored: int,
         score_threshold: int,
         base_url: str = "",
+        run_id: str = "",
     ) -> str | None:
         """Assemble the WhatsApp helper message from the run's outcome.
 
@@ -1355,6 +1360,7 @@ class JobTrailAutomation:
                     best_job or {},
                     score_for_notification,
                     base_url=base_url,
+                    run_id=run_id,
                 )
             )
         no_match_body: str | None = None

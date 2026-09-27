@@ -1812,7 +1812,7 @@ def test_compose_notification_includes_three_new_fields_in_run():
     scorer.jobs = gateway.jobs
     notifier = FakeNotifier()
 
-    JobSearchAutomation(gateway, scorer=scorer, notifier=notifier).run(
+    result = JobSearchAutomation(gateway, scorer=scorer, notifier=notifier).run(
         config=AutomationConfig(
             base_url="http://jobtrail.example.com",
             scorer_config_path="safe/config.yaml",
@@ -1827,6 +1827,7 @@ def test_compose_notification_includes_three_new_fields_in_run():
     assert "*Recommendation:* Priority Apply" in message
     run_id = re.search(r"\*Run ID:\* (\S+)", message).group(1)
     assert _RUN_ID_PATTERN.match(run_id)
+    assert run_id == result.run_id
 
 
 def test_compose_notification_link_uses_whatsapp_short_url_base(monkeypatch):

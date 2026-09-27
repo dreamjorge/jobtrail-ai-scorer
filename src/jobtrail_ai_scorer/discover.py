@@ -140,7 +140,34 @@ def _probe_url(url: str, *, timeout: float) -> bool:
         response = urllib.request.urlopen(request, timeout=timeout)
         return 200 <= getattr(response, "status", 200) < 300
     except urllib.error.HTTPError as error:
-        return 200 <= error.code < 300
+        if error.code != 404:
+            return 200 <= error.code < 300
+        # Older JobTrail backends may not implement GET /api/health but still
+        # expose the endpoint to the conventional HEAD probe.
+        try:
+            response = urllib.request.urlopen(
+                urllib.request.Request(health_url, method="HEAD"), timeout=timeout
+            )
+            return 200 <= getattr(response, "status", 200) < 300
+        except urllib.error.HTTPError as head_error:
+            if 200 <= head_error.code < 300:
+                return True
+            if head_error.code != 404:
+                return False
+            # Some older supported backends expose only the conventional
+            # service-specific health endpoint.
+            try:
+                response = urllib.request.urlopen(
+                    urllib.request.Request(f"{url.rstrip('/')}/health", method="GET"),
+                    timeout=timeout,
+                )
+                return 200 <= getattr(response, "status", 200) < 300
+            except urllib.error.HTTPError as legacy_error:
+                return 200 <= legacy_error.code < 300
+            except (urllib.error.URLError, TimeoutError, ConnectionError, OSError):
+                return False
+        except (urllib.error.URLError, TimeoutError, ConnectionError, OSError):
+            return False
     except (urllib.error.URLError, TimeoutError, ConnectionError, OSError):
         return False
 
