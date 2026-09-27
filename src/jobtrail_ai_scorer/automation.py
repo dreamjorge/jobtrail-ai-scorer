@@ -469,6 +469,46 @@ def build_notification_summary(
     return summary
 
 
+def _render_notification_summary(summary: Mapping[str, Any]) -> str:
+    """Render an allowlisted notification summary as readable WhatsApp text."""
+
+    title = summary.get("title") or "JobTrail match"
+    lines = [f"*JobTrail match: {title}*"]
+
+    for label, key in (
+        ("Company", "company"),
+        ("Location", "location"),
+        ("Score", "score"),
+    ):
+        value = summary.get(key)
+        if value is not None and value != "":
+            lines.append(f"*{label}:* {value}")
+
+    recommendation = summary.get("recommendationLabel") or summary.get("recommendation")
+    if recommendation is not None and recommendation != "":
+        lines.append(f"*Recommendation:* {recommendation}")
+
+    for label, key in (("JobTrail", "jobTrailLink"), ("Source", "jobUrl")):
+        value = summary.get(key)
+        if value is not None and value != "":
+            lines.append(f"*{label}:* {value}")
+
+    for label, key in (
+        ("Search profiles", "searchProfiles"),
+        ("Strengths", "strengths"),
+        ("Gaps", "gaps"),
+    ):
+        values = summary.get(key) or []
+        if values:
+            lines.append(f"*{label}:*")
+            lines.extend(f"• {value}" for value in values if value not in (None, ""))
+
+    run_id = summary.get("runId")
+    if run_id is not None and run_id != "":
+        lines.append(f"*Run ID:* {run_id}")
+    return "\n".join(lines)
+
+
 class AutomationGateway(Protocol):
     def search(self, payload: dict[str, Any]) -> list[dict[str, Any]]: ...
     def import_job(self, payload: dict[str, Any]) -> dict[str, Any]: ...
@@ -1310,14 +1350,12 @@ class JobTrailAutomation:
             score_for_notification = dict(best_score or {})
             if best.get("searchProfiles"):
                 score_for_notification["searchProfiles"] = best["searchProfiles"]
-            match_body = json.dumps(
+            match_body = _render_notification_summary(
                 build_notification_summary(
                     best_job or {},
                     score_for_notification,
                     base_url=base_url,
-                ),
-                ensure_ascii=False,
-                sort_keys=True,
+                )
             )
         no_match_body: str | None = None
         if notify_enabled and best is None and not failures:
