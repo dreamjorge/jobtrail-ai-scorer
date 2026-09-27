@@ -932,8 +932,10 @@ def test_selected_notification_includes_public_search_profiles():
     )
 
     assert result.selected["searchProfiles"] == ["python", "backend"]
-    message = json.loads(notifier.messages[0])
-    assert message["searchProfiles"] == ["python", "backend"]
+    message = notifier.messages[0]
+    assert "*Search profiles:*" in message
+    assert "• python" in message
+    assert "• backend" in message
 
 
 def test_selected_notification_contains_job_and_score_data(monkeypatch):
@@ -959,33 +961,65 @@ def test_selected_notification_contains_job_and_score_data(monkeypatch):
 
     assert summary_args[0][0] is gateway.jobs["j1"]
     assert summary_args[0][1]["score"] == 91
-    message = json.loads(notifier.messages[0])
-    assert set(message) == {
-        "title",
-        "company",
-        "location",
-        "score",
-        "recommendation",
-        "recommendationLabel",
-        "strengths",
-        "gaps",
-        "jobUrl",
-        "jobTrailLink",
-        "runId",
-    }
-    assert message["title"] == "Python Engineer"
-    assert message["company"] == "Acme"
-    assert message["location"] == "Queretaro"
-    assert message["jobUrl"] == "https://jobs.test/1"
-    assert message["score"] == 91
-    assert message["recommendation"] == "PRIORITY_APPLY"
-    assert message["recommendationLabel"] == "Priority Apply"
-    assert message["strengths"] == ["Python"]
-    assert message["gaps"] == ["None"]
-    assert message["jobTrailLink"] == "http://jobtrail.example.com/jobs/j1"
+    message = notifier.messages[0]
+    assert "*JobTrail match: Python Engineer*" in message
+    assert "*Company:* Acme" in message
+    assert "*Location:* Queretaro" in message
+    assert "*Score:* 91" in message
+    assert "*Recommendation:* Priority Apply" in message
+    assert "• Python" in message
+    assert "• None" in message
+    assert "*JobTrail:* http://jobtrail.example.com/jobs/j1" in message
     import re as _re
 
-    assert _re.match(r"^\d{4}-\d{2}-\d{2}-\d{4}-[a-f0-9]{6}$", message["runId"])
+    run_id = re.search(r"\*Run ID:\* (\S+)", message).group(1)
+    assert _re.match(r"^\d{4}-\d{2}-\d{2}-\d{4}-[a-f0-9]{6}$", run_id)
+
+
+def test_selected_notification_renders_readable_whatsapp_text(monkeypatch):
+    summary = {
+        "title": "Python Engineer",
+        "company": "Acme",
+        "location": "",
+        "score": 91,
+        "recommendation": "PRIORITY_APPLY",
+        "recommendationLabel": "Priority Apply",
+        "strengths": ["Python", "APIs"],
+        "gaps": ["None"],
+        "jobUrl": "https://jobs.test/1",
+        "jobTrailLink": "https://jobtrail.test/jobs/j1",
+        "runId": "20260926-1234-abcdef",
+    }
+    monkeypatch.setattr(automation, "build_notification_summary", lambda *args, **kwargs: summary)
+
+    message = JobSearchAutomation._compose_notification(
+        best={"id": "j1"},
+        best_job={},
+        best_score={},
+        failures=(),
+        notify_enabled=True,
+        notify_on_failure=False,
+        searched=1,
+        scored=1,
+        score_threshold=80,
+    )
+
+    assert message == (
+        "*JobTrail match: Python Engineer*\n"
+        "*Company:* Acme\n"
+        "*Score:* 91\n"
+        "*Recommendation:* Priority Apply\n"
+        "*JobTrail:* https://jobtrail.test/jobs/j1\n"
+        "*Source:* https://jobs.test/1\n"
+        "*Strengths:*\n"
+        "• Python\n"
+        "• APIs\n"
+        "*Gaps:*\n"
+        "• None\n"
+        "*Run ID:* 20260926-1234-abcdef"
+    )
+    assert "Location" not in message
+    assert not message.startswith("{")
 
 
 def test_no_match_notification_when_score_below_threshold():
@@ -1787,12 +1821,12 @@ def test_compose_notification_includes_three_new_fields_in_run():
     )
 
     assert len(notifier.messages) == 1
-    message = json.loads(notifier.messages[0])
+    message = notifier.messages[0]
     # The three new fields are present and stable.
-    assert message["jobTrailLink"].endswith("/jobs/j1")
-    assert message["jobTrailLink"].startswith("http://jobtrail.example.com")
-    assert message["recommendationLabel"] in {"Apply", "Priority Apply", "Review", "Skip"}
-    assert _RUN_ID_PATTERN.match(message["runId"])
+    assert "*JobTrail:* http://jobtrail.example.com/jobs/j1" in message
+    assert "*Recommendation:* Priority Apply" in message
+    run_id = re.search(r"\*Run ID:\* (\S+)", message).group(1)
+    assert _RUN_ID_PATTERN.match(run_id)
 
 
 def test_compose_notification_link_uses_whatsapp_short_url_base(monkeypatch):
@@ -1812,10 +1846,9 @@ def test_compose_notification_link_uses_whatsapp_short_url_base(monkeypatch):
         )
     )
 
-    message = json.loads(notifier.messages[0])
-    assert message["jobTrailLink"].startswith("https://sho.rt/")
-    assert message["jobTrailLink"].endswith("/jobs/j1")
-    assert "jobtrail.example.com" not in message["jobTrailLink"]
+    message = notifier.messages[0]
+    assert "*JobTrail:* https://sho.rt/jobs/j1" in message
+    assert "jobtrail.example.com" not in message
 
 
 def test_compose_notification_redacts_sensitive_substrings_in_run():
