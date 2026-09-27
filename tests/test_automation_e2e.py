@@ -248,15 +248,15 @@ def test_happy_path_drives_full_pipeline(server, state):
         for note in state.jobs[job_id_alpha]["notes"]
     )
 
-    # Exactly one best-match WhatsApp message with only allowlisted fields.
+    # Exactly one best-match WhatsApp message rendered as readable text.
     assert len(whatsapp.messages) == 1
-    payload = json.loads(whatsapp.messages[0])
-    _assert_allowlisted_notification_payload(payload)
-    assert payload["score"] == 91
-    assert payload["recommendation"] == "PRIORITY_APPLY"
+    body = whatsapp.messages[0]
+    assert body.startswith("*JobTrail match:")
+    assert "*Score:* 91" in body
+    assert "*Recommendation:* Priority Apply" in body
     # The link is percent-encoded; decode it before comparing to the raw id.
-    assert unquote(payload["jobTrailLink"]).endswith(f"/jobs/{job_id_alpha}")
-    rendered = json.dumps(payload).lower()
+    assert f"/jobs/{job_id_alpha}" in unquote(body)
+    rendered = body.lower()
     for forbidden in (
         "description",
         "candidate",
@@ -374,18 +374,15 @@ def test_redaction_strips_forbidden_tokens_from_notification(server, state):
         assert sentinel not in body
     assert "[REDACTED]" in body
 
-    # The parsed payload still exposes the strengths/gaps arrays but with
-    # the sentinels replaced by the redacted placeholder.
-    payload = json.loads(body)
-    flat = json.dumps(payload)
+    # Readable text still exposes the redacted strengths/gaps content.
     for sentinel in (
         "RESUME_SENTINEL",
         "PROFILE_SENTINEL",
         "PROMPT_SENTINEL",
         "CREDENTIAL_SENTINEL",
     ):
-        assert sentinel not in flat
-    assert "[REDACTED]" in flat
+        assert sentinel not in body
+    assert "[REDACTED]" in body
 
 
 def test_get_job_endpoint_serves_persisted_notes(server, state):
@@ -432,16 +429,17 @@ def test_single_notification_invariant_above_threshold(server, state):
     _run(server, scorer=scorer, notifier=whatsapp)
 
     assert len(whatsapp.messages) == 1
-    payload = json.loads(whatsapp.messages[0])
-    assert payload["score"] == 92
-    assert payload["recommendation"] == "PRIORITY_APPLY"
-    _assert_allowlisted_notification_payload(payload)
+    body = whatsapp.messages[0]
+    assert "*Score:* 92" in body
+    assert "*Recommendation:* Priority Apply" in body
     # The run id matches the documented ``YYYY-MM-DD-HHMM-<6 hex>`` shape.
-    assert re.match(r"^\d{4}-\d{2}-\d{2}-\d{4}-[a-f0-9]{6}$", payload["runId"])
+    assert re.search(
+        r"\*Run ID:\* \d{4}-\d{2}-\d{2}-\d{4}-[a-f0-9]{6}", body
+    )
     # Exactly one of the two jobs is referenced by the rendered link.
-    decoded_link = unquote(payload["jobTrailLink"])
+    decoded_body = unquote(body)
     expected_ids = {
         state.id_for("indeed", "alpha-1"),
         state.id_for("linkedin", "beta-2"),
     }
-    assert any(decoded_link.endswith(f"/jobs/{job_id}") for job_id in expected_ids)
+    assert sum(f"/jobs/{job_id}" in decoded_body for job_id in expected_ids) == 1
