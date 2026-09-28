@@ -1188,6 +1188,19 @@ def test_failed_scorer_cannot_select_or_notify_old_high_marker():
     assert notifier.messages == []
 
 
+def test_supplied_run_id_is_clipped_and_scrubbed():
+    summary = build_notification_summary(
+        {"id": "j1"},
+        {"score": 88},
+        base_url="https://jobtrail.example.com",
+        run_id="RESUME_SENTINEL" + "x" * 300,
+    )
+
+    assert len(summary["runId"]) <= 200
+    assert "RESUME_SENTINEL" not in summary["runId"]
+    assert summary["runId"].startswith("[REDACTED]")
+
+
 def test_notification_summary_allowlist_and_bounded_text():
     summary = build_notification_summary(
         {

@@ -18,6 +18,7 @@ invoked from any launcher or test without importing ``httpx``.
 
 from __future__ import annotations
 
+import json
 import subprocess
 import urllib.error
 import urllib.request
@@ -148,24 +149,36 @@ def _probe_url(url: str, *, timeout: float) -> bool:
             response = urllib.request.urlopen(
                 urllib.request.Request(health_url, method="HEAD"), timeout=timeout
             )
-            return 200 <= getattr(response, "status", 200) < 300
+            if 200 <= getattr(response, "status", 200) < 300:
+                return True
         except urllib.error.HTTPError as head_error:
             if 200 <= head_error.code < 300:
                 return True
-            if head_error.code != 404:
+        except (urllib.error.URLError, TimeoutError, ConnectionError, OSError):
+            return False
+
+        # Some older supported backends expose only the conventional
+        # service-specific health endpoint. Any HTTP failure from the HEAD
+        # probe is allowed to reach this fallback; transport failures remain
+        # rejected above.
+        try:
+            response = urllib.request.urlopen(
+                urllib.request.Request(f"{url.rstrip('/')}/health", method="GET"),
+                timeout=timeout,
+            )
+            if not 200 <= getattr(response, "status", 200) < 300:
                 return False
-            # Some older supported backends expose only the conventional
-            # service-specific health endpoint.
             try:
-                response = urllib.request.urlopen(
-                    urllib.request.Request(f"{url.rstrip('/')}/health", method="GET"),
-                    timeout=timeout,
-                )
-                return 200 <= getattr(response, "status", 200) < 300
-            except urllib.error.HTTPError as legacy_error:
-                return 200 <= legacy_error.code < 300
-            except (urllib.error.URLError, TimeoutError, ConnectionError, OSError):
+                payload = json.loads(response.read())
+            except (AttributeError, TypeError, ValueError):
                 return False
+            return (
+                isinstance(payload, dict)
+                and payload.get("status") == "ok"
+                and payload.get("service") == "jobtrail"
+            )
+        except urllib.error.HTTPError:
+            return False
         except (urllib.error.URLError, TimeoutError, ConnectionError, OSError):
             return False
     except (urllib.error.URLError, TimeoutError, ConnectionError, OSError):

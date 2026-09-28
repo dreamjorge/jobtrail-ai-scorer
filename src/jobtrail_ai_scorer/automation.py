@@ -28,7 +28,13 @@ from .sources import (
     build_ats_adapters,
     normalize_jobspy_job,
 )
-from .notify import NotificationBuilder, build_run_id, recommendation_label
+from .notify import (
+    NotificationBuilder,
+    _clip_text,
+    _scrub,
+    build_run_id,
+    recommendation_label,
+)
 from .n8n_outbound import N8nConfig
 
 
@@ -464,7 +470,7 @@ def build_notification_summary(
     builder = NotificationBuilder.from_env(base_url=base_url)
     summary = builder.build(score=score, job=job)
     if run_id:
-        summary["runId"] = run_id
+        summary["runId"] = _scrub(_clip_text(run_id))
     if "recommendationLabel" not in summary:
         # Defensive fallback for the no-base-url path so the legacy callers
         # still get a stable, normalized recommendation label.
