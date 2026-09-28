@@ -49,7 +49,9 @@ from jobtrail_ai_scorer.automation import (
     AutomationRun,
     JobSearchAutomation,
     JobTrailHTTPClient,
+    build_n8n_envelope,
 )
+from jobtrail_ai_scorer.n8n_outbound import N8nConfig, N8nOutboundAdapter
 from jobtrail_ai_scorer.notify import ALLOWED_FIELDS
 from jobtrail_ai_scorer.retry import RetryPolicy
 from jobtrail_ai_scorer.seen_cache import SeenCache
@@ -415,6 +417,72 @@ def test_get_job_endpoint_serves_persisted_notes(server, state):
     payload = json.loads(note_body.split("[AI_JOB_SCORE_V1]", 1)[1].strip())
     assert payload["score"] == 85
     assert payload["recommendation"] == "APPLY"
+
+
+def test_n8n_handoff_preserves_scoring_metadata(server, state):
+    """The automation-to-n8n boundary carries the selected score metadata."""
+
+    class MetadataScorer(StubScorer):
+        def __call__(self, job_id: str, config_path: str) -> None:
+            super().__call__(job_id, config_path)
+            note = self.state.jobs[job_id]["notes"][0]
+            payload = json.loads(note["body"].split("[AI_JOB_SCORE_V1]", 1)[1])
+            payload.update(
+                {
+                    "fit_score": 87,
+                    "coverage_score": 76,
+                    "classification": "REVIEW",
+                    "strengths": ["Python services match"],
+                    "evidence": ["Python services match"],
+                    "evidence_labels": ["direct"],
+                    "gaps": ["Cloud deployment experience"],
+                    "gap_labels": ["missing"],
+                }
+            )
+            self.state.set_notes(
+                job_id,
+                [{"body": f"[AI_JOB_SCORE_V1]\n{json.dumps(payload)}"}],
+            )
+
+    scorer = MetadataScorer(
+        state, default_score=91, recommendation="PRIORITY_APPLY"
+    )
+    result = _run(server, scorer=scorer, notifier=StubWhatsApp())
+    envelope = build_n8n_envelope(
+        result,
+        occurred_at="2025-01-01T00:00:00+00:00",
+        feedback_actions=True,
+    )
+    requests = []
+    adapter = N8nOutboundAdapter(
+        N8nConfig(enabled=True, endpoint="https://n8n.test/hook"),
+        transport=httpx.MockTransport(
+            lambda request: (requests.append(request) or httpx.Response(202))
+        ),
+    )
+
+    assert adapter.send(envelope).status == "accepted"
+    delivered = json.loads(requests[0].content)
+    selected = delivered["selected"]
+    assert selected["score"] == 91
+    assert selected["recommendation"] == "PRIORITY_APPLY"
+    assert selected["fit_score"] == 87
+    assert selected["coverage_score"] == 76
+    assert selected["classification"] == "REVIEW"
+    assert selected["strengths"] == ["Python services match"]
+    assert selected["evidence"] == ["Python services match"]
+    assert selected["evidence_labels"] == ["direct"]
+    assert selected["gaps"] == ["Cloud deployment experience"]
+    assert selected["gap_labels"] == ["missing"]
+    assert {item["action"] for item in delivered["actions"]} == {
+        "applied", "dismissed", "interesting"
+    }
+    assert all(
+        set(item) == {"action", "action_id", "token_id", "expires_at"}
+        for item in delivered["actions"]
+    )
+    assert "description" not in selected
+    assert "notes" not in selected
 
 
 def test_single_notification_invariant_above_threshold(server, state):
