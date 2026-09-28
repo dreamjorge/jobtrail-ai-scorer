@@ -1,0 +1,59 @@
+{
+  "name": "JobTrail local feedback callback (operator-only)",
+  "active": false,
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "job-feedback",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "job-feedback-webhook",
+      "name": "Local operator webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [240, 300],
+      "webhookId": "job-feedback-local-only"
+    },
+    {
+      "parameters": {
+        "jsCode": "const input = $input.first().json.body ?? $input.first().json;\nconst stringFields = ['event', 'run', 'source', 'sourceJob', 'action', 'token'];\nconst forbidden = /(?:private|cv|profile|prompt|credential|password|secret|api[_-]?key|authorization)/i;\nconst fail = (reason) => { throw new Error(`invalid feedback: ${reason}`); };\nif (!input || typeof input !== 'object' || Array.isArray(input)) fail('object required');\nif (JSON.stringify(input).length > 2048 || forbidden.test(JSON.stringify(input))) fail('disallowed content');\nconst allowedFields = new Set(['schema_version', 'event', 'run', 'source', 'sourceJob', 'action', 'token', 'expiry']);\nif (Object.keys(input).some((field) => !allowedFields.has(field))) fail('unknown field');\nif (input.schema_version !== 1) fail('schema_version');\nif (input.event !== 'job_feedback') fail('event');\nif (Array.isArray(input.action)) fail('duplicate action');\nfor (const field of stringFields) {\n  if (typeof input[field] !== 'string' || input[field].length < 1 || input[field].length > 128) fail(field);\n}\nif (!['applied', 'dismissed', 'interesting'].includes(input.action)) fail('action');\nif (!Number.isSafeInteger(input.expiry) || input.expiry < 0 || input.expiry > 4102444800) fail('expiry');\nif (!/^[A-Za-z0-9_-]{8,128}\\.[0-9]{10}$/.test(input.token) || !input.token.endsWith(`.${input.expiry}`)) fail('token');\nif (input.expiry <= Math.floor(Date.now() / 1000)) fail('expired token');\nconst state = getWorkflowStaticData('global');\nconst MAX_REPLAY_ENTRIES = 1024;\nconst now = Date.now();\nstate.replayedTokens = state.replayedTokens && typeof state.replayedTokens === 'object' ? state.replayedTokens : {};\nfor (const [key, entry] of Object.entries(state.replayedTokens)) {\n  if (!entry || entry.expiresAt <= now) delete state.replayedTokens[key];\n}\nconst replayKey = input.token;\nif (state.replayedTokens[replayKey]) fail('replay');\nif (Object.keys(state.replayedTokens).length >= MAX_REPLAY_ENTRIES) {\n  const oldestKey = Object.keys(state.replayedTokens).sort((left, right) => {\n    const seenAtDelta = state.replayedTokens[left].seenAt - state.replayedTokens[right].seenAt;\n    return seenAtDelta || left.localeCompare(right);\n  })[0];\n  delete state.replayedTokens[oldestKey];\n}\nstate.replayedTokens[replayKey] = {\n  seenAt: now,\n  expiresAt: input.expiry * 1000,\n};\nreturn [{ json: { accepted: true, event: 'job_feedback', schema_version: 1, run: input.run, source: input.source, sourceJob: input.sourceJob, action: input.action } }];"
+      },
+      "id": "job-feedback-validate",
+      "name": "Validate bounded feedback and replay",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [500, 300]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ $json }}",
+        "options": {}
+      },
+      "id": "job-feedback-response",
+      "name": "Sanitized feedback response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [760, 300]
+    }
+  ],
+  "connections": {
+    "Local operator webhook": {
+      "main": [[{"node": "Validate bounded feedback and replay", "type": "main", "index": 0}]]
+    },
+    "Validate bounded feedback and replay": {
+      "main": [[{"node": "Sanitized feedback response", "type": "main", "index": 0}]]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {},
+  "versionId": "job-feedback-local-v1",
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "tags": []
+}

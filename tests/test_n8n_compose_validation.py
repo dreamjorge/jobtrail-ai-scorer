@@ -1,3 +1,4 @@
+import json
 from copy import deepcopy
 from pathlib import Path
 
@@ -8,6 +9,8 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURE = ROOT / "validation" / "n8n" / "docker-compose.yml"
 README = ROOT / "validation" / "n8n" / "README.md"
+WORKFLOW = ROOT / "validation" / "n8n" / "workflows" / "job-feedback.json"
+FEEDBACK_FIXTURE = ROOT / "tests" / "fixtures" / "n8n" / "job-feedback-event.json"
 
 FORBIDDEN_TEXT = (
     "/DATA",
@@ -164,3 +167,134 @@ def test_fixture_is_not_referenced_by_production_startup():
         text = path.read_text().lower()
         assert "validation/n8n" not in text
         assert "n8n-validation" not in text
+
+
+def _workflow():
+    return json.loads(WORKFLOW.read_text())
+
+
+def _workflow_nodes(workflow):
+    return {node["name"]: node for node in workflow["nodes"]}
+
+
+def _validation_code(workflow):
+    return _workflow_nodes(workflow)["Validate bounded feedback and replay"]["parameters"]["jsCode"]
+
+
+def test_job_feedback_workflow_has_exact_local_webhook_contract():
+    workflow = _workflow()
+    nodes = _workflow_nodes(workflow)
+    assert set(nodes) == {
+        "Local operator webhook",
+        "Validate bounded feedback and replay",
+        "Sanitized feedback response",
+    }
+
+    webhook = nodes["Local operator webhook"]
+    assert webhook["type"] == "n8n-nodes-base.webhook"
+    assert webhook["parameters"]["httpMethod"] == "POST"
+    assert webhook["parameters"]["path"] == "job-feedback"
+    assert webhook["parameters"]["responseMode"] == "responseNode"
+    assert webhook["webhookId"] == "job-feedback-local-only"
+
+    response = nodes["Sanitized feedback response"]
+    assert response["type"] == "n8n-nodes-base.respondToWebhook"
+    assert response["parameters"]["respondWith"] == "json"
+    assert response["parameters"]["responseBody"] == "={{ $json }}"
+
+
+def test_job_feedback_workflow_has_exact_webhook_validate_response_topology():
+    workflow = _workflow()
+    assert workflow["connections"] == {
+        "Local operator webhook": {
+            "main": [[{
+                "node": "Validate bounded feedback and replay",
+                "type": "main",
+                "index": 0,
+            }]],
+        },
+        "Validate bounded feedback and replay": {
+            "main": [[{
+                "node": "Sanitized feedback response",
+                "type": "main",
+                "index": 0,
+            }]],
+        },
+    }
+
+
+def test_job_feedback_workflow_is_inactive_profile_gated_and_local_only():
+    workflow = _workflow()
+    assert workflow["active"] is False
+    assert workflow["settings"]["executionOrder"] == "v1"
+    assert workflow["meta"]["templateCredsSetupCompleted"] is False
+    assert all(
+        "cron" not in node["type"].lower()
+        and "schedule" not in node["type"].lower()
+        and "http://" not in json.dumps(node).lower()
+        and "https://" not in json.dumps(node).lower()
+        for node in workflow["nodes"]
+    )
+    compose = _compose()
+    assert _service(compose)["profiles"] == ["n8n-validation"]
+    assert _parse_host_ip(_service(compose)["ports"][0]) == "127.0.0.1"
+
+
+def test_job_feedback_validation_has_exact_actions_identity_expiry_token_replay_and_sanitization():
+    code = _validation_code(_workflow())
+    assert "const allowedFields = new Set(['schema_version', 'event', 'run', 'source', 'sourceJob', 'action', 'token', 'expiry']);" in code
+    assert "if (!['applied', 'dismissed', 'interesting'].includes(input.action)) fail('action');" in code
+    for marker in (
+        "input.schema_version !== 1",
+        "input.event !== 'job_feedback'",
+        "const stringFields = ['event', 'run', 'source', 'sourceJob', 'action', 'token'];",
+        "Number.isSafeInteger(input.expiry)",
+        "input.expiry <= Math.floor(Date.now() / 1000)",
+        "input.token.endsWith(`.${input.expiry}`)",
+        "getWorkflowStaticData('global')",
+        "state.replayedTokens",
+        "const replayKey = input.token",
+        "if (state.replayedTokens[replayKey]) fail('replay')",
+        "for (const field of stringFields)",
+        "input[field].length > 128",
+        "MAX_REPLAY_ENTRIES = 1024",
+        "expiresAt: input.expiry * 1000",
+        "entry.expiresAt <= now",
+        "Object.keys(state.replayedTokens).length >= MAX_REPLAY_ENTRIES",
+        "sort((left, right)",
+        "left.localeCompare(right)",
+        "Object.keys(input)",
+        "unknown field",
+        "duplicate action",
+        "accepted: true",
+        "sourceJob: input.sourceJob",
+    ):
+        assert marker in code, f"validation code must contain {marker}"
+    assert "REPLAY_TTL_MS" not in code
+    assert "returnData" not in code
+    assert "JSON.stringify([input.token, input.action, input.run, input.source, input.sourceJob])" not in code
+
+
+def test_job_feedback_fixture_is_synthetic_and_schema_bounded():
+    event = json.loads(FEEDBACK_FIXTURE.read_text())
+    assert event == {
+        "schema_version": 1,
+        "event": "job_feedback",
+        "run": "synthetic-run-001",
+        "source": "operator_fixture",
+        "sourceJob": "synthetic-job-001",
+        "action": "interesting",
+        "token": "synthetic-token-001.4102444800",
+        "expiry": 4102444800,
+    }
+    text = FEEDBACK_FIXTURE.read_text().lower()
+    for marker in ("private", "cv", "profile", "prompt", "credential", "password", "secret"):
+        assert marker not in text
+
+
+def test_readme_documents_feedback_fixture_boundaries():
+    text = README.read_text().lower()
+    for phrase in ("job-feedback.json", "synthetic", "replay", "expired", "operator-imported", "private", "cleanup"):
+        assert phrase in text, f"README must state {phrase} boundary"
+    assert "does not authenticate tokens cryptographically" in text
+    assert "must not be exposed publicly" in text
