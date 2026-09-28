@@ -8,6 +8,7 @@ import typer
 
 from .config import AppConfig, load_config
 from .jobtrail import JobTrailClient
+from .matching_strategy import MatchingStrategy, load_matching_strategy
 from .prompt_budget import LoadStatus, PromptBudget
 from .prompt_tokens import estimate_sections, optional_budget_from_env
 from .scoring import (
@@ -73,6 +74,11 @@ def run_score(*, config_path: Path, limit: int | None = None, job_id: str | None
         config.candidate_profile_path, prompt_budget.profile_budget_chars
     )
     _warn_if_unavailable("profile", profile_status)
+    strategy = load_matching_strategy(config.matching_strategy_path)
+    if strategy.available:
+        profile = f"{profile}\n\nPublic matching strategy:\n{strategy.prompt_context}"
+    else:
+        logger.warning("Unable to load public matching strategy (%s); continuing without it", strategy.status)
     cv = ""
     cv_status = None
     if config.candidate_cv_path is not None:
@@ -173,6 +179,13 @@ def _sample_job_payload(client: object, job_id: str | None) -> str:
     if not isinstance(job, dict):
         return serialize_job({"id": job_id})
     return serialize_job(job)
+
+
+def load_public_strategy_context(path: Path | str | None) -> str:
+    """Return only validated public matching rules for scoring context."""
+
+    strategy = load_matching_strategy(path)
+    return strategy.prompt_context if strategy.available else ""
 
 
 def _warn_if_unavailable(section: str, status: LoadStatus) -> None:
