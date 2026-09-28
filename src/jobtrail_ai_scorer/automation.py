@@ -733,6 +733,24 @@ def _scrub_query_string(value: str) -> str:
     return f"{head}?{cleaned_query}" if cleaned_query else head
 
 
+def _normalized_identity(
+    source: Any, source_job_id: Any
+) -> tuple[str, str] | None:
+    """Return the production identity key, or ``None`` when it is invalid."""
+
+    if not isinstance(source, str) or not source.strip():
+        return None
+    if not isinstance(source_job_id, str) or not source_job_id.strip():
+        return None
+    return source.strip().lower(), source_job_id.strip().lower()
+
+
+def _bounded_score_limit(max_score: Any) -> int:
+    """Interpret score caps consistently across production and simulation."""
+
+    return max(0, int(max_score or 0))
+
+
 def _resolve_simulation_clock(clock_iso: str | None) -> str:
     """Return the deterministic clock string used by the dry-run envelope."""
 
@@ -767,8 +785,12 @@ def build_planned_operations(
     # multi-note history on a real JobTrail record.
     history_by_identity: dict[tuple[str, str], list[str]] = {}
     jobs_by_identity: dict[tuple[str, str], NormalizedJob] = {}
-    for job in scenario.jobs:
-        identity = (job.source, job.source_job_id)
+    for index, job in enumerate(scenario.jobs):
+        identity = _normalized_identity(job.source, job.source_job_id)
+        # Production does not retain invalid identities in its deduplication
+        # index, so each invalid job remains independently importable.
+        if identity is None:
+            identity = ("", f"__invalid_identity_{index}")
         note_body = (job.metadata or {}).get("score_note")
         history_by_identity.setdefault(identity, [])
         if isinstance(note_body, str):
@@ -777,7 +799,7 @@ def build_planned_operations(
 
         jobs_by_identity.setdefault(identity, job)
     candidates: list[tuple[int, int, tuple[str, str], NormalizedJob]] = []
-    max_score = max(0, int(config.max_score or 0))
+    max_score = _bounded_score_limit(config.max_score)
     eligible_identities = set(list(history_by_identity)[:max_score])
     for index, (identity, notes) in enumerate(history_by_identity.items()):
         if identity not in eligible_identities:
@@ -789,7 +811,9 @@ def build_planned_operations(
             (score["score"], -index, identity, jobs_by_identity[identity])
         )
 
-    candidates.sort(key=lambda item: (-item[0], item[1]))
+    # Python's sort is stable, so equal scores retain discovery order just
+    # like the production ``score > best`` comparison.
+    candidates.sort(key=lambda item: -item[0])
     eligible = [
         (_score, job)
         for _score, _order, _identity, job in candidates
@@ -1122,7 +1146,7 @@ class JobTrailAutomation:
                     failures.append(_format_failure("search", exc))
                     if count_profiles:
                         profile_counts[profile_name]["failures"] += 1
-        for job_id in ids[: config.max_score]:
+        for job_id in ids[: _bounded_score_limit(config.max_score)]:
             try:
                 retry_call(
                     self.scorer,
@@ -1394,11 +1418,7 @@ class JobTrailAutomation:
     def _normalized_identity(
         source: Any, source_job_id: Any
     ) -> tuple[str, str] | None:
-        if not isinstance(source, str) or not source.strip():
-            return None
-        if not isinstance(source_job_id, str) or not source_job_id.strip():
-            return None
-        return source.strip().lower(), source_job_id.strip().lower()
+        return _normalized_identity(source, source_job_id)
 
     @staticmethod
     def _append_profile_provenance(

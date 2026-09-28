@@ -278,7 +278,7 @@ def test_simulation_filters_below_threshold() -> None:
     assert result.selected is None
 
 
-def test_simulation_respects_cap_at_zero() -> None:
+def test_simulation_respects_non_positive_score_caps() -> None:
     SimulationScenario = require_optional("SimulationScenario")
     gateway = _RecordingGateway()
     scenario = SimulationScenario(
@@ -286,9 +286,49 @@ def test_simulation_respects_cap_at_zero() -> None:
         jobs=(_job(source_job_id="1", score=90),),
     )
     automation = JobTrailAutomation(gateway, simulation=scenario)
-    result = automation.run(config=AutomationConfig(score_threshold=70, max_score=0))
-    assert result.selected is None
-    assert result.scored == 0
+
+    for max_score in (0, -1):
+        result = automation.run(
+            config=AutomationConfig(score_threshold=70, max_score=max_score)
+        )
+        assert result.selected is None
+        assert result.scored == 0
+
+
+def test_simulation_deduplicates_normalized_jobs_inside_the_scenario() -> None:
+    """Equivalent trimmed/case-folded identities only count once."""
+
+    SimulationScenario = require_optional("SimulationScenario")
+    gateway = _RecordingGateway()
+    scenario = SimulationScenario(
+        name="normalized-dup",
+        jobs=(
+            _job(source=" Indeed ", source_job_id=" JOB-1 ", score=70),
+            _job(source="indeed", source_job_id="job-1", score=88),
+        ),
+    )
+    automation = JobTrailAutomation(gateway, simulation=scenario)
+    result = automation.run(config=_base_config())
+    assert result.selected is not None
+    assert result.selected["score"] == 88
+    assert result.envelope["planned_imports"] == 1
+
+
+def test_simulation_does_not_deduplicate_invalid_identities() -> None:
+    """Invalid production identities are imported independently."""
+
+    SimulationScenario = require_optional("SimulationScenario")
+    scenario = SimulationScenario(
+        name="invalid-identities",
+        jobs=(
+            _job(source=" ", source_job_id="JOB-1", score=80),
+            _job(source="indeed", source_job_id=" ", score=90),
+        ),
+    )
+    planned = require_optional("build_planned_operations")(
+        scenario, _base_config(), clock_iso="fixed"
+    )
+    assert planned.to_envelope()["planned_imports"] == 2
 
 
 def test_simulation_deduplicates_jobs_inside_the_scenario() -> None:
@@ -306,7 +346,7 @@ def test_simulation_deduplicates_jobs_inside_the_scenario() -> None:
     automation = JobTrailAutomation(gateway, simulation=scenario)
     result = automation.run(config=_base_config())
     assert result.selected is not None
-    # The later (highest) score wins per the parse_score_note convention.
+    # The later score is retained as history for the deduplicated identity.
     assert result.selected["score"] == 88
     assert result.envelope["planned_imports"] == 1
 
@@ -345,7 +385,7 @@ def test_simulation_breaks_ties_by_input_order() -> None:
     automation = JobTrailAutomation(gateway, simulation=scenario)
     result = automation.run(config=_base_config())
     assert result.selected is not None
-    assert result.selected["title"] == "Second"
+    assert result.selected["title"] == "First"
 
 
 def test_simulation_handles_empty_discovery() -> None:

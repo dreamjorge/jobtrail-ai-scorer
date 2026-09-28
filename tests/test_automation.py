@@ -84,6 +84,94 @@ class FakeNotifier:
         self.messages.append(message)
 
 
+def _automation_test_job(source_job_id: str) -> NormalizedJob:
+    return NormalizedJob(
+        source="synthetic",
+        source_job_id=source_job_id,
+        title=source_job_id,
+        company="Acme",
+        description="Build things.",
+        source_url=f"https://example.test/{source_job_id}",
+        location="Remote",
+        metadata={},
+    )
+
+
+def test_production_equal_scores_keep_first_input_job():
+    class Gateway:
+        def __init__(self):
+            self.jobs = {}
+
+        def import_job(self, payload):
+            job_id = payload["sourceJobId"]
+            self.jobs[job_id] = {
+                **payload,
+                "id": job_id,
+                "notes": [],
+            }
+            return {"id": job_id}
+
+        def get_job(self, job_id):
+            return self.jobs[job_id]
+
+    class Source:
+        name = "synthetic"
+
+        def search(self, request):
+            return [_automation_test_job("first"), _automation_test_job("second")]
+
+    gateway = Gateway()
+
+    def scorer(job_id, config_path):
+        gateway.jobs[job_id]["notes"] = [
+            {
+                "body": "[AI_JOB_SCORE_V1]\n"
+                + json.dumps(
+                    {
+                        "score": 80,
+                        "recommendation": "APPLY",
+                        "strengths": [],
+                        "gaps": [],
+                    }
+                )
+            }
+        ]
+
+    result = JobSearchAutomation(
+        gateway, scorer=scorer, source_adapters=(Source(),)
+    ).run(
+        config=AutomationConfig(
+            scorer_config_path="safe/config.yaml", score_threshold=70, max_score=10
+        )
+    )
+
+    assert result.selected is not None
+    assert result.selected["sourceJobId"] == "first"
+
+
+def test_production_negative_score_cap_is_bounded_to_zero():
+    class Source:
+        name = "synthetic"
+
+        def search(self, request):
+            return [_automation_test_job("first")]
+
+    gateway = FakeJobTrail()
+    scored: list[str] = []
+
+    def scorer(job_id, config_path):
+        scored.append(job_id)
+
+    result = JobSearchAutomation(
+        gateway, scorer=scorer, source_adapters=(Source(),)
+    ).run(
+        config=AutomationConfig(scorer_config_path="safe/config.yaml", max_score=-1)
+    )
+
+    assert scored == []
+    assert result.scored == 0
+
+
 def test_search_payloads_split_sites_and_locations():
     config = AutomationConfig.from_env({})
     payloads = search_payloads(config)
