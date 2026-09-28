@@ -5,12 +5,13 @@ from __future__ import annotations
 import contextlib
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from itertools import islice
 import json
 import os
 import shlex
 import subprocess
 from typing import Any, Callable, Mapping, Protocol
-from urllib.parse import quote
+from urllib.parse import quote, unquote
 
 import httpx
 
@@ -35,7 +36,7 @@ from .notify import (
     build_run_id,
     recommendation_label,
 )
-from .n8n_outbound import N8nConfig
+from .n8n_outbound import N8nConfig, build_envelope
 
 
 DEFAULT_TERMS = (
@@ -600,6 +601,29 @@ class AutomationRun:
     run_id: str = ""
 
 
+def build_n8n_envelope(
+    run: AutomationRun, *, occurred_at: str, feedback_actions: bool = False
+) -> dict[str, Any]:
+    """Translate a completed run at the n8n handoff boundary.
+
+    The HTTP adapter is intentionally constructed and invoked by the caller;
+    this function only maps the run result into the outbound contract. Keeping
+    transport ownership outside orchestration avoids introducing a second
+    scheduler or hiding delivery policy in the search pipeline.
+    """
+
+    return build_envelope(
+        run_id=run.run_id,
+        occurred_at=occurred_at,
+        searched=run.searched,
+        imported=run.imported,
+        scored=run.scored,
+        failures=run.failures,
+        selected=run.selected,
+        feedback_actions=feedback_actions,
+    )
+
+
 # --- Simulation seam (issue #36) --------------------------------------------
 #
 # The offline automation dry-run slice swaps the production pipeline for a
@@ -608,6 +632,12 @@ class AutomationRun:
 # invoked while the seam is active. Output is shaped like an
 # :class:`AutomationRun` so callers and the launcher can introspect it without
 # special-casing the simulation branch.
+
+# Maximum number of captured jobs retained by one dry-run scenario. Keeping
+# this bound at the scenario boundary prevents planning from traversing or
+# retaining an unbounded captured history.
+MAX_SIMULATION_JOBS = 100
+
 
 @dataclass(frozen=True)
 class SimulationScenario:
@@ -628,6 +658,34 @@ class SimulationScenario:
             raise ValueError("SimulationScenario.name must be a string")
         if not isinstance(self.jobs, tuple):
             raise ValueError("SimulationScenario.jobs must be a tuple")
+        bounded_jobs = self.jobs[:MAX_SIMULATION_JOBS]
+        object.__setattr__(self, "jobs", bounded_jobs)
+        for index, job in enumerate(bounded_jobs):
+            if not isinstance(job, NormalizedJob):
+                raise ValueError(
+                    "SimulationScenario.jobs[{}] must be a NormalizedJob".format(index)
+                )
+
+
+def _normalize_simulation_clock(clock_iso: str) -> str:
+    """Validate and normalize a supplied simulation clock.
+
+    The envelope boundary must never carry a naive, date-only, or otherwise
+    unparsable timestamp.  ``datetime.fromisoformat`` accepts timezone offsets
+    and the normalized ISO representation keeps fixed-clock output stable.
+    """
+
+    if not isinstance(clock_iso, str):
+        raise ValueError("clock_iso must be a timezone-aware ISO datetime")
+    try:
+        parsed = datetime.fromisoformat(clock_iso)
+    except ValueError as exc:
+        raise ValueError(
+            "clock_iso must be a timezone-aware ISO datetime"
+        ) from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError("clock_iso must be a timezone-aware ISO datetime")
+    return parsed.isoformat()
 
 
 @dataclass(frozen=True)
@@ -657,10 +715,19 @@ class PlannedOperations:
                 "planned_scores": self.planned_scores,
                 "would_notify": self.would_notify,
                 "best": self.best,
-                "clock": self.clock,
+                "clock": _normalize_simulation_clock(self.clock),
                 "redacted": self.redacted,
             }
         )
+
+
+# Strings and collections in the dry-run envelope have explicit bounds so a
+# captured scenario cannot turn the advertised bounded payload into an
+# unbounded one.
+_SIMULATION_MAX_STRING = 256
+_SIMULATION_MAX_LIST = 32
+_SIMULATION_MAX_DICT_ENTRIES = 32
+_SIMULATION_MAX_DEPTH = 8
 
 
 # Strings the dry-run envelope MUST scrub from any captured payload.
@@ -685,26 +752,52 @@ _SIMULATION_FORBIDDEN_QUERY_KEYS: tuple[str, ...] = (
 )
 
 
-def _scrub_simulation_value(value: Any) -> Any:
-    """Recursively scrub forbidden substrings and query credentials from ``value``.
+def _bounded_simulation_string(value: str) -> str:
+    """Keep one scrubbed simulation string within the output envelope bound."""
 
-    The scrubber preserves structure (dicts/lists/scalars) so the envelope
-    still round-trips through ``json.dumps`` without losing shape. Strings
-    that contain a forbidden substring are rewritten to a generic marker so
-    downstream consumers can still see that something was there. URLs whose
-    query string carries a recognised credential key have that key removed.
+    return value[:_SIMULATION_MAX_STRING]
+
+
+def _bounded_simulation_list(value: list[Any]) -> list[Any]:
+    """Keep one simulation list within the output envelope bound."""
+
+    return value[:_SIMULATION_MAX_LIST]
+
+
+def _scrub_simulation_value(value: Any, *, _depth: int = 0) -> Any:
+    """Recursively scrub and bound values in the simulation envelope.
+
+    Dictionary keys are untrusted captured data too, so they receive the same
+    string scrubbing and length bound as values.  The entry and depth limits
+    keep adversarial mappings from producing an oversized or deeply recursive
+    envelope.
     """
 
+    if _depth >= _SIMULATION_MAX_DEPTH:
+        return "[redacted]"
     if isinstance(value, str):
         cleaned = _scrub_query_string(value)
         for needle in _SIMULATION_FORBIDDEN_SUBSTRINGS:
             if needle in cleaned:
                 cleaned = cleaned.replace(needle, "[redacted]")
-        return cleaned
-    if isinstance(value, dict):
-        return {key: _scrub_simulation_value(item) for key, item in value.items()}
+        return _bounded_simulation_string(cleaned)
+    if isinstance(value, Mapping):
+        scrubbed: dict[str, Any] = {}
+        for index, (key, item) in enumerate(value.items()):
+            if index >= _SIMULATION_MAX_DICT_ENTRIES:
+                break
+            scrubbed_key = _scrub_simulation_value(str(key), _depth=_depth + 1)
+            scrubbed[scrubbed_key] = _scrub_simulation_value(
+                item, _depth=_depth + 1
+            )
+        return scrubbed
     if isinstance(value, (list, tuple)):
-        return [_scrub_simulation_value(item) for item in value]
+        return _bounded_simulation_list(
+            [
+                _scrub_simulation_value(item, _depth=_depth + 1)
+                for item in value[:_SIMULATION_MAX_LIST]
+            ]
+        )
     return value
 
 
@@ -723,7 +816,7 @@ def _scrub_query_string(value: str) -> str:
         if not pair:
             continue
         key, sep, _ = pair.partition("=")
-        if key.lower() in _SIMULATION_FORBIDDEN_QUERY_KEYS:
+        if unquote(key).lower() in _SIMULATION_FORBIDDEN_QUERY_KEYS:
             changed = True
             continue
         cleaned_pairs.append(pair)
@@ -755,7 +848,7 @@ def _resolve_simulation_clock(clock_iso: str | None) -> str:
     """Return the deterministic clock string used by the dry-run envelope."""
 
     if clock_iso is not None:
-        return clock_iso
+        return _normalize_simulation_clock(clock_iso)
     # Import locally so callers that never opt in do not pay the cost.
     from datetime import datetime, timezone
 
@@ -782,10 +875,12 @@ def build_planned_operations(
     # Scenario-only dedup: collect every score note for the same identity
     # (source, source_job_id) so we can later resolve to the latest
     # valid score, matching how ``parse_score_note`` would handle a
-    # multi-note history on a real JobTrail record.
+    # multi-note history on a real JobTrail record.  Keep this local slice as
+    # an explicit defense in depth for callers holding a scenario-like object.
+    bounded_jobs = scenario.jobs[:MAX_SIMULATION_JOBS]
     history_by_identity: dict[tuple[str, str], list[str]] = {}
     jobs_by_identity: dict[tuple[str, str], NormalizedJob] = {}
-    for index, job in enumerate(scenario.jobs):
+    for index, job in enumerate(bounded_jobs):
         identity = _normalized_identity(job.source, job.source_job_id)
         # Production does not retain invalid identities in its deduplication
         # index, so each invalid job remains independently importable.
@@ -800,10 +895,9 @@ def build_planned_operations(
         jobs_by_identity.setdefault(identity, job)
     candidates: list[tuple[int, int, tuple[str, str], NormalizedJob]] = []
     max_score = _bounded_score_limit(config.max_score)
-    eligible_identities = set(list(history_by_identity)[:max_score])
-    for index, (identity, notes) in enumerate(history_by_identity.items()):
-        if identity not in eligible_identities:
-            continue
+    eligible_identities = list(islice(history_by_identity, max_score))
+    for index, identity in enumerate(eligible_identities):
+        notes = history_by_identity[identity]
         score = parse_score_note([{"body": body} for body in notes])
         if score is None:
             continue
@@ -836,7 +930,7 @@ def build_planned_operations(
     scrubbed_best = _scrub_simulation_value(best) if best is not None else None
     return PlannedOperations(
         scenario=scenario.name,
-        searched=len(scenario.jobs),
+        searched=len(bounded_jobs),
         planned_imports=len(jobs_by_identity),
         planned_scores=len(candidates),
         would_notify=bool(scrubbed_best and config.notify_enabled),
@@ -987,7 +1081,9 @@ class JobTrailAutomation:
             shlex.split(self._whatsapp_command), input=message, text=True, check=True
         )
 
-    def _run_simulation(self, config: AutomationConfig) -> AutomationRun:
+    def _run_simulation(
+        self, config: AutomationConfig, *, clock_iso: str | None = None
+    ) -> AutomationRun:
         """Return a deterministic ``AutomationRun`` from the configured scenario.
 
         The dry-run path never touches ``self.gateway``, ``self.scorer`` or
@@ -1001,7 +1097,33 @@ class JobTrailAutomation:
 
         assert self._simulation is not None
         scenario = self._simulation
-        planned = build_planned_operations(scenario, config)
+        # Validate the source clock before redaction.  Parsing the scrubbed
+        # envelope would turn a redacted sentinel into a ValueError and would
+        # also make the run-id path depend on presentation-layer output.
+        try:
+            planned = build_planned_operations(
+                scenario, config, clock_iso=clock_iso
+            )
+            simulation_clock = datetime.fromisoformat(planned.clock)
+            if (
+                simulation_clock.tzinfo is None
+                or simulation_clock.utcoffset() is None
+            ):
+                raise ValueError("simulation clock must be timezone-aware")
+        except (TypeError, ValueError):
+            return AutomationRun(
+                searched=0,
+                imported=0,
+                scored=0,
+                failures=("simulation:invalid_clock",),
+                selected=None,
+                profile_counts={},
+                envelope={
+                    "error": "invalid_clock",
+                    "redacted": True,
+                },
+            )
+
         envelope = planned.to_envelope()
         selected = envelope["best"]
         return AutomationRun(
@@ -1012,16 +1134,21 @@ class JobTrailAutomation:
             selected=selected,
             profile_counts={},
             envelope=envelope,
-            run_id=build_run_id(seed=f"simulation:{scenario.name}", clock=lambda: datetime.fromisoformat(envelope["clock"])),
+            run_id=build_run_id(
+                seed=f"simulation:{scenario.name}",
+                clock=lambda: simulation_clock,
+            ),
         )
 
-    def run(self, *, config: AutomationConfig) -> AutomationRun:
+    def run(
+        self, *, config: AutomationConfig, clock_iso: str | None = None
+    ) -> AutomationRun:
         # Offline automation dry-run (issue #36). When the constructor
         # was given a SimulationScenario, the production pipeline is
         # bypassed entirely: no gateway, no scorer subprocess, no
         # notifier, no production-state mutation.
         if self._simulation is not None:
-            return self._run_simulation(config)
+            return self._run_simulation(config, clock_iso=clock_iso)
         started_at = datetime.now(timezone.utc)
         run_id = build_run_id(moment=started_at, seed=started_at.isoformat())
         if not config.scorer_config_path:
@@ -1185,6 +1312,14 @@ class JobTrailAutomation:
                         "source": job.get("source", ""),
                         "sourceJobId": job.get("sourceJobId", ""),
                     }
+                    # These additive fields are copied only when the scorer
+                    # supplied them; the outbound boundary clips/redacts them.
+                    for field_name in (
+                        "fit_score", "coverage_score", "classification",
+                        "evidence", "evidence_labels", "gap_labels",
+                    ):
+                        if field_name in score:
+                            best[field_name] = score[field_name]
                     best_job = job
                     best_score = score
                     best_job_id = job_id
