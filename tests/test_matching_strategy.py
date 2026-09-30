@@ -34,6 +34,71 @@ Use only job requirements and this public strategy.
 """
 
 
+def test_default_strategy_is_independent_of_cwd(tmp_path, monkeypatch):
+    from jobtrail_ai_scorer.config import AppConfig
+
+    monkeypatch.chdir(tmp_path)
+    config = AppConfig(jobtrail_base_url="http://localhost:8000", candidate_profile_path="synthetic.md")
+    strategy = load_matching_strategy(config.matching_strategy_path)
+    assert strategy.available
+    assert "Backend" in strategy.sections["Target roles"]
+    assert load_matching_strategy().available
+    explicit = tmp_path / "explicit.md"
+    explicit.write_text(VALID_MARKDOWN)
+    assert load_matching_strategy(explicit).sections["Target roles"] == "Backend and platform engineering."
+    assert load_matching_strategy(tmp_path / "missing.md").status == "missing"
+
+
+def test_wheel_contains_cwd_independent_default_and_preserves_override(tmp_path):
+    """Build and extract locally; all intermediates remain in pytest's tmp_path."""
+    import os
+    import shutil
+    import subprocess
+    import sys
+    import zipfile
+
+    root = Path(__file__).resolve().parents[1]
+    source = tmp_path / "source"
+    source.mkdir()
+    shutil.copyfile(root / "pyproject.toml", source / "pyproject.toml")
+    package = root / "src" / "jobtrail_ai_scorer"
+    for path in (*package.rglob("*.py"), *package.glob("data/*.md")):
+        target = source / "src" / "jobtrail_ai_scorer" / path.relative_to(package)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(path, target)
+    temp = tmp_path / "temp"
+    temp.mkdir()
+    env = dict(os.environ, TMPDIR=str(temp), PIP_DISABLE_PIP_VERSION_CHECK="1", PYTHONDONTWRITEBYTECODE="1")
+    wheels = tmp_path / "wheels"
+    command = [sys.executable, "-m", "pip", "wheel", "--no-index", "--no-deps", "--no-build-isolation", "--no-cache-dir",
+               "--wheel-dir", str(wheels), "."]
+    build = subprocess.run(command, cwd=source, env=env, text=True, capture_output=True)
+    assert build.returncode == 0, build.stdout + build.stderr
+    wheel, = wheels.glob("*.whl")
+    target = tmp_path / "target"
+    with zipfile.ZipFile(wheel) as archive:
+        assert "jobtrail_ai_scorer/data/matching-strategy.md" in archive.namelist()
+        archive.extractall(target)
+    cwd = tmp_path / "empty-cwd"
+    cwd.mkdir()
+    override = cwd / "rules.md"
+    override.write_text(VALID_MARKDOWN)
+    script = '''
+import sys
+sys.path.insert(0, sys.argv[1])
+from jobtrail_ai_scorer.config import AppConfig
+from jobtrail_ai_scorer.matching_strategy import load_matching_strategy
+config = AppConfig(jobtrail_base_url="http://localhost:8000", candidate_profile_path="synthetic.md")
+assert load_matching_strategy().available
+assert load_matching_strategy(config.matching_strategy_path).available
+config = AppConfig(jobtrail_base_url="http://localhost:8000", candidate_profile_path="synthetic.md", matching_strategy_path="rules.md")
+assert load_matching_strategy(config.matching_strategy_path).sections["Target roles"] == "Backend and platform engineering."
+assert load_matching_strategy("missing.md").status == "missing"
+'''
+    check = subprocess.run([sys.executable, "-I", "-B", "-c", script, str(target)], cwd=cwd, env=env, text=True, capture_output=True)
+    assert check.returncode == 0, check.stderr
+
+
 def test_loader_returns_stable_strategy_sections(tmp_path):
     path = tmp_path / "matching-strategy.md"
     path.write_text(VALID_MARKDOWN)

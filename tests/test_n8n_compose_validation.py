@@ -251,7 +251,7 @@ def test_job_feedback_validation_has_exact_actions_identity_expiry_token_replay_
         "Number.isSafeInteger(input.expiry)",
         "input.expiry <= Math.floor(Date.now() / 1000)",
         "input.token.endsWith(`.${input.expiry}`)",
-        "getWorkflowStaticData('global')",
+        "$getWorkflowStaticData('global')",
         "state.replayedTokens",
         "const replayKey = input.token",
         "if (state.replayedTokens[replayKey]) fail('replay')",
@@ -273,6 +273,45 @@ def test_job_feedback_validation_has_exact_actions_identity_expiry_token_replay_
     assert "REPLAY_TTL_MS" not in code
     assert "returnData" not in code
     assert "JSON.stringify([input.token, input.action, input.run, input.source, input.sourceJob])" not in code
+
+
+def test_workflow_code_executes_with_n8n_helpers():
+    import subprocess
+
+    code = _validation_code(_workflow())
+    event = json.loads(FEEDBACK_FIXTURE.read_text())
+    harness = r"""
+const code = JSON.parse(process.argv[1]);
+const event = JSON.parse(process.argv[2]);
+const state = {};
+const execute = new Function('$input', '$getWorkflowStaticData', code);
+const invoke = (input) => execute({first: () => ({json: {body: input}})}, (scope) => {
+  if (scope !== 'global') throw Error('wrong scope');
+  return state;
+});
+const accepted = invoke(event)[0].json;
+if (!accepted.accepted || accepted.token || accepted.expiry) throw Error('unsafe response');
+const rejects = (input, reason) => {
+  try { invoke(input); } catch (error) {
+    if (error.message.includes(reason)) return;
+    throw error;
+  }
+  throw Error('unexpected acceptance: ' + reason);
+};
+rejects({...event, action: 'applied'}, 'replay');
+rejects({...event, action: 'unknown'}, 'action');
+rejects({...event, extra: 'synthetic'}, 'unknown field');
+rejects({...event, expiry: 1000000000, token: 'synthetic-token.1000000000'}, 'expired');
+rejects({...event, token: 'synthetic-token.4102444799'}, 'token');
+state.replayedTokens = {expired: {seenAt: 0, expiresAt: 0}};
+for (let i = 0; i < 1024; i++) state.replayedTokens['entry-' + i] = {seenAt: i, expiresAt: 4102444800000};
+invoke({...event, token: 'fresh-synthetic.4102444800'});
+if (Object.keys(state.replayedTokens).length !== 1024 || state.replayedTokens.expired || state.replayedTokens['entry-0']) throw Error('replay bound');
+console.log('workflow helper execution passed');
+"""
+    result = subprocess.run(["node", "-e", harness, json.dumps(code), json.dumps(event)], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert "workflow helper execution passed" in result.stdout
 
 
 def test_job_feedback_fixture_is_synthetic_and_schema_bounded():

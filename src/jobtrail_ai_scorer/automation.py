@@ -250,6 +250,7 @@ class AutomationConfig:
     breaker_alert_cooldown_seconds: float = 3600.0
     breaker_state_path: str = ""
     n8n: N8nConfig = field(default_factory=N8nConfig)
+    feedback_actions_enabled: bool = False
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "AutomationConfig":
@@ -320,6 +321,7 @@ class AutomationConfig:
             ),
             breaker_state_path=e.get("BREAKER_STATE_PATH", "").strip(),
             n8n=N8nConfig.from_env(e),
+            feedback_actions_enabled=truthy("N8N_FEEDBACK_ACTIONS_ENABLED"),
         )
 
 
@@ -602,7 +604,8 @@ class AutomationRun:
 
 
 def build_n8n_envelope(
-    run: AutomationRun, *, occurred_at: str, feedback_actions: bool = False
+    run: AutomationRun, *, occurred_at: str, feedback_actions: bool = False,
+    run_id: str | None = None,
 ) -> dict[str, Any]:
     """Translate a completed run at the n8n handoff boundary.
 
@@ -613,7 +616,7 @@ def build_n8n_envelope(
     """
 
     return build_envelope(
-        run_id=run.run_id,
+        run_id=run_id if run_id is not None else run.run_id,
         occurred_at=occurred_at,
         searched=run.searched,
         imported=run.imported,

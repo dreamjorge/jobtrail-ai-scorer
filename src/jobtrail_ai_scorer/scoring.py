@@ -214,7 +214,9 @@ def classify_score(
         return "APPLY"
     if (fit_score >= FIT_REVIEW_THRESHOLD and coverage_score >= COVERAGE_REVIEW_THRESHOLD) or fit_score >= FIT_APPLY_THRESHOLD:
         return "REVIEW"
-    if fit_score >= FIT_REVIEW_THRESHOLD:
+    # Adjacent roles remain worth exploring when evidence coverage is strong,
+    # not merely because fit is moderate despite absent evidence.
+    if coverage_score >= COVERAGE_REVIEW_THRESHOLD:
         return "EXPLORE"
     return "SKIP"
 

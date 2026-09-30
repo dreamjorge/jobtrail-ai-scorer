@@ -437,7 +437,8 @@ def test_optional_scores_and_labels_are_bounded_and_sanitized():
         selected={
             "score": 999, "fit_score": 999, "coverage_score": -4, "classification": "C" * 300,
             "strengths": ["s" * 300, "PROMPT_SENTINEL"],
-            "evidence": ["direct", "PROMPT_SENTINEL"] * 20,
+            "evidence": [{"label": "direct", "text": "x" * 300},
+                         {"label": "inferred", "text": "PROMPT_SENTINEL"}] * 20,
             "gap_labels": ["g" * 300],
         },
     )["selected"]
@@ -449,9 +450,35 @@ def test_optional_scores_and_labels_are_bounded_and_sanitized():
     assert len(selected["strengths"][0]) == 200
     assert selected["strengths"][1] == "[redacted]"
     assert len(selected["evidence"]) == 5
-    assert len(selected["evidence"][0]) <= 200
-    assert selected["evidence"][1] == "[redacted]"
+    assert len(selected["evidence"][0]["text"]) == 200
+    assert selected["evidence"][1] == {"label": "inferred", "text": "[redacted]"}
     assert len(selected["gap_labels"][0]) == 200
+
+
+def test_structured_evidence_drops_malformed_entries_and_unknown_fields():
+    envelope = build_envelope(
+        run_id="synthetic-run", occurred_at="2030-01-01T00:00:00+00:00",
+        searched=1, imported=1, scored=1,
+        selected={"evidence": [
+            {"label": "direct", "text": "https://example.test/?token=synthetic&keep=yes", "unknown": "ignored"},
+            {"label": "unknown", "text": "bad label"},
+            {"label": ["direct"], "text": "bad label type"},
+            {"label": "missing", "text": " "},
+            "not structured",
+            {"label": "equivalent", "text": "beyond bound"},
+        ]},
+    )
+    assert envelope["selected"]["evidence"] == [{
+        "label": "direct", "text": "https://example.test/?keep=yes",
+    }]
+    requests = []
+    adapter = N8nOutboundAdapter(
+        N8nConfig(enabled=True, endpoint="https://synthetic.test/hook"),
+        transport=httpx.MockTransport(lambda request: (requests.append(request) or httpx.Response(200))),
+    )
+    envelope["selected"]["evidence"][0]["unknown"] = "invalid envelope"
+    assert adapter.send(envelope).status == "failed"
+    assert requests == []
 
 
 def test_supplied_run_id_is_redacted_and_clipped():

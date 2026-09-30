@@ -86,8 +86,13 @@ def test_additive_prompt_contract_mentions_scores_evidence_and_classification():
 def test_deterministic_classification_covers_all_classes_and_exclusions():
     assert classify_score(90, 80) == "APPLY"
     assert classify_score(70, 40) == "REVIEW"
-    assert classify_score(60, 30) == "EXPLORE"
-    assert classify_score(40, 90) == "SKIP"
+    assert classify_score(60, 0) == "SKIP"
+    assert classify_score(60, 30) == "SKIP"
+    assert classify_score(40, 90) == "EXPLORE"
+    assert classify_score(40, 50) == "EXPLORE"
+    assert classify_score(40, 49) == "SKIP"
+    assert classify_score(40, 90, exclusion_signal=True) == "SKIP"
+    assert classify_score(40, 90, critical_requirements_missing=["clearance"]) == "SKIP"
     assert classify_score(90, 90, exclusion_signal=True) == "SKIP"
     assert classify_score(90, 90, critical_requirements_missing=["security clearance"]) == "SKIP"
 

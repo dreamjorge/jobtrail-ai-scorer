@@ -8,7 +8,8 @@ import re
 from typing import Literal
 
 
-DEFAULT_STRATEGY_PATH = Path("config/matching-strategy.md")
+# Package data is installed beside this module, independent of the caller's CWD.
+DEFAULT_STRATEGY_PATH = Path(__file__).resolve().parent / "data" / "matching-strategy.md"
 DEFAULT_MAX_CHARS = 12_000
 REQUIRED_SECTIONS = (
     "Target roles",

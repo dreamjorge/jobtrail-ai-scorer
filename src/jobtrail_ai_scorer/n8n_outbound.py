@@ -33,7 +33,8 @@ _MAX_RESULT_COUNT = 1_000_000
 _MAX_LABELS = 5
 _ACTION_EXPIRY = timedelta(days=1)
 _SCORE_FIELDS = ("fit_score", "coverage_score")
-_LABEL_FIELDS = ("strengths", "evidence", "evidence_labels", "gaps", "gap_labels")
+_LABEL_FIELDS = ("strengths", "evidence_labels", "gaps", "gap_labels")
+_EVIDENCE_LABELS = {"direct", "equivalent", "inferred", "missing"}
 
 
 @dataclass(frozen=True)
@@ -128,6 +129,24 @@ def _bounded_labels(value: Any) -> list[str] | None:
     return [_redact_text(item) for item in list(value)[:_MAX_LABELS] if isinstance(item, str)]
 
 
+def _bounded_evidence(value: Any) -> list[dict[str, str]] | None:
+    """Preserve only labelled evidence; never serialize arbitrary objects."""
+    if not isinstance(value, (list, tuple)):
+        return None
+    result = []
+    for item in value[:_MAX_LABELS]:
+        if not isinstance(item, Mapping):
+            continue
+        label, text = item.get("label"), item.get("text")
+        if (
+            not isinstance(label, str) or label not in _EVIDENCE_LABELS
+            or not isinstance(text, str) or not text.strip()
+        ):
+            continue
+        result.append({"label": label, "text": _redact_text(text)})
+    return result
+
+
 def _bounded_count(value: Any) -> int:
     try:
         count = int(value)
@@ -176,6 +195,9 @@ def _selected_summary(selected: Mapping[str, Any] | None) -> dict[str, Any] | No
         value = _bounded_score(selected.get(key))
         if value is not None:
             result[key] = value
+    evidence = _bounded_evidence(selected.get("evidence"))
+    if evidence is not None:
+        result["evidence"] = evidence
     for key in _LABEL_FIELDS:
         labels = _bounded_labels(selected.get(key))
         if labels is not None:
