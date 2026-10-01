@@ -662,6 +662,10 @@ JobTrail remains the sole scheduler, source collector, importer, scorer, SeenCac
 
 Configure `N8N_ENABLED=1`, `N8N_ENDPOINT`, and optionally `N8N_TIMEOUT_SECONDS`, `N8N_RETRY_ATTEMPTS`, and `N8N_AUTH_HEADER`. Authentication values are configuration-only and are never copied into payloads, logs, or journal records. 2xx responses are acknowledgements; 4xx responses are terminal failures, while bounded 5xx/timeout attempts are recorded as exhausted or uncertain. Remove the endpoint or set `N8N_ENABLED=0` to roll back without disabling local automation.
 
+Feedback actions are independently default-off. Set `N8N_FEEDBACK_ACTIONS_ENABLED=1` to include bounded `applied`, `dismissed`, and `interesting` action descriptors via the canonical launcher handoff helper. This does not enable transport, authenticate callbacks, or perform write-back. Actions require a valid source/job identity and expire after one day. Selected evidence retains only bounded, redacted `{label, text}` entries with labels `direct`, `equivalent`, `inferred`, or `missing`.
+
+The scorer's default public matching strategy ships as package data and does not depend on the working directory. An explicit `matching_strategy_path` still selects the operator's file (including relative-path semantics); missing or invalid overrides safely continue without strategy context, rather than falling back to bundled rules. Classification uses coverage for EXPLORE after APPLY/REVIEW: fit 40 / coverage 90 is EXPLORE, while fit 60 / coverage 0 is SKIP. Exclusions and missing hard requirements always force SKIP.
+
 Delivery records are additive JSONL entries linked by `run_id` and `event_id`; local outcomes are retained when n8n is unavailable. Dry-run mode performs no network delivery and records no delivery acknowledgement. Verification uses only `python -m pytest` with injected `httpx.MockTransport` and fakes; no live automation, Docker, systemd, Hermes, WhatsApp, or public service is required.
 
 Telegram callbacks, public HTTPS ingress, authenticated write-back, Google Sheets as canonical storage, n8n-owned collection, Docker/systemd changes, and generic webhook behavior remain deferred.

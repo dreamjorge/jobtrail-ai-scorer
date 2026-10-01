@@ -49,7 +49,9 @@ from jobtrail_ai_scorer.automation import (
     AutomationRun,
     JobSearchAutomation,
     JobTrailHTTPClient,
+    build_n8n_envelope,
 )
+from jobtrail_ai_scorer.n8n_outbound import N8nConfig, N8nOutboundAdapter
 from jobtrail_ai_scorer.notify import ALLOWED_FIELDS
 from jobtrail_ai_scorer.retry import RetryPolicy
 from jobtrail_ai_scorer.seen_cache import SeenCache
@@ -61,6 +63,53 @@ from stubs.stub_whatsapp import StubWhatsApp
 
 
 pytestmark = pytest.mark.e2e
+
+
+def test_real_score_model_evidence_survives_outbound_boundary():
+    from jobtrail_ai_scorer.scoring import score_jobs
+
+    class Gateway:
+        note = None
+
+        def list_jobs(self):
+            return [{"id": "synthetic-1", "description": "Build services"}]
+
+        def get_job(self, job_id):
+            return {"id": job_id, "description": "Build services", "notes": []}
+
+        def add_note(self, job_id, body):
+            self.note = body
+
+    class Provider:
+        def score(self, prompt):
+            return json.dumps({
+                "score": 90, "fit_score": 40, "coverage_score": 90,
+                "recommendation": "REVIEW", "strengths": [], "gaps": [],
+                "needs_confirmation": [], "hard_requirements_missing": [],
+                "career_value": "Medium", "reasoning": "Synthetic evidence",
+                "evidence": [{"label": "equivalent", "text": "/DATA/ " + "x" * 300}],
+            })
+
+    gateway = Gateway()
+    result = score_jobs(gateway, Provider(), "Synthetic profile", emit_status=False)
+    assert result.processed == 1
+    from jobtrail_ai_scorer.scoring import parse_score_note
+    score = parse_score_note([{"body": gateway.note}])
+    run = AutomationRun(run_id="synthetic-run", selected={
+        **score, "source": "synthetic", "sourceJobId": "synthetic-1",
+    })
+    envelope = build_n8n_envelope(run, occurred_at="2030-01-01T00:00:00+00:00")
+    assert envelope["selected"]["evidence"] == [{
+        "label": "equivalent", "text": ("[redacted] " + "x" * 300)[:200],
+    }]
+    assert envelope["selected"]["classification"] == "EXPLORE"
+    captured = []
+    adapter = N8nOutboundAdapter(
+        N8nConfig(enabled=True, endpoint="https://synthetic.test/events"),
+        transport=httpx.MockTransport(lambda request: (captured.append(json.loads(request.content)) or httpx.Response(200))),
+    )
+    assert adapter.send(envelope).status == "accepted"
+    assert captured == [envelope]
 
 
 # --- Fixtures ----------------------------------------------------------------
@@ -415,6 +464,74 @@ def test_get_job_endpoint_serves_persisted_notes(server, state):
     payload = json.loads(note_body.split("[AI_JOB_SCORE_V1]", 1)[1].strip())
     assert payload["score"] == 85
     assert payload["recommendation"] == "APPLY"
+
+
+def test_n8n_handoff_preserves_scoring_metadata(server, state):
+    """The automation-to-n8n boundary carries the selected score metadata."""
+
+    class MetadataScorer(StubScorer):
+        def __call__(self, job_id: str, config_path: str) -> None:
+            super().__call__(job_id, config_path)
+            note = self.state.jobs[job_id]["notes"][0]
+            payload = json.loads(note["body"].split("[AI_JOB_SCORE_V1]", 1)[1])
+            payload.update(
+                {
+                    "fit_score": 87,
+                    "coverage_score": 76,
+                    "needs_confirmation": [],
+                    "hard_requirements_missing": [],
+                    "career_value": "Medium",
+                    "reasoning": "Synthetic service experience",
+                    "classification": "REVIEW",
+                    "strengths": ["Python services match"],
+                    "evidence": [{"label": "direct", "text": "Python services match"}],
+                    "gaps": ["Cloud deployment experience"],
+                }
+            )
+            from jobtrail_ai_scorer.models import ScoreResult
+            payload = ScoreResult.model_validate(payload).model_dump(mode="json")
+            self.state.set_notes(
+                job_id,
+                [{"body": f"[AI_JOB_SCORE_V1]\n{json.dumps(payload)}"}],
+            )
+
+    scorer = MetadataScorer(
+        state, default_score=91, recommendation="PRIORITY_APPLY"
+    )
+    result = _run(server, scorer=scorer, notifier=StubWhatsApp())
+    envelope = build_n8n_envelope(
+        result,
+        occurred_at="2025-01-01T00:00:00+00:00",
+        feedback_actions=True,
+    )
+    requests = []
+    adapter = N8nOutboundAdapter(
+        N8nConfig(enabled=True, endpoint="https://n8n.test/hook"),
+        transport=httpx.MockTransport(
+            lambda request: (requests.append(request) or httpx.Response(202))
+        ),
+    )
+
+    assert adapter.send(envelope).status == "accepted"
+    delivered = json.loads(requests[0].content)
+    selected = delivered["selected"]
+    assert selected["score"] == 91
+    assert selected["recommendation"] == "PRIORITY_APPLY"
+    assert selected["fit_score"] == 87
+    assert selected["coverage_score"] == 76
+    assert selected["classification"] == "APPLY"
+    assert selected["strengths"] == ["Python services match"]
+    assert selected["evidence"] == [{"label": "direct", "text": "Python services match"}]
+    assert selected["gaps"] == ["Cloud deployment experience"]
+    assert {item["action"] for item in delivered["actions"]} == {
+        "applied", "dismissed", "interesting"
+    }
+    assert all(
+        set(item) == {"action", "action_id", "token_id", "expires_at"}
+        for item in delivered["actions"]
+    )
+    assert "description" not in selected
+    assert "notes" not in selected
 
 
 def test_single_notification_invariant_above_threshold(server, state):

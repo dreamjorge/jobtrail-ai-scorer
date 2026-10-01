@@ -60,11 +60,16 @@ def parse_score_note(
 
     if not isinstance(notes, list):
         return None
+    markers = (marker, LEGACY_MARKER) if marker == CURRENT_MARKER else (marker,)
     for note in reversed(notes):
         body = note.get("body") if isinstance(note, dict) else None
-        if not isinstance(body, str) or marker not in body:
+        matched_marker = next(
+            (candidate for candidate in markers if isinstance(body, str) and candidate in body),
+            None,
+        )
+        if matched_marker is None:
             continue
-        payload_text = body.split(marker, 1)[1].strip()
+        payload_text = body.split(matched_marker, 1)[1].strip()
         if not payload_text:
             continue
         try:
@@ -82,13 +87,21 @@ def parse_score_note(
 
 
 PROMPT_INSTRUCTIONS = (
-    "Evaluate this job against the candidate profile. "
+    "Evaluate this job against the candidate profile and public strategy context. "
 )
 PROMPT_SCHEMA = (
     "Return JSON only matching the configured score schema. Use exactly these keys "
-    "and no extra fields: score, recommendation, strengths, gaps, needs_confirmation, "
+    "and no extra fields: score, fit_score, coverage_score, classification, evidence, "
+    "exclusion_signals, recommendation, strengths, gaps, needs_confirmation, "
     "hard_requirements_missing, career_value, reasoning. "
-    "score must be an integer 0-100. "
+    "score must be an integer 0-100. fit_score and coverage_score must be integers 0-100. "
+    "classification must be one of APPLY, REVIEW, EXPLORE, SKIP and is derived "
+    "deterministically from fit_score, coverage_score, exclusion_signals, and "
+    "hard_requirements_missing; any exclusion signal or missing hard requirement "
+    "forces SKIP regardless of the scores. Classification is an input only and "
+    "will be normalized from these fields. "
+    "Each evidence entry must have a non-empty text and exactly one label: "
+    "direct, equivalent, inferred, or missing; inferred evidence is not direct. "
     "recommendation must be one of PRIORITY_APPLY, APPLY, REVIEW, SKIP. "
     "strengths, gaps, needs_confirmation, and hard_requirements_missing "
     "must be arrays of strings. "
@@ -150,15 +163,62 @@ def should_score(
     return not _contains_score_marker(job.get("notes"), marker=marker)
 
 
-def render_prompt(job: dict[str, Any], candidate_profile: str) -> str:
-    """Render a deterministic provider prompt from a job and local profile."""
+def render_prompt(
+    job: dict[str, Any],
+    candidate_profile: str,
+    strategy_context: dict[str, Any] | str | None = None,
+) -> str:
+    """Render a deterministic prompt, including only public strategy context."""
 
     job_json = serialize_job(job)
+    public_context = json.dumps(strategy_context, sort_keys=True, default=str) if isinstance(strategy_context, dict) else (strategy_context or "")
     return (
         f"{PROMPT_INSTRUCTIONS}{PROMPT_SCHEMA}\n\n"
         f"Candidate profile:\n{candidate_profile}\n\n"
+        f"Public strategy context:\n{public_context}\n\n"
         f"Job:\n{job_json}\n"
     )
+
+
+FIT_APPLY_THRESHOLD = 70
+COVERAGE_APPLY_THRESHOLD = 70
+FIT_REVIEW_THRESHOLD = 50
+COVERAGE_REVIEW_THRESHOLD = 50
+
+
+def classify_score(
+    fit_score: int,
+    coverage_score: int,
+    *,
+    exclusion_signal: bool = False,
+    critical_requirements_missing: list[str] | None = None,
+) -> str:
+    """Classify strict integer scores using bounded, deterministic thresholds.
+
+    Direct callers receive ``ValueError`` for booleans, non-integers, and values
+    outside the inclusive ``0``-``100`` range, matching provider-model strictness.
+    """
+
+    if (
+        isinstance(fit_score, bool)
+        or not isinstance(fit_score, int)
+        or isinstance(coverage_score, bool)
+        or not isinstance(coverage_score, int)
+        or not 0 <= fit_score <= 100
+        or not 0 <= coverage_score <= 100
+    ):
+        raise ValueError("scores must be strict integers between 0 and 100")
+    if exclusion_signal or critical_requirements_missing:
+        return "SKIP"
+    if fit_score >= FIT_APPLY_THRESHOLD and coverage_score >= COVERAGE_APPLY_THRESHOLD:
+        return "APPLY"
+    if (fit_score >= FIT_REVIEW_THRESHOLD and coverage_score >= COVERAGE_REVIEW_THRESHOLD) or fit_score >= FIT_APPLY_THRESHOLD:
+        return "REVIEW"
+    # Adjacent roles remain worth exploring when evidence coverage is strong,
+    # not merely because fit is moderate despite absent evidence.
+    if coverage_score >= COVERAGE_REVIEW_THRESHOLD:
+        return "EXPLORE"
+    return "SKIP"
 
 
 def score_jobs(
@@ -172,6 +232,7 @@ def score_jobs(
     dry_run: bool = False,
     marker: str = CURRENT_MARKER,
     emit_status: bool = True,
+    strategy_context: dict[str, Any] | str | None = None,
 ) -> ScoreRunResult:
     """Score independently eligible jobs and save only validated results."""
 
@@ -199,10 +260,18 @@ def score_jobs(
                 outcomes.append(ScoreOutcome(candidate_id, "skipped", reason))
                 continue
 
-            prompt = render_prompt(full_job, candidate_profile)
+            prompt = render_prompt(full_job, candidate_profile, strategy_context)
             raw_score = provider.score(prompt)
-            score = ScoreResult.model_validate(_decode_provider_score(raw_score))
-            note_body = _serialize_note(marker, score)
+            decoded_score = _decode_provider_score(raw_score)
+            score = ScoreResult.model_validate(decoded_score)
+            note_body = _serialize_note(
+                marker,
+                score,
+                include_additive=any(
+                    key in decoded_score
+                    for key in ("fit_score", "coverage_score", "evidence", "exclusion_signals", "classification")
+                ),
+            )
             if dry_run:
                 processed += 1
                 outcomes.append(ScoreOutcome(candidate_id, "dry_run", "validated"))
@@ -277,13 +346,19 @@ def _contains_score_marker(notes: Any, *, marker: str) -> bool:
         return False
     for note in notes:
         body = note.get("body") if isinstance(note, dict) else None
-        if isinstance(body, str) and (marker in body or LEGACY_MARKER in body):
+        if isinstance(body, str) and (
+            marker in body or (marker == CURRENT_MARKER and LEGACY_MARKER in body)
+        ):
             return True
     return False
 
 
-def _serialize_note(marker: str, score: ScoreResult) -> str:
-    canonical_json = json.dumps(
-        score.model_dump(mode="json"), sort_keys=True, separators=(",", ":")
-    )
+def _serialize_note(
+    marker: str, score: ScoreResult, *, include_additive: bool = True
+) -> str:
+    payload = score.model_dump(mode="json")
+    if not include_additive:
+        for key in ("fit_score", "coverage_score", "evidence", "exclusion_signals", "classification"):
+            payload.pop(key, None)
+    canonical_json = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return f"{marker}\n{canonical_json}"

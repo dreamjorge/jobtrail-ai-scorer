@@ -29,13 +29,14 @@ from jobtrail_ai_scorer.automation import (
     JobSearchAutomation,
     JobTrailHTTPClient,
     SimulationScenario,
+    build_n8n_envelope,
     build_planned_operations,
     build_run_id,
     merge_resolved_base_url,
     resolve_automation_base_url,
 )
 from jobtrail_ai_scorer.sources import NormalizedJob
-from jobtrail_ai_scorer.n8n_outbound import N8nOutboundAdapter, build_envelope
+from jobtrail_ai_scorer.n8n_outbound import N8nOutboundAdapter
 from jobtrail_ai_scorer.run_journal import DEFAULT_RUN_JOURNAL_PATH, record_delivery, record_run
 from jobtrail_ai_scorer.seen_cache import DEFAULT_SEEN_CACHE_PATH, SeenCache
 
@@ -201,10 +202,9 @@ def _record_local_then_deliver(
     journal_path = os.environ.get("JOBTRAIL_RUN_JOURNAL_PATH", DEFAULT_RUN_JOURNAL_PATH)
     record_run(journal_path, result, started_at=started_at, finished_at=finished_at, base_url_source=base_url_source)
     run_id = getattr(result, "run_id", "") or build_run_id(moment=started_at, seed=started_at.isoformat())
-    envelope = build_envelope(
-        run_id=run_id, occurred_at=finished_at.isoformat(), searched=result.searched,
-        imported=result.imported, scored=result.scored, failures=result.failures,
-        selected=result.selected,
+    envelope = build_n8n_envelope(
+        result, occurred_at=finished_at.isoformat(), run_id=run_id,
+        feedback_actions=getattr(config, "feedback_actions_enabled", False),
     )
     delivery = N8nOutboundAdapter(config.n8n).send(envelope)
     record_delivery(journal_path, run_id=run_id, event_id=envelope["event_id"], result=delivery)

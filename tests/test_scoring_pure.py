@@ -14,14 +14,17 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
+
 from jobtrail_ai_scorer.scoring import parse_score_note
 
 
 VALID_MARKER = "[AI_JOB_SCORE_V1]"
+LEGACY_MARKER = "[HERMES_JOB_SCORE_V1]"
 
 
-def _build_body(score: Any) -> str:
-    return f"{VALID_MARKER}\n{score}"
+def _build_body(score: Any, marker: str = VALID_MARKER) -> str:
+    return f"{marker}\n{score}"
 
 
 def _valid_payload(score: int, recommendation: str = "APPLY", reasoning: str = "ok") -> str:
@@ -99,6 +102,19 @@ def test_coerces_float_score_to_int() -> None:
     assert result is not None
     assert result["score"] == 70
     assert isinstance(result["score"], int)
+
+
+def test_default_parser_accepts_legacy_marker() -> None:
+    notes = [{"body": _build_body(_valid_payload(78), marker=LEGACY_MARKER)}]
+    result = parse_score_note(notes)
+    assert result is not None
+    assert result["score"] == 78
+
+
+@pytest.mark.parametrize("existing_marker", [VALID_MARKER, LEGACY_MARKER])
+def test_custom_marker_does_not_enable_current_or_legacy_fallback(existing_marker: str) -> None:
+    notes = [{"body": _build_body(_valid_payload(78), marker=existing_marker)}]
+    assert parse_score_note(notes, marker="[CUSTOM_SCORE_V1]") is None
 
 
 def test_returns_latest_valid_score_when_multiple_valid_notes_exist() -> None:

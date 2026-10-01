@@ -31,6 +31,37 @@ def _load_module():
     return module
 
 
+@pytest.mark.parametrize("enabled", [False, True])
+def test_launcher_feedback_actions_are_explicit_opt_in(monkeypatch, enabled):
+    module = _load_module()
+    from jobtrail_ai_scorer.automation import AutomationConfig, AutomationRun
+
+    monkeypatch.setattr(module, "record_run", lambda *a, **k: None)
+    monkeypatch.setattr(module, "record_delivery", lambda *a, **k: None)
+    captured = []
+
+    class Adapter:
+        def __init__(self, config):
+            pass
+
+        def send(self, envelope):
+            captured.append(envelope)
+            return DeliveryResult("disabled")
+
+    monkeypatch.setattr(module, "N8nOutboundAdapter", Adapter)
+    env = {"N8N_FEEDBACK_ACTIONS_ENABLED": "true"} if enabled else {}
+    config = AutomationConfig.from_env(env)
+    run = AutomationRun(run_id="synthetic-run", selected={
+        "source": "synthetic", "sourceJobId": "job-1", "score": 90,
+    })
+    module._record_local_then_deliver(run, config, base_url_source="static")
+    assert ("actions" in captured[0]) is enabled
+    if enabled:
+        assert [action["action"] for action in captured[0]["actions"]] == [
+            "applied", "dismissed", "interesting",
+        ]
+
+
 @pytest.fixture()
 def launcher():
     return _load_module()

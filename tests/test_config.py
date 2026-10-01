@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import pytest
 from pydantic import ValidationError
 
@@ -30,6 +32,20 @@ def test_app_config_trims_surrounding_marker_whitespace():
     )
 
     assert config.marker == "[CUSTOM]"
+
+
+def test_matching_strategy_path_defaults_to_packaged_rules(tmp_path):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "jobtrail_base_url: https://jobs.test\n"
+        "candidate_profile_path: profile.md\n"
+    )
+
+    config = load_config(config_path)
+
+    from jobtrail_ai_scorer.matching_strategy import DEFAULT_STRATEGY_PATH
+    assert config.matching_strategy_path == DEFAULT_STRATEGY_PATH
+    assert config.matching_strategy_path.is_file()
 
 
 def test_load_config_preserves_candidate_cv_path(tmp_path):
