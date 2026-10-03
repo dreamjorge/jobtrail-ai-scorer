@@ -6,6 +6,7 @@ import pytest
 
 from jobtrail_ai_scorer.opportunity_intelligence import (
     Citation, PublicJobIdentity, TrustedEmployerContext, OpportunityIntelligence,
+    _apply_link,
 )
 from jobtrail_ai_scorer.public_search import PublicSearchRequest, PublicSearchResult, SearchLead
 from jobtrail_ai_scorer.public_http import FetchResult
@@ -490,3 +491,15 @@ def test_multi_part_location_citations_preserve_exact_extracted_values():
     excerpts = [c.excerpt for c in result.citations if c.kind == 'identity']
     assert 'Austin' in excerpts and 'Texas' in excerpts
     assert 'Austin, Texas' not in excerpts
+
+
+def test_valueless_href_in_apply_link():
+    """Valueless href (None) from malformed HTML must not raise TypeError.
+
+    PR09 R7: A valueless <a href> attribute yields href=None from HTMLParser.
+    urljoin(base, None) returns the base URL (truthy), making target truthy,
+    then len(href) with href=None raises TypeError. Guard against this.
+    """
+    class _Page:
+        links = [(None, "Apply")]
+    assert _apply_link(_Page(), "https://example.com/jobs/123") is None
