@@ -917,6 +917,40 @@ network. They serve different purposes and are not interchangeable.
 
 ## One-way n8n handoff
 
+### Opportunity cards: opt into completion schema v2
+
+Consumers must explicitly support `schema_version: 2` before enabling public
+opportunity enrichment for n8n. Both `N8N_ENABLED=1` and
+`OPPORTUNITY_INTELLIGENCE_ENABLED=true` are needed for card delivery. Direct callers record locally, then call `build_n8n_envelope(run)` and the same
+optional adapter; canonical launcher wiring is forthcoming. No new channel or scheduler.
+
+Disabled enrichment, absent intelligence, or no serializable public cards emits
+**exactly the prior v1 shape**, event-ID domain and optional feedback actions.
+v1 rejects an `opportunities` field. v2 adds a required nonempty array of at most
+three T5A public cards: company/title, original URL, status, optional verified
+official URL or unverified candidate URL, at most three citations and three
+company-reported claims (`legalName`, `sector`, `foundingDate`). Citation objects
+contain only source URL, unchanged quoted excerpt, and timezone-aware retrieval
+date. No raw result objects, job descriptions, notes, reasoning, profiles or
+CV-match evidence are exported in cards. v2 retains the bounded `selected`
+compatibility identity/score/recommendation fields, but omits its evidence,
+strengths, gaps and evidence/gap labels; v1 retains its existing behavior.
+
+The builder and adapter enforce closed v2 fields with the public-card validation
+policy, including nested bounds, dates, URL/inline-credential checks and
+status/official-URL consistency. Typed serialization may drop unsafe proofs;
+unsafe caller mappings instead fail before HTTP, without repairing quotes.
+v2 JSON is capped at 256 KiB. Its event ID uses the explicit `jobtrail-n8n-v2`
+hash domain, stable across retries. Optional feedback action IDs remain bound
+to that completion event with the existing canonical action set and one-day
+expiry. This is a **completion-event** version, not a feedback-event upgrade:
+existing v1 feedback events and workflow JSON are unchanged. Existing v1-only
+consumers must not treat v2 as implicitly compatible or silently ignore cards.
+
+Validation is hermetic mocked HTTP only. No n8n deployment, live delivery,
+consumer migration, or publication has been validated.
+
+
 JobTrail remains the sole scheduler, source collector, importer, scorer, SeenCache owner, and journal authority. The optional n8n adapter is disabled by default and sends one bounded, versioned, redacted run envelope only after the local run record is written. Hermes WhatsApp remains an independent local channel; n8n delivery never invokes or configures Hermes.
 
 Configure `N8N_ENABLED=1`, `N8N_ENDPOINT`, and optionally `N8N_TIMEOUT_SECONDS`, `N8N_RETRY_ATTEMPTS`, and `N8N_AUTH_HEADER`. Authentication values are configuration-only and are never copied into payloads, logs, or journal records. 2xx responses are acknowledgements; 4xx responses are terminal failures, while bounded 5xx/timeout attempts are recorded as exhausted or uncertain. Remove the endpoint or set `N8N_ENABLED=0` to roll back without disabling local automation.

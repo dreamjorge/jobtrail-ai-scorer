@@ -16,6 +16,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 import httpx
 
 from .notify import FORBIDDEN_TOKENS
+from .opportunity_cards import validated_cards
 
 
 _EVENT_TYPE = "automation.run.completed"
@@ -235,18 +236,24 @@ def _feedback_actions(*, event_id: str, run_id: str, selected: Mapping[str, Any]
 def build_envelope(
     *, run_id: str, occurred_at: str, searched: int, imported: int, scored: int,
     failures: tuple[str, ...] | list[str] = (), selected: Mapping[str, Any] | None = None,
-    feedback_actions: bool = False,
+    feedback_actions: bool = False, opportunities: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Build the closed, bounded payload sent to n8n."""
     raw_run_id = run_id if isinstance(run_id, str) else str(run_id)
     safe_run_id = _redact_text(_clip(raw_run_id))
+    cards = validated_cards(opportunities) if opportunities is not None else None
+    version = 2 if cards else 1
     safe_selected = _selected_summary(selected)
+    if cards and safe_selected:
+        # Preserve the selected compatibility summary, not CV-match evidence.
+        safe_selected = {key: value for key, value in safe_selected.items()
+                         if key in _SELECTED_FIELDS + ('classification',) + _SCORE_FIELDS}
     identity = _valid_identity(selected or {}) or (raw_run_id, "run")
     event_id = _identity_digest({
         "job_id": identity[1],
         "run_id": raw_run_id,
         "source": identity[0],
-        "version": "jobtrail-n8n-v1",
+        "version": f"jobtrail-n8n-v{version}",
     })
     safe_occurred_at = _safe_occurred_at(occurred_at)
     actions = (
@@ -264,7 +271,7 @@ def build_envelope(
         for label in list(failures)[:_MAX_FAILURES]
     ]
     return {
-        "schema_version": 1,
+        "schema_version": version,
         "event_id": event_id,
         "run_id": safe_run_id,
         "event_type": _EVENT_TYPE,
@@ -276,6 +283,7 @@ def build_envelope(
         },
         "selected": safe_selected,
         **({"actions": actions} if actions else {}),
+        **({"opportunities": cards} if cards else {}),
     }
 
 
@@ -284,12 +292,17 @@ def _validated_envelope(envelope: Mapping[str, Any]) -> dict[str, Any] | None:
 
     if not isinstance(envelope, Mapping):
         return None
-    if set(envelope) not in (
+    version = envelope.get('schema_version')
+    if type(version) is not int or version not in (1, 2):
+        return None
+    cards = validated_cards(envelope.get('opportunities')) if version == 2 else None
+    fields = set(envelope) - ({'opportunities'} if version == 2 else set())
+    if fields not in (
         {"schema_version", "event_id", "run_id", "event_type", "occurred_at", "result", "selected"},
         {"schema_version", "event_id", "run_id", "event_type", "occurred_at", "result", "selected", "actions"},
     ):
         return None
-    if envelope.get("schema_version") != 1 or envelope.get("event_type") != _EVENT_TYPE:
+    if envelope.get("event_type") != _EVENT_TYPE:
         return None
     event_id = envelope.get("event_id")
     run_id = envelope.get("run_id")
@@ -321,8 +334,11 @@ def _validated_envelope(envelope: Mapping[str, Any]) -> dict[str, Any] | None:
     selected = envelope.get("selected")
     if selected is not None and (not isinstance(selected, Mapping) or _selected_summary(selected) != dict(selected)):
         return None
+    if version == 2 and selected is not None and set(selected) - set(
+            _SELECTED_FIELDS + ('classification',) + _SCORE_FIELDS):
+        return None
     canonical: dict[str, Any] = {
-        "schema_version": 1, "event_id": event_id, "run_id": run_id,
+        "schema_version": version, "event_id": event_id, "run_id": run_id,
         "event_type": _EVENT_TYPE, "occurred_at": occurred_at,
         "result": {key: result[key] for key in ("searched", "imported", "scored", "failure_count")}
         | {"failures": list(failures)},
@@ -377,6 +393,12 @@ def _validated_envelope(envelope: Mapping[str, Any]) -> dict[str, Any] | None:
             ):
                 return None
         canonical["actions"] = [dict(action) for action in actions]
+    if cards:
+        canonical['opportunities'] = cards
+        # 3 cards x (3 citations + 3 cited claims), with Unicode/JSON escaping
+        # headroom. v1 bounds/bytes remain unchanged.
+        if len(json.dumps(canonical, ensure_ascii=True).encode()) > 262_144:
+            return None
     return canonical
 
 
