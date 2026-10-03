@@ -35,7 +35,7 @@ Keep injected transports caller-owned through a minimal non-closing adapter; pre
 - [x] R5 — PR90: shared credential URL boundary and site-local IPv6 rejection. Verify PR91/92 propagation.
 - [x] R6 — PR93: deny generic ATS host families as employer trust anchors.
 - [x] R7 — PR94: tolerate valueless/malformed HTML attributes without discarding valid evidence.
-- [ ] R8 — PR95: enforce evidence/job association and preserve validated original fragments.
+- [x] R8 — PR95: enforce evidence/job association and preserve validated original fragments.
 - [ ] R9 — PR96: failure-only notification gating, employer normalization and shared strict intelligence flag parser.
 - [ ] R10 — PR97: null stripped empty v2 selection and align rollout documentation.
 - [ ] R11 — PR98: reuse strict flag parser; preserve disabled/dry-run zero-secret-read lazy behavior.
@@ -43,7 +43,7 @@ Keep injected transports caller-owned through a minimal non-closing adapter; pre
 
 ## State and evidence
 
-R1–R7 COMPLETE; R8 IN PROGRESS; R9–R12 pending. Active worktree: `/root/.config/superpowers/worktrees/jobtrail-ai-scorer/feat-opportunity-intelligence-review`, branch `feat/opportunity-intelligence-review-13-canonical-launcher`, HEAD `784176b1afd337976e125adc040c2cd3a9a00aaf` + R7 merges.
+R1–R8 COMPLETE; R9 IN PROGRESS; R10–R12 pending. Active worktree: `/root/.config/superpowers/worktrees/jobtrail-ai-scorer/feat-opportunity-intelligence-review`, branch `feat/opportunity-intelligence-review-13-canonical-launcher`, HEAD `784176b1afd337976e125adc040c2cd3a9a00aaf` + R7 merges.
 
 Prior read-only triage: Engram280/281, `/tmp/jobtrail-bot-validation-20261003T052646Z`, fresh GitHub metadata 2026-10-03 14:44 UTC. PR83 had 799 passing tests and five earlier bot findings fixed, but a separate canonical probe selected/notified an explicit SKIP job; final98 rejected it. Twelve feature root causes reproduced; transport and unusual selected-input production impact not demonstrated. PR97 stale documentation is specifically superseded by PR98.
 
