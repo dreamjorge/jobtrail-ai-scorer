@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Iterable, Mapping, TypeVar
 
-from .scoring import classify_score
+from .scoring import eligible_score
 
 
 Job = TypeVar("Job")
@@ -19,42 +19,7 @@ def _eligible_score(
     fails eligibility is rejected, never replaced with an older recommendation.
     Explicit SKIP always wins, even over otherwise eligible dual scores.
     """
-    legacy_score = score.get("score")
-    if (
-        isinstance(legacy_score, bool)
-        or not isinstance(legacy_score, int)
-        or not 0 <= legacy_score <= 100
-        or legacy_score < score_threshold
-    ):
-        return None
-    for field in ("recommendation", "classification"):
-        value = score.get(field)
-        if isinstance(value, str) and value.strip().upper() == "SKIP":
-            return None
-    for field in ("hard_requirements_missing", "exclusion_signals"):
-        if field in score:
-            value = score[field]
-            if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
-                return None
-            if value:
-                return None
-
-    normalized = dict(score)
-    if "fit_score" in score or "coverage_score" in score:
-        try:
-            classification = classify_score(
-                score.get("fit_score"), score.get("coverage_score"),
-            )
-        except ValueError:
-            return None
-        if classification == "SKIP":
-            return None
-        normalized["classification"] = classification
-    elif "classification" in score and score["classification"] not in (
-        "APPLY", "REVIEW", "EXPLORE",
-    ):
-        return None
-    return normalized
+    return eligible_score(score, score_threshold=score_threshold)
 
 
 def build_shortlist(
