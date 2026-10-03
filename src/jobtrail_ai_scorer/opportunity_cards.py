@@ -68,6 +68,8 @@ def serialize_cards(pairs):
         original = _card_url(job.original_url)
         if not original:
             raise ValueError('invalid original URL')
+        if result.source_url is not None and _candidate_url(result.source_url) != _candidate_url(job.original_url):
+            raise ValueError('result source_url does not match job original_url')
         card = {'company': _text(job.company, 160), 'title': _text(job.title, 200),
                 'original_url': original,
                 'status': result.status if result.status in _STATUSES else 'unavailable'}
