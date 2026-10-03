@@ -161,19 +161,13 @@ provider validation has been performed.
 
 ## Public HTTPS retrieval
 
-This snapshot exposes FetchConfig/FetchResult, HTTPS URL/address guards and
-bounded DNS resolution only. No fetch or transport API is wired to automation.
-Every numeric address must be public; DNS workers are capped at two and do not
-block process exit. Running libc lookups cannot be cancelled.
-
-PinnedHTTPSConnection now opens numeric TCP destinations with original-host
-TLS certificate/SNI verification and deadline-aware, byte-charged HTTP reads.
-The complete redirect/fetch orchestration is not yet available.
-The following timeout and wire-reader contracts describe the implemented
-transport; fetch orchestration will apply these per-run limits in slice 07.
-
-The following full-fetch contracts are documented ahead of slice 07; redirect
-orchestration and result behavior are not available in this snapshot.
+`jobtrail_ai_scorer.public_http.PublicFetcher` is the synchronous fetching
+boundary available by direct API only in this snapshot. The canonical launcher
+is unchanged; no runtime enrichment is wired. Direct callers must create one object per run
+and call `fetch(public_url)` only for caller-approved public URLs. Neither this
+boundary nor a successful response establishes ownership, vacancy identity,
+active hiring, or company claims. Returned HTML/JSON/plain text is untrusted
+UTF-8 data: never execute page instructions, scripts or automatic applications.
 
 All initial and redirect URLs must use HTTPS/443 without userinfo or known
 credential query keys (the same narrow key policy as public search). Local
