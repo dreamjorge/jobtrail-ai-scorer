@@ -22,6 +22,8 @@ import threading
 import time
 from urllib.parse import parse_qsl, unquote, urljoin, urlsplit, urlunsplit
 
+from . import public_search
+
 MAX_RESPONSE_BYTES = 512 * 1024
 MAX_TOTAL_BYTES = 3 * 1024 * 1024
 MAX_ATTEMPTS = 12
@@ -29,7 +31,7 @@ MAX_REDIRECTS = 2
 # Same narrow credential-key policy as public_search; no runtime imports.
 _SECRET_QUERY_KEYS = frozenset({
     "token", "api_key", "apikey", "access_token", "password", "client_secret",
-    "secret", "app_id", "app_key",
+    "secret", "secretkey", "secret_key", "app_id", "app_key",
 })
 
 
@@ -95,6 +97,9 @@ def _safe_url(value):
             _public_ip(host)
         if any(key.lower() in _SECRET_QUERY_KEYS
                for key, _ in parse_qsl(parts.query, keep_blank_values=True)):
+            return None
+        if (public_search._credential_fields(parts.query, 0)
+                or public_search._credential_fields(parts.fragment, 0, fragment=True)):
             return None
         netloc = f"[{host}]" if ":" in host else host
         # ASCII request targets only; callers must percent-encode Unicode paths.
