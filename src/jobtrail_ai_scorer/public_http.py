@@ -138,3 +138,133 @@ def bounded_resolve(host, timeout):
     if outcome[0] is None:
         raise OSError()
     return outcome[0]
+
+
+class _ByteBudgetExceeded(Exception):
+    pass
+
+
+class _ByteBudget:
+    """One response's HTTP wire bytes, charged once to the shared run."""
+    def __init__(self, fetcher):
+        self.fetcher = fetcher
+        self.used = 0
+
+    def allowance(self, size):
+        size = min(size, MAX_RESPONSE_BYTES - self.used,
+                   MAX_TOTAL_BYTES - self.fetcher._bytes)
+        if size <= 0:
+            raise _ByteBudgetExceeded()
+        return size
+
+    def received(self, size):
+        self.used += size
+        self.fetcher._bytes += size
+
+
+class _DeadlineReader(io.RawIOBase):
+    """Bound every TLS recv, including slow trickled HTTP headers/chunk framing."""
+    def __init__(self, owner):
+        self.owner = owner
+
+    def readable(self):
+        return True
+
+    def readinto(self, buffer):
+        self.owner._set_read_timeout()
+        budget = self.owner._byte_budget
+        view = memoryview(buffer)
+        if budget is not None:
+            view = view[:budget.allowance(len(view))]
+        size = self.owner._tls_sock.recv_into(view)
+        if budget is not None:
+            budget.received(size)
+        self.owner._remaining()
+        return size
+
+
+class _SocketView:
+    def __init__(self, owner):
+        self.owner = owner
+
+    def makefile(self, mode):
+        return io.BufferedReader(_DeadlineReader(self.owner))
+
+    def sendall(self, data):
+        self.owner._set_read_timeout()
+        self.owner._tls_sock.sendall(data)
+        self.owner._remaining()
+
+    def close(self):
+        self.owner._tls_sock.close()
+
+
+class PinnedHTTPSConnection(http.client.HTTPSConnection):
+    """Numeric TCP connect, original-host SNI and certificate identity, no DNS."""
+    def __init__(self, host, ip, timeout):
+        super().__init__(host, port=443, timeout=timeout,
+                         context=ssl.create_default_context())
+        self._ip = _public_ip(ip)
+        self._clock = time.monotonic
+        self._deadline = self._clock() + timeout
+        self._read_seconds = timeout
+        self._tls_sock = None
+        self._byte_budget = None
+
+    def set_byte_budget(self, budget):
+        self._byte_budget = budget
+
+    def set_deadline(self, deadline, clock, read_seconds):
+        self._deadline, self._clock, self._read_seconds = deadline, clock, read_seconds
+
+    def _remaining(self):
+        remaining = self._deadline - self._clock()
+        if remaining <= 0:
+            raise TimeoutError()
+        return remaining
+
+    def _set_read_timeout(self):
+        # During HTTP I/O self.sock is a view; retain the underlying TLS socket.
+        self._tls_sock.settimeout(min(self._read_seconds, self._remaining()))
+
+    def connect(self):
+        # Direct numeric socket.connect avoids even getaddrinfo(numeric_ip).
+        raw = socket.socket(socket.AF_INET6 if ":" in self._ip else socket.AF_INET,
+                            socket.SOCK_STREAM)
+        try:
+            raw.settimeout(min(self.timeout, self._remaining()))
+            raw.connect((self._ip, 443))
+            tls = self._context.wrap_socket(raw, server_hostname=self.host,
+                                            do_handshake_on_connect=False)
+            self._tls_sock = tls
+            tls.settimeout(min(self.timeout, self._remaining()))
+            tls.do_handshake()
+            self._remaining()
+            self.sock = tls
+        except Exception:
+            if self._tls_sock is not None:
+                self._tls_sock.close()
+            raw.close()
+            raise
+
+    def close(self):
+        # http.client detaches a Connection: close response before its body is
+        # consumed. Our custom file retains TLS until explicit final cleanup.
+        if getattr(self, "_reading_headers", False):
+            self.sock = None
+            super().close()
+            return
+        super().close()
+        if self._tls_sock is not None:
+            self._tls_sock.close()
+
+    def getresponse(self):
+        # HTTPResponse reads via deadline-aware makefile, not plain socket IO.
+        self.sock = _SocketView(self)
+        self._reading_headers = True
+        try:
+            return super().getresponse()
+        finally:
+            self._reading_headers = False
+            if self.sock is not None:
+                self.sock = self._tls_sock
