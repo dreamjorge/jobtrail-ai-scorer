@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
-from typing import Any, Protocol
+from typing import Any, Mapping, Protocol
 
 from pydantic import ValidationError
 
@@ -219,6 +219,63 @@ def classify_score(
     if coverage_score >= COVERAGE_REVIEW_THRESHOLD:
         return "EXPLORE"
     return "SKIP"
+
+
+def eligible_score(
+    score: Mapping[str, Any], *, score_threshold: int,
+) -> dict[str, Any] | None:
+    """Return a normalized eligible copy, preserving legacy score ranking.
+
+    Apply this after parsing the latest valid note; rejection must never fall
+    back to an older note. Any additive marker requires both strict dual scores
+    and explicit safety arrays. Genuine legacy notes need no additive defaults.
+    Neither this helper nor its callers rewrite persisted notes.
+    """
+
+    legacy_score = score.get("score")
+    if (
+        isinstance(legacy_score, bool)
+        or not isinstance(legacy_score, int)
+        or not 0 <= legacy_score <= 100
+        or legacy_score < score_threshold
+    ):
+        return None
+    for field in ("recommendation", "classification"):
+        if field in score:
+            value = score[field]
+            if not isinstance(value, str) or value.strip().upper() == "SKIP":
+                return None
+    if "classification" in score and score["classification"] not in (
+        "APPLY", "REVIEW", "EXPLORE",
+    ):
+        return None
+
+    additive = any(field in score for field in (
+        "fit_score", "coverage_score", "classification", "evidence", "exclusion_signals",
+    ))
+    for field in ("hard_requirements_missing", "exclusion_signals"):
+        if field not in score:
+            if additive:
+                return None
+            continue
+        value = score[field]
+        if not isinstance(value, list) or not all(
+            isinstance(entry, str) and entry.strip() for entry in value
+        ):
+            return None
+        if value:
+            return None
+
+    normalized = dict(score)
+    if additive:
+        try:
+            classification = classify_score(score.get("fit_score"), score.get("coverage_score"))
+        except ValueError:
+            return None
+        if classification == "SKIP":
+            return None
+        normalized["classification"] = classification
+    return normalized
 
 
 def score_jobs(
