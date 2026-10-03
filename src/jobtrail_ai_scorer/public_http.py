@@ -268,3 +268,157 @@ class PinnedHTTPSConnection(http.client.HTTPSConnection):
             self._reading_headers = False
             if self.sock is not None:
                 self.sock = self._tls_sock
+
+
+class PublicFetcher:
+    """No retries, proxies, ambient credentials, cookies, execution or claims.
+
+    Use a new object per run; not thread-safe. Clock is monotonic seconds;
+    utcnow supplies a datetime for retrieval timestamps. Trusted injected IO
+    must honor its timeout; production IO also enforces the absolute deadline.
+    """
+    def __init__(self, config=FetchConfig(), *, resolver=bounded_resolve,
+                 connection_factory=PinnedHTTPSConnection, clock=time.monotonic,
+                 utcnow=lambda: datetime.now(timezone.utc)):
+        self.config = config
+        self._resolver, self._factory = resolver, connection_factory
+        self._clock, self._utcnow = clock, utcnow
+        self._deadline = clock() + config.total_seconds
+        self._attempts = self._bytes = 0
+
+    def _remaining(self):
+        remaining = self._deadline - self._clock()
+        if remaining <= 0:
+            raise TimeoutError()
+        return remaining
+
+    def fetch(self, url):
+        stamp = self._utcnow()
+        if stamp.tzinfo is None:
+            stamp = stamp.replace(tzinfo=timezone.utc)
+        checked_at = stamp.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+        current = _safe_url(url)
+        def result(status, error=None, text=None, mime=None):
+            # Failure URLs omitted: never echo malicious input or redirects.
+            return FetchResult(status, current if status == "ok" else None,
+                               checked_at, mime, text, error)
+        if current is None:
+            return result("blocked", "unsafe_url")
+        seen = set()
+        for hop in range(MAX_REDIRECTS + 1):
+            conn = response = None
+            try:
+                self._remaining()
+                if self._attempts >= MAX_ATTEMPTS or self._bytes >= MAX_TOTAL_BYTES:
+                    return result("budget_exhausted", "run_budget")
+                if current in seen:
+                    return result("blocked", "redirect_loop")
+                seen.add(current)
+                parts = urlsplit(current)
+                host = parts.hostname
+                try:
+                    ipaddress.ip_address(host)
+                except ValueError:
+                    answers = self._resolver(host, min(self.config.connect_seconds, self._remaining()))
+                else:
+                    answers = [host]
+                self._remaining()
+                if not isinstance(answers, (list, tuple)) or not answers or len(answers) > 256:
+                    return result("blocked", "unsafe_dns")
+                try:
+                    ips = [_public_ip(address) for address in answers]
+                except (ValueError, TypeError):
+                    return result("blocked", "unsafe_dns")
+                self._attempts += 1
+                conn = self._factory(host, ips[0], min(self.config.connect_seconds, self._remaining()))
+                conn.set_byte_budget(_ByteBudget(self))
+                if isinstance(conn, PinnedHTTPSConnection):
+                    conn.set_deadline(self._deadline, self._clock, self.config.read_seconds)
+                conn.connect()
+                self._remaining()
+                conn.sock.settimeout(min(self.config.read_seconds, self._remaining()))
+                target = parts.path + ("?" + parts.query if parts.query else "")
+                conn.request("GET", target, headers={"Host": parts.netloc,
+                             "Accept-Encoding": "identity", "Connection": "close"})
+                self._remaining()
+                response = conn.getresponse()
+                self._remaining()
+                if type(response.status) is not int or not 100 <= response.status <= 599:
+                    return result("failed", "bad_response")
+                length = response.getheader("content-length")
+                transfer = response.getheader("transfer-encoding")
+                if transfer is not None and (not isinstance(transfer, str)
+                        or transfer.strip().lower() != "chunked" or length is not None):
+                    return result("failed", "bad_framing")
+                declared_length = None
+                if length is not None:
+                    if (not isinstance(length, str) or len(length) > 10
+                            or not re.fullmatch(r"[0-9]+", length)):
+                        return result("failed", "bad_framing")
+                    declared_length = int(length)
+                encoding = response.getheader("content-encoding", "identity")
+                if not isinstance(encoding, str) or encoding.strip().lower() != "identity":
+                    return result("unsupported", "unsupported_encoding")
+                body = bytearray()
+                while True:
+                    self._remaining()
+                    if conn.sock is not None:
+                        conn.sock.settimeout(min(self.config.read_seconds, self._remaining()))
+                    # Wire bytes (including prefetch) are charged below the
+                    # parser, not again here. Keep the decoded body bounded too.
+                    allowance = min(8192, MAX_RESPONSE_BYTES - len(body))
+                    if allowance <= 0:
+                        return result("budget_exhausted", "body_budget")
+                    chunk = response.read1(allowance)
+                    if not isinstance(chunk, bytes) or len(chunk) > allowance:
+                        return result("failed", "bad_response")
+                    self._remaining()
+                    if not chunk:
+                        if getattr(response, "length", None) not in (None, 0):
+                            return result("failed", "truncated_response")
+                        break
+                    body.extend(chunk)
+                if declared_length is not None and len(body) != declared_length:
+                    return result("failed", "truncated_response")
+                if response.status in (301, 302, 303, 307, 308):
+                    location = response.getheader("location")
+                    if not isinstance(location, str) or not location:
+                        return result("failed", "bad_redirect")
+                    candidate = _safe_url(urljoin(current, location))
+                    if candidate is None:
+                        return result("blocked", "unsafe_redirect")
+                    if hop == MAX_REDIRECTS:
+                        return result("blocked", "redirect_limit")
+                    current = candidate
+                    continue
+                if response.status != 200:
+                    return result("failed", "http_status")
+                content_type = response.getheader("content-type", "")
+                if not isinstance(content_type, str):
+                    return result("failed", "bad_response")
+                mime = content_type.split(";", 1)[0].strip().lower()
+                if mime not in ("text/html", "text/plain", "application/json"):
+                    return result("unsupported", "unsupported_mime")
+                for parameter in content_type.split(";")[1:]:
+                    if parameter.strip().lower().startswith("charset="):
+                        if parameter.split("=", 1)[1].strip().strip('"').lower() not in ("utf-8", "utf8"):
+                            return result("unsupported", "unsupported_charset")
+                return result("ok", text=body.decode("utf-8"), mime=mime)
+            except _ByteBudgetExceeded:
+                return result("budget_exhausted", "body_budget")
+            except DNSBusy:
+                return result("failed", "dns_busy")
+            except TimeoutError:
+                return result("timed_out", "deadline")
+            except ssl.SSLError:
+                return result("failed", "tls_failure")
+            except UnicodeError:
+                return result("unsupported", "invalid_utf8")
+            except (OSError, ValueError, TypeError, http.client.HTTPException):
+                return result("failed", "transport_or_response")
+            finally:
+                if response is not None and hasattr(response, "close"):
+                    response.close()
+                if conn is not None:
+                    conn.close()
+        return result("blocked", "redirect_limit")
