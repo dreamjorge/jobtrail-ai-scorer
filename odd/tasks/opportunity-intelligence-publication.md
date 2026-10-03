@@ -15,10 +15,12 @@ The user authorized a feature-specific approved issue, a documentation-only new 
 
 ## Tasks
 - [x] P1: Created issue [#84](https://github.com/dreamjorge/jobtrail-ai-scorer/issues/84), with `enhancement` and `status:approved`; duplicate/policy/privacy checks passed.
-- [ ] P2 (in progress): Add meaningful tracker documentation and reconstruct 13 child trees/commits on the new common base; preserve original refs.
-- [ ] P3: Independently verify branch bases, source parity, authored budgets, local tests and public PR descriptions.
-- [ ] P4: Push only the new tracker and children; open draft tracker and correctly based child PRs with issue linkage and labels.
+- [x] P2: Created tracker bootstrap `82d45522ec5b8f2ccfc09b77c05168a7a229417a` and 13 new child commits, ending at `6497c16789e2428f914596127babd5322a2d8c9f`; original refs are intact.
+- [x] P3: Actual commit trees, immediate parents, 17 preserved source files, approved budgets and public PR bodies independently verified; fresh final suite: 1346 passed, zero skips.
+- [ ] P4 (in progress): Push only the new tracker and children; open draft tracker and correctly based child PRs with issue linkage and labels.
 - [ ] P5: Observe each PR's remote diff and CI, record links and pending checks, and stop without merge or activation.
 
-## Recovery
-The implementation history is recorded in `odd/tasks/opportunity-intelligence.md`. Publication evidence is recorded here as each task closes. CI must be observed, not inferred from local tests.
+## Evidence and recovery
+Issue #84 is approved. The documentation-only tracker has 128 authored lines. New adjacent child diffs are 241, 229, 228, 362, 212, 324, 575, 248, 875, 351, 176, 235 and 339 lines before this publication journal update. All 14 proposed public trees passed independent full suites; the final tree passed 1346 tests without skips. Source trees differ from their preserved predecessors only by the two common-base documents. Fresh shellcheck and syntax checks passed. Remote CI has not yet been observed.
+
+The implementation history is recorded in `odd/tasks/opportunity-intelligence.md`; its earlier local-only authorization is historical and superseded by this publication task. Existing branches and their commits remain preserved.
