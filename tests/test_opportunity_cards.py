@@ -23,6 +23,15 @@ def test_public_cards_bound_and_separate_links():
     assert 'Candidate (unverified)' in render_cards(cards)
 
 
+def test_serialize_cards_rejects_mismatched_source_url():
+    """A result whose source_url differs from its job's original_url is a misbehaving caller."""
+    from jobtrail_ai_scorer.opportunity_cards import serialize_cards
+    job = PublicJobIdentity('Acme', 'Engineer', 'Remote', 'https://source.test/1', 'indeed', '1')
+    result = OpportunityResult('verified', 'https://other.example/jobs/99')
+    with pytest.raises(ValueError, match='source_url'):
+        serialize_cards([(job, result)])
+
+
 @pytest.mark.parametrize('url', ['https://a.test/?token=secret', 'https://user:pass@a.test/', 'http://a.test/'])
 def test_cards_reject_unsafe_proof(url):
     from jobtrail_ai_scorer.opportunity_cards import serialize_cards
