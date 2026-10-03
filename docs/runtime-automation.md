@@ -102,6 +102,36 @@ The JSON is configuration only: it must not contain secrets, credentials, privat
 
 The final launcher output includes `profile_counts` with `searched`, `imported`, `duplicates`, and `failures` per profile when profiles are configured; it is `{}` for the legacy fallback.
 
+## Public opportunity search
+
+Only the public request/config/result contracts and syntactic URL filter are
+available in this snapshot. No runtime wiring, search or destination fetching
+is present. Adapter construction and provider calls are a later slice.
+
+`PublicSearchConfig` defaults to `enabled=False`, no API key and a five-second
+HTTP timeout (finite, positive, at most 30 seconds). `from_env` accepts an
+explicitly supplied environment mapping, rather than reading ambient variables:
+
+| Variable | Default | Contract |
+| --- | --- | --- |
+| `OPPORTUNITY_INTELLIGENCE_ENABLED` | `false` | `1/true/yes/on` enables; `0/false/no/off` disables. Other values are rejected. |
+| `BRAVE_SEARCH_API_KEY` | absent | Secret configuration only, excluded from config repr. Missing/blank when enabled yields `provider_unconfigured`, with zero HTTP attempts. |
+
+Fake placeholders only (do not commit real keys):
+
+```text
+OPPORTUNITY_INTELLIGENCE_ENABLED=1
+BRAVE_SEARCH_API_KEY=fake-placeholder-not-a-real-key
+```
+
+Callers must construct `PublicSearchRequest(company, title, location)` from
+approved public identifiers only, never raw job/profile/description/notes
+mappings. Fields are required nonblank strings, bounded to 160/200/120 characters;
+existing forbidden markers, controls and query-injection punctuation are
+rejected. The deterministic query quotes each field and appends `jobs` (at most
+493 characters). This defense does not prove that arbitrary caller-supplied text
+is public: callers still own the public-field boundary.
+
 ## Optional Adzuna source
 
 `AdzunaSourceAdapter` is an optional source the automation launcher can
