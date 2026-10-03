@@ -16,6 +16,220 @@ import pytest
 
 from jobtrail_ai_scorer.n8n_outbound import DeliveryResult, N8nConfig
 
+def test_intelligence_factory_disabled_and_dryrun_do_not_read_secret():
+    module = _load_module()
+    class Guard(dict):
+        def get(self, key, default=None):
+            assert key != 'BRAVE_SEARCH_API_KEY'
+            return super().get(key, default)
+    assert module._build_intelligence(Guard(), dry_run=False) == {}
+    assert module._build_intelligence(Guard(OPPORTUNITY_INTELLIGENCE_ENABLED='true'), dry_run=True) == {}
+
+
+def test_intelligence_factory_real_typed_missing_key_and_context_limits():
+    module = _load_module()
+    from jobtrail_ai_scorer.opportunity_intelligence import PublicJobIdentity, OpportunityIntelligence
+    kwargs = module._build_intelligence({'OPPORTUNITY_INTELLIGENCE_ENABLED': 'true'})
+    resolver = kwargs['intelligence_resolver_factory']()
+    assert type(resolver) is OpportunityIntelligence
+    job = PublicJobIdentity('Acme', 'Engineer', 'Remote', 'https://source.test/1', 'indeed', '1')
+    assert resolver.resolve(job, enabled=True).status == 'provider_unconfigured'
+    for raw in ['SECRET_SENTINEL', ' ' * 16385, '[{}]' , '[' + ','.join('{}' for _ in range(11)) + ']']:
+        kwargs = module._build_intelligence({'OPPORTUNITY_INTELLIGENCE_ENABLED': 'true', 'OPPORTUNITY_EMPLOYER_CONTEXTS_JSON': raw})
+        assert kwargs['intelligence_status'] == 'invalid_configuration'
+        assert 'SECRET_SENTINEL' not in repr(kwargs)
+
+
+@pytest.mark.parametrize('enabled', [False, True])
+def test_canonical_launcher_real_pipeline_mock_public_io(monkeypatch, enabled):
+    import json
+    import httpx
+    from datetime import datetime, timezone
+    from jobtrail_ai_scorer.automation import JobSearchAutomation
+    from jobtrail_ai_scorer import public_search, public_http
+    from jobtrail_ai_scorer.opportunity_intelligence import PublicJobIdentity
+    module = _load_module()
+    env = {'SCORER_CONFIG_PATH': 'synthetic', 'JOB_SEARCH_LOCATIONS': 'Austin',
+           'WHATSAPP_NOTIFY_ENABLED': 'true', 'N8N_ENABLED': 'true',
+           'N8N_ENDPOINT': 'https://n8n.test/hook'}
+    if enabled:
+        env.update(OPPORTUNITY_INTELLIGENCE_ENABLED='true', BRAVE_SEARCH_API_KEY='synthetic-test-key',
+                   OPPORTUNITY_EMPLOYER_CONTEXTS_JSON=json.dumps([{
+                       'company': 'Acme', 'hosts': ['acme.example'],
+                       'careers_url': 'https://acme.example/careers',
+                       'provenance': {'url': 'https://acme.example/careers',
+                                      'excerpt': 'Operator confirmed public employer page',
+                                      'checked_at': '2026-06-01T00:00:00+00:00', 'kind': 'user_confirmed'}}]))
+    # Replace, rather than inspecting/copying, the ambient environment.
+    monkeypatch.setattr(module.os, 'environ', env)
+    monkeypatch.setattr(sys, 'argv', ['launcher', '--no-discover'])
+    messages, runs, constructed, requests, fetches = [], [], [], [], []
+    class Gateway:
+        def __init__(self, *args):
+            self.jobs = {}
+        def close(self):
+            pass
+        def search(self, payload):
+            return [{'site': 'indeed', 'id': str(i), 'title': 'Engineer', 'company': 'Acme',
+                     'location': 'Austin', 'job_url': f'https://source.example/{i}'} for i in range(4)]
+        def import_job(self, payload):
+            key = payload['sourceJobId']
+            self.jobs[key] = dict(payload, id=key, notes=[], profile={'cv': 'RESUME_SENTINEL'},
+                                  private_key='CREDENTIAL_SENTINEL', reasoning='PROMPT_SENTINEL')
+            return {'id': key}
+        def get_job(self, key):
+            return self.jobs[key]
+    class Automation(JobSearchAutomation):
+        def __init__(self, gateway, **kwargs):
+            if enabled:
+                assert callable(kwargs['intelligence_resolver_factory'])
+            def score(key, path):
+                gateway.jobs[key]['notes'] = [{'body': '[AI_JOB_SCORE_V1]\n' + json.dumps({
+                    'score': 91, 'recommendation': 'APPLY', 'strengths': [], 'gaps': []})}]
+            super().__init__(gateway, scorer=score, notifier=messages.append, **kwargs)
+        def run(self, **kwargs):
+            result = super().run(**kwargs)
+            runs.append(result)
+            return result
+    real_search = public_search.BravePublicSearchAdapter
+    def respond(request):
+        requests.append(request)
+        assert 'RESUME_SENTINEL' not in str(request.url)
+        return httpx.Response(200, json={'web': {'results': [{'title': 'Engineer',
+            'url': f'https://jobs.lever.co/acme/{len(requests)}', 'description': 'untrusted lead'}]}})
+    def search_factory(config):
+        constructed.append('search')
+        return real_search(config, transport=httpx.MockTransport(respond))
+    class Fetch:
+        def __init__(self):
+            constructed.append('fetch')
+        def fetch(self, url):
+            fetches.append(url)
+            now = datetime.now(timezone.utc).isoformat()
+            if url == 'https://acme.example/careers':
+                text = '<a href="https://jobs.lever.co/acme">Careers</a>'
+            else:
+                text = '<script type="application/ld+json">' + json.dumps({
+                    '@type': 'JobPosting', 'title': 'Engineer',
+                    'hiringOrganization': {'name': 'Acme'},
+                    'jobLocation': {'address': {'addressLocality': 'Austin'}},
+                    'sameAs': 'https://source.example/0', 'validThrough': '2099-01-01'}) + f'</script><a href="/acme/{len(requests)}/apply">Apply now</a>'
+            return public_http.FetchResult('ok', url, now, 'text/html', text)
+    monkeypatch.setattr(public_search, 'BravePublicSearchAdapter', search_factory)
+    monkeypatch.setattr(public_http, 'PublicFetcher', Fetch)
+    monkeypatch.setattr(module, 'JobTrailHTTPClient', Gateway)
+    monkeypatch.setattr(module, 'JobSearchAutomation', Automation)
+    monkeypatch.setattr(module, '_build_seen_cache', lambda args: None)
+    delivered = []
+    from jobtrail_ai_scorer.n8n_outbound import N8nOutboundAdapter
+    monkeypatch.setattr(module, 'record_run', lambda *a, **k: None)
+    monkeypatch.setattr(module, 'record_delivery', lambda *a, **k: None)
+    monkeypatch.setattr(module, 'N8nOutboundAdapter', lambda config: N8nOutboundAdapter(
+        config,
+        transport=httpx.MockTransport(lambda request: (delivered.append(json.loads(request.content)) or httpx.Response(202)))))
+    assert module.main() == 0
+    assert len(delivered) == 1
+    assert delivered[0]['schema_version'] == (2 if enabled else 1)
+    if enabled:
+        assert len(delivered[0]['opportunities']) == 3
+        assert delivered[0]['opportunities'][0]['status'] == 'verified'
+        assert delivered[0]['opportunities'][0]['original_url'] == 'https://source.example/0'
+    else:
+        assert 'opportunities' not in delivered[0]
+    assert len(runs[0].opportunities) == 3
+    assert runs[0].selected == runs[0].opportunities[0]
+    assert runs[0].scored == 4 and len(messages) == 1
+    if enabled:
+        assert constructed == ['search', 'fetch']
+        assert len(requests) == 3 and len(fetches) <= 6
+        assert runs[0].intelligence[0].status == 'verified'
+        assert 'Official (verified)' in messages[0]
+        assert 'Original: https://source.example/0' in messages[0]
+        assert 'Candidate (unverified)' in messages[0]
+        assert not any(s in messages[0] for s in ('RESUME_SENTINEL', 'PROMPT_SENTINEL', 'CREDENTIAL_SENTINEL'))
+    else:
+        assert constructed == requests == fetches == []
+        assert runs[0].intelligence == ()
+        assert 'Public information' not in messages[0]
+
+
+@pytest.mark.parametrize('enabled', [False, True])
+def test_enrichment_budget_starts_after_slow_scoring_and_is_shared(monkeypatch, enabled):
+    import json
+    from jobtrail_ai_scorer.automation import AutomationConfig, JobSearchAutomation
+    from jobtrail_ai_scorer import public_http, public_search, opportunity_intelligence
+    module = _load_module()
+    monkeypatch.setattr(module.os, 'environ', {})
+    clock = [0.0]
+    created, deadlines, dns_calls, statuses = [], [], [], []
+    real_fetcher = public_http.PublicFetcher
+
+    def dns(host, timeout):
+        dns_calls.append(clock[0])
+        clock[0] += 50
+        raise TimeoutError()
+
+    def fetch_factory():
+        created.append(clock[0])
+        return real_fetcher(clock=lambda: clock[0], resolver=dns)
+
+    class Resolver:
+        def __init__(self, search, fetch):
+            self.fetch = fetch
+        def resolve(self, job, context, **kwargs):
+            deadlines.append(self.fetch._deadline)
+            statuses.append(self.fetch.fetch(job.original_url).status)
+            return opportunity_intelligence.OpportunityResult('unavailable', job.original_url)
+
+    class Gateway:
+        def __init__(self):
+            self.jobs = {}
+        def search(self, payload):
+            return [{'site': 'indeed', 'id': str(i), 'title': 'Engineer', 'company': 'Acme',
+                     'location': 'Remote', 'job_url': f'https://source.example/{i}'} for i in range(3)]
+        def import_job(self, payload):
+            key = payload['sourceJobId']
+            self.jobs[key] = dict(payload, id=key)
+            return {'id': key}
+        def get_job(self, key):
+            return self.jobs[key]
+
+    gateway = Gateway()
+    def score(key, path):
+        clock[0] += 40
+        gateway.jobs[key]['notes'] = [{'body': '[AI_JOB_SCORE_V1]\n' + json.dumps({
+            'score': 91, 'recommendation': 'APPLY', 'strengths': [], 'gaps': []})}]
+
+    monkeypatch.setattr(public_http, 'PublicFetcher', fetch_factory)
+    monkeypatch.setattr(public_search, 'BravePublicSearchAdapter', lambda config: object())
+    monkeypatch.setattr(opportunity_intelligence, 'OpportunityIntelligence', Resolver)
+    class Guard(dict):
+        def get(self, key, default=None):
+            if key == 'BRAVE_SEARCH_API_KEY':
+                assert enabled and clock[0] >= 120
+            return super().get(key, default)
+    kwargs = module._build_intelligence(Guard(OPPORTUNITY_INTELLIGENCE_ENABLED='true'))
+    runner = JobSearchAutomation(gateway, scorer=score, **kwargs)
+    config = AutomationConfig(scorer_config_path='synthetic', locations=('Remote',),
+                              opportunity_intelligence_enabled=enabled)
+    result = runner.run(config=config)
+    assert result.scored == 3
+    if not enabled:
+        assert result.intelligence == ()
+        assert created == deadlines == dns_calls == statuses == []
+        return
+    assert len(result.intelligence) == 3
+    assert created == [120.0]
+    assert deadlines == [210.0] * 3
+    assert dns_calls == [120.0, 170.0]
+    assert statuses == ['timed_out'] * 3
+    # Reusing the automation object must not reuse the previous run's stack.
+    runner.run(config=config)
+    assert created == [120.0, 340.0]
+    assert deadlines == [210.0] * 3 + [430.0] * 3
+    assert dns_calls == [120.0, 170.0, 340.0, 390.0]
+
+
 ROOT = Path(__file__).resolve().parents[1]
 LAUNCHER = ROOT / "scripts" / "automated-job-search.example.py"
 

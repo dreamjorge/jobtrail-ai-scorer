@@ -270,6 +270,13 @@ class AutomationConfig:
         def truthy(key: str, default: str = "0") -> bool:
             return e.get(key, default).strip().lower() in {"1", "true", "yes", "on"}
 
+        def _parse_bool_flag(key: str) -> bool:
+            """Strict allowlist parse; raises ValueError for unknown strings (same as PublicSearchConfig)."""
+            flag = e.get(key, "0").strip().lower()
+            if flag not in {"1", "true", "yes", "on", "0", "false", "no", "off"}:
+                raise ValueError(f"{key} must be 0/1/true/false/yes/no/on/off")
+            return flag in {"1", "true", "yes", "on"}
+
         def _coerce_int(key: str, default: int) -> int:
             raw = e.get(key)
             if raw is None or raw == "":
@@ -328,7 +335,7 @@ class AutomationConfig:
             breaker_state_path=e.get("BREAKER_STATE_PATH", "").strip(),
             n8n=N8nConfig.from_env(e),
             feedback_actions_enabled=truthy("N8N_FEEDBACK_ACTIONS_ENABLED"),
-            opportunity_intelligence_enabled=truthy("OPPORTUNITY_INTELLIGENCE_ENABLED"),
+            opportunity_intelligence_enabled=_parse_bool_flag("OPPORTUNITY_INTELLIGENCE_ENABLED"),
         )
 
 
@@ -1406,13 +1413,14 @@ class JobTrailAutomation:
             base_url=self.base_url,
             run_id=run_id,
         )
-        if notification_body is not None and best and config.opportunity_intelligence_enabled:
-            from .opportunity_cards import serialize_cards, render_cards
-            try:
-                public_body = render_cards(serialize_cards(card_inputs))
-            except Exception:
-                public_body = "Public information: unavailable"
-            notification_body += "\n\n" + public_body
+        if notification_body is not None and config.opportunity_intelligence_enabled:
+            if (config.notify_enabled and best) or (config.notify_on_failure and failures):
+                from .opportunity_cards import serialize_cards, render_cards
+                try:
+                    public_body = render_cards(serialize_cards(card_inputs))
+                except Exception:
+                    public_body = "Public information: unavailable"
+                notification_body += "\n\n" + public_body
         notification_sent = False
         if notification_body is not None:
             try:

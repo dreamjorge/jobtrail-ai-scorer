@@ -244,6 +244,8 @@ def build_envelope(
     cards = validated_cards(opportunities) if opportunities is not None else None
     version = 2 if cards else 1
     safe_selected = _selected_summary(selected)
+    if cards and (not safe_selected or not any(v is not None for v in safe_selected.values())):
+        safe_selected = None
     if cards and safe_selected:
         # Preserve the selected compatibility summary, not CV-match evidence.
         safe_selected = {key: value for key, value in safe_selected.items()
