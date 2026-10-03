@@ -25,6 +25,59 @@ requirements. The legacy score threshold and stable discovery-order ties remain.
 `build_shortlist` returns at most three eligible entries in production and simulation.
 Selected compatibility and default notification behavior remain unchanged.
 
+This snapshot supports injected resolvers/factories; the canonical launcher
+is not yet wired. References below describe the forthcoming launcher contract.
+
+## Optional public opportunity intelligence
+
+Direct automation callers enable public enrichment only with
+`OPPORTUNITY_INTELLIGENCE_ENABLED=true`; it is off by default. Disabled and
+`--automation-dry-run` paths do not construct the public search/fetch/resolver
+stack or read `BRAVE_SEARCH_API_KEY`. Enabled real runs lazily construct one
+stack after collection/scoring, only when there are shortlisted opportunities.
+The factory reads search credentials at that point. Its fetcher's 90-second
+monotonic deadline starts then and is shared across all three opportunities;
+it is never reset per opportunity or reused across runs. Direct resolver
+injection remains supported (the caller owns that resolver's lifetime).
+Enabled real runs use this single stack and
+resolve at most three eligible shortlisted matches before composing WhatsApp.
+Search/import/scoring, local journal authority, and selected compatibility remain.
+n8n continues using its existing v1 contract; public-card v2 is forthcoming. There is no additional scheduler.
+
+Configure `BRAVE_SEARCH_API_KEY` only in operator-controlled runtime settings.
+Missing credentials yield `provider unconfigured` without public HTTP calls.
+Enrichment errors never suppress a match notification: enabled notifications
+append bounded public cards or a concise unavailable status. Default-off and
+no-match notifications retain their existing text. Cards retain the original
+source link, label uncertain candidates explicitly unverified, and expose an
+additional official link only when T4 verifies the listing. Claims are
+extractive, attributed **company reported**, and include retrieval timestamps;
+search snippets are not evidence. Cards never include score reasoning,
+descriptions, CVs or profiles.
+
+Optional `OPPORTUNITY_EMPLOYER_CONTEXTS_JSON` is a JSON array of at most ten
+operator-asserted public employer anchors (at most 16 KiB UTF-8). Each entry has
+exactly `company`, `hosts` (one to five exact hostnames), `careers_url`, and
+`provenance`. Provenance has exactly `url`, `excerpt`, `checked_at` (timezone-aware
+ISO datetime), and `kind` (`user_confirmed` or `public_citation`). Example with
+synthetic public identifiers:
+
+```json
+[{"company":"Acme","hosts":["acme.example"],"careers_url":"https://acme.example/careers","provenance":{"url":"https://acme.example/careers","excerpt":"Operator confirmed employer careers page","checked_at":"2026-06-01T00:00:00+00:00","kind":"user_confirmed"}}]
+```
+
+These anchors are assertions of domain trust by the operator, **never generated
+from Brave results**. Unknown keys, duplicate employers, unsafe URLs, invalid
+provenance and oversized configuration fail safely with generic
+`invalid configuration` status; configuration values are not printed in
+errors. Absent anchors leave discovered candidates unverified. Generic ATS
+provider hosts cannot be employer anchors. Public proof URLs reject embedded
+credentials and secret query parameters. Existing search/fetch per-run budgets
+remain enforced by their adapters, and fetch failures do not prove closure.
+No live/provider validation or deployment is implied. Independent local
+verification of these snapshots is pending; live API setup, production activation and consumer
+migration remain separate operator decisions.
+
 ## Backend URL resolution
 
 The systemd service must reach the JobTrail backend. Instead of baking a private
