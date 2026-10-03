@@ -232,11 +232,68 @@ DNS, destination requests or Brave requests were performed.
 
 ## Public opportunity evidence
 
-This snapshot provides the public identity, citation, explicit employer trust
-anchor, result/brief and transport protocol models only. No evidence resolution
-or runtime enrichment is available yet. Source identifiers must be public,
-requisitions explicitly namespaced and employer authority operator-asserted.
-Generic ATS hosts cannot serve as employer trust anchors.
+`jobtrail_ai_scorer.opportunity_intelligence.OpportunityIntelligence` combines
+injected public search and fetch boundaries. The resolver is available through direct API injection only in this snapshot.
+Canonical automation, cards and n8n wiring are later slices.
+Offline simulation remains network-free. Live provider validation, production
+activation and n8n consumer migration have not been performed.
+
+Create one resolver, search adapter and public fetcher per sequential run;
+retain their shared quotas across calls. The resolver accepts at most **three
+public opportunities/cards per run**, not three attempts per candidate, and
+extracts at most **three company-reported claims per brief**. It does not
+implement notification-card serialization. Disabled and dry-run resolution
+perform zero search/fetch calls. Pass only approved public company, title,
+location and identifiers, never private descriptions, CV/profile or score notes.
+
+Verification requires an explicit `TrustedEmployerContext`: exact employer
+hosts, a careers URL on those hosts, and public-citation or user-confirmed
+provenance. Current source adapters do not supply that trusted anchor. Search
+rank, an ATS tenant name, HTTP 200 and self-claimed Organization metadata cannot
+bootstrap employer authority. Without the anchor, candidates stay `unverified`.
+A freshly fetched careers page must contain a literal link to the exact employer
+listing or a supported Lever/Greenhouse tenant. Redirects must retain the host
+and tenant and independently satisfy careers delegation.
+
+A bounded JobPosting record must corroborate company, title, exact location
+(including remote restrictions), and an explicitly namespaced employer
+requisition or an exact normalized reference to the original source URL.
+Unknown or insufficient identity remains `unverified`. The original aggregator
+URL is always retained separately; it is never silently replaced. Source
+references compare normalized host case/default port/fragments, but their
+identity citations quote the actual bounded raw matching page field. If that
+field is not a literal substring of fetched text, it cannot become a synthetic
+quotation and resolution fails closed.
+
+All fetched JobPosting records are checked **before matching filters** for
+conflicting evidence sharing a listing URL or namespaced requisition. Contradictory
+company/title/location/remote/identifier/reference/date evidence returns
+`ambiguous` with reason `conflicting_vacancy_evidence`, no official URL and no
+chosen vacancy citations. This is intentionally conservative, including missing
+versus present core fields; optional descriptions are not identity. Different
+plausible listings/requisitions remain separately ambiguous with reason
+`multiple_plausible_vacancies`. Verification never merges conflicting copies.
+An explicit parseable future `validThrough`, nonfuture consistent `datePosted`
+when supplied, and a literal same-host listing-specific Apply link are required
+for `verified`. Expired corroborated evidence can return `closed`. Fetch failure
+(including undifferentiated 404/410), bounded empty search or unsupported page
+structure cannot prove closure or vacancy nonexistence. Partial fetch/quota
+failure prevents claiming a unique verified match.
+
+Company briefs extract only supported Organization fields from the trusted
+careers page, omitting conflicting/unsupported fields instead of padding them.
+Claims carry `company_reported` attribution, source URL, extracted excerpt and
+retrieval timestamp. They do not infer culture or hiring probability. Evidence
+parsing is bounded HTML links and LD+JSON/JSON, not browser execution, arbitrary
+HTML fact extraction or instruction following. Citations record fresh retrieval,
+not an assurance that company statements are independently true.
+
+Verification uses synthetic fixtures and injected transports/clocks only; no
+live provider, DNS or destination validation was performed. The repair
+regressions have observed RED/GREEN evidence, but initial T4 writer provenance
+is unknown: no full-source strict-TDD claim is made. Canonical code integration is forthcoming; production activation and live
+consumer migration remain unvalidated. No automatic application, deployment or publication
+has been performed.
 
 ## Optional Adzuna source
 
