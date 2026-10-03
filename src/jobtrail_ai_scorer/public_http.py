@@ -62,8 +62,12 @@ class FetchResult:
 
 def _public_ip(value):
     address = ipaddress.ip_address(value)
-    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped:
-        address = address.ipv4_mapped
+    if isinstance(address, ipaddress.IPv6Address):
+        if address.ipv4_mapped:
+            address = address.ipv4_mapped
+        elif address.packed[0] == 0xfe and (address.packed[1] & 0xc0) == 0xc0:
+            # Python reports fec0::/10 (site-local, deprecated) as is_global=True.
+            raise ValueError("blocked address")
     if (not address.is_global or address.is_multicast or address.is_reserved
             or address.is_unspecified or address.is_loopback or address.is_link_local):
         raise ValueError("blocked address")
