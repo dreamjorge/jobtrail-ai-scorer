@@ -398,7 +398,7 @@ def _activity(record, page, url, now):
 def _apply_link(page, url):
     for href, label in page.links:
         target = _url(urljoin(url, href))
-        if (target and len(href) <= 1000 and _host(target) == _host(url)
+        if (href is not None and target and len(href) <= 1000 and _host(target) == _host(url)
                 and urlsplit(target).path.rstrip('/') == urlsplit(url).path.rstrip('/') + '/apply'
                 and re.search(r'\bapply\b', label, re.I)):
             return href
