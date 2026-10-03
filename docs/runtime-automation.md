@@ -104,9 +104,10 @@ The final launcher output includes `profile_counts` with `searched`, `imported`,
 
 ## Public opportunity search
 
-Only the public request/config/result contracts and syntactic URL filter are
-available in this snapshot. No runtime wiring, search or destination fetching
-is present. Adapter construction and provider calls are a later slice.
+`jobtrail_ai_scorer.public_search.BravePublicSearchAdapter` provides opt-in
+Brave discovery through direct API injection only in this snapshot. The canonical
+launcher remains unchanged. No result destination is fetched by this adapter;
+DNS/fetch safety and evidence resolution are later boundaries.
 
 `PublicSearchConfig` defaults to `enabled=False`, no API key and a five-second
 HTTP timeout (finite, positive, at most 30 seconds). `from_env` accepts an
@@ -131,6 +132,32 @@ existing forbidden markers, controls and query-injection punctuation are
 rejected. The deterministic query quotes each field and appends `jobs` (at most
 493 characters). This defense does not prove that arbitrary caller-supplied text
 is public: callers still own the public-field boundary.
+
+Each **new adapter per run** has a shared budget of three attempts and ten
+unique candidate URLs. Each query makes one GET to the fixed
+`https://api.search.brave.com/res/v1/web/search` endpoint with
+`X-Subscription-Token`, requesting five results. There are no retries,
+pagination, dynamic endpoints or caching. Only the first five result members
+are inspected. Disabled and `dry_run=True` calls make zero HTTP attempts.
+Clients disable ambient proxy configuration and redirects; a fresh client per
+query prevents response cookies being reused. Response bodies are limited to
+256 KiB before JSON parsing; compressed responses are rejected.
+
+Statuses distinguish `found`, successful empty `not_found`, discarded or
+duplicate-only `untrusted`, `provider_error` (terminal 4xx), `quota_exceeded`
+(429), `timeout`, `unavailable` (transport/5xx), `bad_response`,
+`oversized_response`, `budget_exhausted`, and the three no-network gates
+`disabled`, `dry_run`, `provider_unconfigured`. Failures return labels only,
+never raw provider errors/bodies or keys. Malformed results are discarded.
+
+Returned title/description snippets are **unverified leads** (`verified=False`)
+with a source URL, not cited company claims or ownership/job-identity evidence.
+HTTPS URL filtering rejects credentials, obvious local/private literal hosts,
+nonstandard ports and unknown/malformed URL forms. It does not resolve DNS,
+prove public destination addresses, or protect a later fetch against rebinding;
+those checks belong to the separate public-fetching slice before any destination
+is contacted. Mocked tests exercise synthetic requests and bodies only; no live
+provider validation has been performed.
 
 ## Optional Adzuna source
 
