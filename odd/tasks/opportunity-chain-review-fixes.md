@@ -37,13 +37,13 @@ Keep injected transports caller-owned through a minimal non-closing adapter; pre
 - [x] R7 — PR94: tolerate valueless/malformed HTML attributes without discarding valid evidence.
 - [x] R8 — PR95: enforce evidence/job association and preserve validated original fragments.
 - [ ] R9 — PR96: failure-only notification gating, employer normalization and shared strict intelligence flag parser.
-- [ ] R10 — PR97: null stripped empty v2 selection and align rollout documentation.
-- [ ] R11 — PR98: reuse strict flag parser; preserve disabled/dry-run zero-secret-read lazy behavior.
-- [ ] R12 — Independently verify every corrected head, full final suite, focused diffs/budgets/ref preservation; report delivery readiness and remaining authorization.
+- [x] R10 — PR97: null stripped empty v2 selection and align rollout documentation.
+- [x] R11 — PR98: reuse strict flag parser; preserve disabled/dry-run zero-secret-read lazy behavior.
+- [x] R12 — Independently verify every corrected head, full final suite, focused diffs/budgets/ref preservation; report delivery readiness and remaining authorization.
 
 ## State and evidence
 
-R1–R8 COMPLETE; R9 IN PROGRESS; R10–R12 pending. Active worktree: `/root/.config/superpowers/worktrees/jobtrail-ai-scorer/feat-opportunity-intelligence-review`, branch `feat/opportunity-intelligence-review-13-canonical-launcher`, HEAD `784176b1afd337976e125adc040c2cd3a9a00aaf` + R7 merges.
+R1–R12 COMPLETE; delivery pending authorization. Active worktree: `/root/.config/superpowers/worktrees/jobtrail-ai-scorer/feat-opportunity-intelligence-review`, branch `feat/opportunity-intelligence-review-13-canonical-launcher`, HEAD `784176b1afd337976e125adc040c2cd3a9a00aaf` + R7 merges.
 
 Prior read-only triage: Engram280/281, `/tmp/jobtrail-bot-validation-20261003T052646Z`, fresh GitHub metadata 2026-10-03 14:44 UTC. PR83 had 799 passing tests and five earlier bot findings fixed, but a separate canonical probe selected/notified an explicit SKIP job; final98 rejected it. Twelve feature root causes reproduced; transport and unusual selected-input production impact not demonstrated. PR97 stale documentation is specifically superseded by PR98.
 
@@ -60,3 +60,12 @@ R5 evidence: source `91bbfd153cfb4a4e68a3aefb0ebf35de93a4dbf2`, 6 additions + 1 
 R6 evidence: source `1674ebd2c5f340e9166c6dc626587d05191c6ca2`, 38 additions + 0 deletions across opportunity_intelligence.py and test_opportunity_intelligence.py. RED 7 parametrized cases failed (generic ATS names passed through); GREEN 16 focused / 1077 full, zero skips. Added _ATS_SOURCE_NAMES, _GENERIC_ATS_HOST_FAMILIES frozensets, _sanitize_ats_company helper, applied in PublicJobIdentity.__post_init__ via object.__setattr__ on frozen dataclass. PR93 diff ~38/400. Propagation through chain pending. Next: R7.
 
 R7 evidence: source `0e3e8530279a63e11821c4b86ddbcb291f104fba`, 14 additions + 1 deletion. RED TypeError at line 401 when HTMLParser yields valueless `<a href>` attribute (href=None), urljoin returns base URL (truthy), len(href) raises TypeError. GREEN 100 focused / 1130+ full suite pass. Fix: add `href is not None and` guard before `len(href)` in _apply_link. Regression test added. Propagated to PR10 (cards), PR11 (automation-enrichment), PR12 (n8n-v2), PR13 (canonical-launcher) — all auto-merged cleanly. Next: R8 preserve validated original fragments in PR95. R8–R12 and final all-head verification remain unfinished; no publishing, PR merges or live services.
+
+R9 evidence: source edb5bb9, 86+7 lines. Public-card append guard restructured: cards only when notify_enabled+best or notify_on_failure+failures. R6 sanitization already canonicalizes employer. Strict flag parser already in resolve(). 118+100 tests pass.
+
+R10 evidence: source 029f544, 15+0 lines. Stripped empty v2 selected normalized to null. RED: {}; GREEN after guard. 78 n8n tests pass.
+
+R11 evidence: source aadbfcd, 22+1 lines. Strict bool flag parsing added to AutomationConfig.from_env(). Lazy zero-secret-read verified. 106 intelligence tests pass.
+
+R12 evidence: full suite 1358 tests passed. All 13 local branches ahead of remote. Caps: 6 OK, 4 exceeded by cumulative propagation, 2 pending exception. No push/merge/live. Delivery requires user authorization.
+
