@@ -6,6 +6,10 @@ from jobtrail_ai_scorer.automation import AutomationConfig, AutomationRun, JobSe
 from jobtrail_ai_scorer.opportunity_intelligence import PublicJobIdentity, OpportunityResult
 
 
+def test_config_is_opt_in_and_positional_result_compatible():
+    assert not AutomationConfig.from_env({}).opportunity_intelligence_enabled
+    assert AutomationConfig.from_env({'OPPORTUNITY_INTELLIGENCE_ENABLED': 'true'}).opportunity_intelligence_enabled
+    assert AutomationRun(1, 2, 3, (), {'title': 'old'}).intelligence == ()
 
 
 def test_public_cards_bound_and_separate_links():
@@ -37,6 +41,34 @@ def test_cards_reject_unsafe_proof(url):
     assert 'official_url' not in card
 
 
+def test_enabled_run_projects_public_fields_and_survives_failure(monkeypatch):
+    import jobtrail_ai_scorer.automation as automation
+    monkeypatch.setattr(automation.os, 'environ', {})
+    class Gateway:
+        def search(self, payload):
+            return [{'site': 'indeed', 'id': '1', 'title': 'Engineer', 'company': 'Acme', 'location': 'Remote', 'job_url': 'https://source.test/1'}]
+        def import_job(self, payload):
+            self.job = dict(payload, id='1', profile={'cv': 'PRIVATE_SENTINEL'}, reasoning='PRIVATE_SENTINEL')
+            return {'id': '1'}
+        def get_job(self, job_id):
+            return self.job
+    gateway = Gateway()
+    def score(*args):
+        gateway.job['notes'] = [{'body': '[AI_JOB_SCORE_V1]\n' + json.dumps({'score': 91, 'recommendation': 'APPLY', 'strengths': [], 'gaps': []})}]
+    calls = []
+    class Resolver:
+        def resolve(self, job, context=None, **kwargs):
+            calls.append(job)
+            assert type(job) is PublicJobIdentity
+            assert 'PRIVATE_SENTINEL' not in repr(job)
+            raise ValueError('SECRET_DIAGNOSTIC')
+    messages = []
+    result = JobSearchAutomation(gateway, scorer=score, notifier=messages.append, intelligence_resolver=Resolver()).run(config=AutomationConfig(scorer_config_path='synthetic', locations=('Remote',), notify_enabled=True, opportunity_intelligence_enabled=True))
+    assert len(calls) == 1
+    assert result.selected and not result.failures
+    assert result.intelligence[0].status == 'unavailable'
+    assert 'Public information' in messages[0]
+    assert 'SECRET_DIAGNOSTIC' not in messages[0]
 
 
 @pytest.mark.parametrize('card', [
@@ -71,6 +103,24 @@ def test_context_closed_schema_and_bounds():
             parse_employer_contexts(json.dumps(payload))
 
 
+@pytest.mark.parametrize('enabled', [False, True])
+def test_no_match_message_exact_and_resolver_not_called(monkeypatch, enabled):
+    import jobtrail_ai_scorer.automation as automation
+    monkeypatch.setattr(automation.os, 'environ', {})
+    class Gateway:
+        def search(self, payload):
+            return []
+    class Resolver:
+        def resolve(self, *args, **kwargs):
+            pytest.fail('empty run resolved')
+    messages = []
+    def factory():
+        pytest.fail('empty run constructed intelligence')
+    result = JobSearchAutomation(Gateway(), notifier=messages.append, intelligence_resolver_factory=factory).run(
+        config=AutomationConfig(scorer_config_path='synthetic', locations=('Remote',),
+                                notify_enabled=True, opportunity_intelligence_enabled=enabled))
+    assert result.intelligence == ()
+    assert messages == ['JobTrail — sin coincidencias\nBuscadas: 0\nPuntuadas: 0\nUmbral: 80\nNo hubo ofertas que calificaran.']
 
 
 def test_cards_omit_forbidden_claims_and_nested_payloads():
@@ -178,3 +228,13 @@ def test_cards_preserve_supported_quotes_with_safe_inline_public_urls():
     assert cards[0]['claims'][0]['value'] == value
     assert excerpt in render_cards(cards)
     assert value in render_cards(cards)
+
+
+def test_simulation_never_resolves():
+    class Resolver:
+        def resolve(self, *args, **kwargs):
+            pytest.fail('simulation resolved')
+    def factory():
+        pytest.fail('simulation constructed intelligence')
+    result = JobSearchAutomation(None, simulation=SimulationScenario('offline'), intelligence_resolver=Resolver(), intelligence_resolver_factory=factory).run(config=AutomationConfig(opportunity_intelligence_enabled=True))
+    assert result.intelligence == ()
