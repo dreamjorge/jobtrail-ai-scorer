@@ -14,6 +14,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import jobtrail_ai_scorer.scoring as scoring
+
 import pytest
 
 from jobtrail_ai_scorer.scoring import parse_score_note
@@ -173,3 +175,91 @@ def test_respects_custom_marker_argument() -> None:
     assert result["score"] == 33
     # Default marker does NOT match.
     assert parse_score_note(notes) is None
+
+
+def _eligible_payload(payload: dict[str, Any], threshold: int = 80) -> Any:
+    helper = getattr(scoring, "eligible_score", None)
+    assert callable(helper), "shared score eligibility policy is missing"
+    return helper(payload, score_threshold=threshold)
+
+
+def _additive_payload() -> dict[str, Any]:
+    return {
+        "score": 99, "fit_score": 80, "coverage_score": 80,
+        "classification": "APPLY", "exclusion_signals": [],
+        "hard_requirements_missing": [],
+    }
+
+
+@pytest.mark.parametrize("patch", [
+    {"classification": "SKIP"}, {"recommendation": " skip "},
+    {"hard_requirements_missing": ["License"]},
+    {"exclusion_signals": ["Excluded employer"]},
+    {"hard_requirements_missing": None}, {"exclusion_signals": True},
+    {"exclusion_signals": "none"}, {"hard_requirements_missing": [1]},
+    {"exclusion_signals": [" "]}, {"hard_requirements_missing": [""]},
+    {"fit_score": True}, {"coverage_score": False},
+    {"fit_score": 80.0}, {"coverage_score": "80"},
+    {"fit_score": -1}, {"coverage_score": 101},
+    {"classification": True}, {"classification": "UNKNOWN"},
+    {"classification": None}, {"recommendation": True},
+])
+def test_eligibility_rejects_unsafe_payload(patch: dict[str, Any]) -> None:
+    assert _eligible_payload({**_additive_payload(), **patch}) is None
+
+
+@pytest.mark.parametrize("fields", [
+    ("exclusion_signals",), ("hard_requirements_missing",),
+    ("exclusion_signals", "hard_requirements_missing"),
+    ("fit_score",), ("coverage_score",),
+])
+def test_eligibility_rejects_partial_additive_payload(fields: tuple[str, ...]) -> None:
+    payload = _additive_payload()
+    for field in fields:
+        payload.pop(field)
+    assert _eligible_payload(payload) is None
+
+
+@pytest.mark.parametrize("marker", [
+    "fit_score", "coverage_score", "classification", "evidence", "exclusion_signals",
+])
+def test_eligibility_rejects_lone_additive_marker(marker: str) -> None:
+    assert _eligible_payload({"score": 99, marker: _additive_payload().get(marker, [])}) is None
+
+
+@pytest.mark.parametrize("fit,coverage,classification", [
+    (80, 80, "APPLY"), (80, 20, "REVIEW"), (20, 80, "EXPLORE"),
+])
+def test_eligibility_derives_class_without_mutating_note(
+    fit: int, coverage: int, classification: str,
+) -> None:
+    payload = _additive_payload()
+    payload.pop("classification")
+    payload.update(fit_score=fit, coverage_score=coverage)
+    normalized = _eligible_payload(payload)
+    assert normalized == {**payload, "classification": classification}
+    assert "classification" not in payload
+    supplied = {**payload, "classification": "APPLY"}
+    assert _eligible_payload(supplied) == {**supplied, "classification": classification}
+    assert supplied["classification"] == "APPLY"
+
+
+@pytest.mark.parametrize("payload", [
+    {"score": 99, "fit_score": 20, "coverage_score": 20,
+     "exclusion_signals": [], "hard_requirements_missing": []},
+    {"score": 79}, {"score": True}, {"score": 101}, {"score": "99"},
+    {"score": 99, "recommendation": "SKIP"},
+    {"score": 99, "hard_requirements_missing": ["License"]},
+])
+def test_eligibility_keeps_threshold_and_legacy_vetoes(payload: dict[str, Any]) -> None:
+    assert _eligible_payload(payload) is None
+
+
+@pytest.mark.parametrize("payload", [
+    {"score": 80}, {"score": 99, "recommendation": "PRIORITY_APPLY"},
+    {"score": 91, "hard_requirements_missing": [], "strengths": ["Python"]},
+])
+def test_eligibility_preserves_legacy_payload(payload: dict[str, Any]) -> None:
+    normalized = _eligible_payload(payload)
+    assert normalized == payload
+    assert normalized is not payload
