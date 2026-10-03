@@ -75,6 +75,19 @@ class Citation:
             raise ValueError('invalid public citation')
 
 
+_ATS_SOURCE_NAMES = frozenset({"lever", "greenhouse", "workday", "ashby", "bamboohr", "workable", "smartrecruiters"})
+_GENERIC_ATS_HOST_FAMILIES = frozenset({"workday", "greenhouse", "lever", "ashby", "bamboohr", "workable", "smartrecruiters"})
+
+
+def _sanitize_ats_company(company, source):
+    if company is None:
+        return None
+    if source and source.lower() in _ATS_SOURCE_NAMES:
+        if company.lower() in _GENERIC_ATS_HOST_FAMILIES:
+            return None
+    return company
+
+
 @dataclass(frozen=True)
 class PublicJobIdentity:
     company: str
@@ -87,10 +100,16 @@ class PublicJobIdentity:
     requisition_namespace: str | None = None
 
     def __post_init__(self):
+        # Validate searchability using original company (search needs a string).
         PublicSearchRequest(self.company, self.title, self.location)
         if (not _url(self.original_url) or not _text(self.source, 80)
                 or not _text(self.source_job_id, 160)):
             raise ValueError('invalid public identity')
+        # Sanitize: generic ATS platform names cannot serve as employer
+        # ownership anchors; strip them to None.
+        _sanitized = _sanitize_ats_company(self.company, self.source)
+        if _sanitized is None:
+            object.__setattr__(self, 'company', None)
         for value in (self.source, self.source_job_id, self.requisition_id, self.requisition_namespace):
             if value is not None and (not _text(value, 160) or not re.fullmatch(r"[\w .,+()'/-]+", value)):
                 raise ValueError('invalid public identifier')

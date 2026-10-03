@@ -16,6 +16,9 @@ LISTING = 'https://jobs.lever.co/acme/123'
 ORIGINAL = 'https://aggregator.example/jobs/77'
 
 
+ATS_FAMILIES = ['workday', 'greenhouse', 'lever', 'ashby', 'bamboohr', 'workable', 'smartrecruiters']
+
+
 def identity(**kwargs):
     fields = dict(company='Acme', title='Engineer', location='Austin',
                   original_url=ORIGINAL, source='aggregator', source_job_id='77',
@@ -37,6 +40,22 @@ def test_public_identity_validation(changes):
     with pytest.raises(ValueError):
         identity(**changes)
 
+
+
+@pytest.mark.parametrize('ats_family', ATS_FAMILIES)
+def test_generic_ats_host_cannot_establish_employer_ownership(ats_family):
+    """Generic ATS platform names cannot establish employer ownership anchors.
+
+    PR93: Generic ATS host families (workday, greenhouse, lever, ashby, bamboohr,
+    workable, smartrecruiters) are not legitimate employer identifiers. When a
+    synthetic job uses an ATS platform name as the company field, it must be
+    sanitized to None at the trust layer so it cannot flow downstream as an
+    employer ownership anchor.
+    """
+    result = identity(company=ats_family, source=ats_family)
+    assert result.company is None, (
+        f"Generic ATS family '{ats_family}' should not establish employer ownership; got {result.company}"
+    )
 
 
 @pytest.mark.parametrize('hosts,careers,anchor', [
