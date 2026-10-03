@@ -503,3 +503,17 @@ def test_valueless_href_in_apply_link():
     class _Page:
         links = [(None, "Apply")]
     assert _apply_link(_Page(), "https://example.com/jobs/123") is None
+
+
+@pytest.mark.parametrize('flag', [
+    'invalid', 'maybe', 'ENABLED', '1.0', 'false1', '',
+])
+def test_automation_config_rejects_invalid_opportunity_flag(flag):
+    """PR98 R11: OPPORTUNITY_INTELLIGENCE_ENABLED must use strict allowlist parsing.
+
+    Consistent with PublicSearchConfig.from_env: invalid flag strings must raise
+    ValueError, not silently coerce to False.
+    """
+    from jobtrail_ai_scorer.automation import AutomationConfig
+    with pytest.raises(ValueError):
+        AutomationConfig.from_env({'OPPORTUNITY_INTELLIGENCE_ENABLED': flag})
