@@ -295,6 +295,12 @@ is unknown: no full-source strict-TDD claim is made. Canonical code integration 
 consumer migration remain unvalidated. No automatic application, deployment or publication
 has been performed.
 
+### Public cards
+
+Typed public projections/results can now be serialized and rendered directly.
+Cards keep original links, never promote candidates to official status, and
+omit unsafe quotes rather than rewriting them. Runtime wiring is forthcoming.
+
 ## Optional Adzuna source
 
 `AdzunaSourceAdapter` is an optional source the automation launcher can
