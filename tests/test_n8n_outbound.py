@@ -642,6 +642,19 @@ def test_v2_builder_denies_empty_oversized_and_unsafe_cards():
                            scored=0, opportunities=cards)
 
 
+def test_empty_selected_normalized_to_null():
+    # Empty selected with v2 (opportunities present) must emit selected=null, not selected={}.
+    cards = _v2_envelope()['opportunities']
+    for selected in ({}, {'title': None, 'score': None}):
+        envelope = build_envelope(
+            run_id='run-1', occurred_at='2026-06-01T00:00:00+00:00',
+            searched=1, imported=1, scored=1, selected=selected,
+            opportunities=cards,
+        )
+        assert envelope['schema_version'] == 2
+        assert envelope['selected'] is None, f"expected null, got {envelope['selected']!r}"
+
+
 def test_canonical_wrapper_exact_v1_and_three_card_cap():
     from jobtrail_ai_scorer.automation import AutomationRun, build_n8n_envelope
     from jobtrail_ai_scorer.opportunity_intelligence import OpportunityResult
