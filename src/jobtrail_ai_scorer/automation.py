@@ -21,6 +21,7 @@ from .discover import (  # noqa: F401  (re-exported on purpose)
 )
 from .retry import RetryPolicy, classify_retryable, retry_call
 from .seen_cache import SeenCache
+from .shortlist import build_shortlist
 from .sources import (
     JobSpySourceAdapter,
     NormalizedJob,
@@ -601,6 +602,7 @@ class AutomationRun:
     envelope: dict[str, Any] | None = None
     notification_sent: bool | None = None
     run_id: str = ""
+    opportunities: tuple[dict[str, Any], ...] = ()
 
 
 def build_n8n_envelope(
@@ -708,6 +710,8 @@ class PlannedOperations:
     best: dict[str, Any] | None
     clock: str
     redacted: bool = True
+    # Internal only: preserve the existing launcher envelope contract.
+    opportunities: tuple[dict[str, Any], ...] = ()
 
     def to_envelope(self) -> dict[str, Any]:
         return _scrub_simulation_value(
@@ -873,7 +877,7 @@ def build_planned_operations(
     forbidden substrings from any value that would leak to the launcher.
     """
 
-    from .scoring import eligible_score, parse_score_note
+    from .scoring import parse_score_note
 
     # Scenario-only dedup: collect every score note for the same identity
     # (source, source_job_id) so we can later resolve to the latest
@@ -896,46 +900,32 @@ def build_planned_operations(
             notes.append(note_body)
 
         jobs_by_identity.setdefault(identity, job)
-    candidates: list[tuple[int, int, tuple[str, str], NormalizedJob]] = []
+    candidates: list[tuple[NormalizedJob, dict[str, Any]]] = []
     max_score = _bounded_score_limit(config.max_score)
     eligible_identities = list(islice(history_by_identity, max_score))
     planned_scores = 0
-    for index, identity in enumerate(eligible_identities):
+    for identity in eligible_identities:
         notes = history_by_identity[identity]
         score = parse_score_note([{"body": body} for body in notes])
         if score is None:
             continue
         planned_scores += 1
-        score = eligible_score(score, score_threshold=config.score_threshold)
-        if score is None:
-            continue
-        candidates.append(
-            (score["score"], -index, identity, jobs_by_identity[identity])
-        )
+        candidates.append((jobs_by_identity[identity], score))
 
-    # Python's sort is stable, so equal scores retain discovery order just
-    # like the production ``score > best`` comparison.
-    candidates.sort(key=lambda item: -item[0])
-    eligible = [
-        (_score, job)
-        for _score, _order, _identity, job in candidates
-        if _score >= config.score_threshold
-    ]
-
-    best: dict[str, Any] | None = None
-    if eligible:
-        score, winner = eligible[0]
-        best = {
-            "title": winner.title or "",
-            "company": winner.company or "",
-            "location": winner.location or "",
-            "score": score,
-            "jobUrl": winner.source_url or "",
-            "sourceJobId": winner.source_job_id or "",
-            "source": winner.source or "",
-        }
-
-    scrubbed_best = _scrub_simulation_value(best) if best is not None else None
+    eligible = build_shortlist(candidates, score_threshold=config.score_threshold)
+    opportunities = tuple(
+        _scrub_simulation_value({
+            "title": job.title or "",
+            "company": job.company or "",
+            "location": job.location or "",
+            "score": score["score"],
+            "jobUrl": job.source_url or "",
+            "sourceJobId": job.source_job_id or "",
+            "source": job.source or "",
+        })
+        for job, score in eligible
+    )
+    scrubbed_best = opportunities[0] if opportunities else None
     return PlannedOperations(
         scenario=scenario.name,
         searched=len(bounded_jobs),
@@ -944,6 +934,7 @@ def build_planned_operations(
         would_notify=bool(scrubbed_best and config.notify_enabled),
         best=scrubbed_best,
         clock=_resolve_simulation_clock(clock_iso),
+        opportunities=opportunities,
     )
 
 
@@ -1142,6 +1133,7 @@ class JobTrailAutomation:
             selected=selected,
             profile_counts={},
             envelope=envelope,
+            opportunities=planned.opportunities,
             run_id=build_run_id(
                 seed=f"simulation:{scenario.name}",
                 clock=lambda: simulation_clock,
@@ -1295,50 +1287,45 @@ class JobTrailAutomation:
                 scored += 1
             except Exception as exc:
                 failures.append(_format_failure("score", exc, job_id=job_id))
-        best = None
-        best_job = None
-        best_score = None
-        best_job_id = None
-        from .scoring import eligible_score
-
+        candidates = []
         for job_id in scored_ids:
             try:
                 job = self.gateway.get_job(job_id)
                 score = parse_score_note(job.get("notes"))
                 if score is not None:
-                    score = eligible_score(score, score_threshold=config.score_threshold)
-                if (
-                    score is not None
-                    and (best is None or score["score"] > best["score"])
-                ):
-                    best = {
-                        "title": job.get("position", job.get("title", "")),
-                        "company": job.get("company", ""),
-                        "location": job.get("location", ""),
-                        "score": score["score"],
-                        "recommendation": score.get("recommendation", ""),
-                        "strengths": score.get("strengths", []),
-                        "gaps": score.get("gaps", []),
-                        "jobUrl": job.get("jobUrl", job.get("job_url", "")),
-                        "source": job.get("source", ""),
-                        "sourceJobId": job.get("sourceJobId", ""),
-                    }
-                    # These additive fields are copied only when the scorer
-                    # supplied them; the outbound boundary clips/redacts them.
-                    for field_name in (
-                        "fit_score", "coverage_score", "classification",
-                        "evidence", "evidence_labels", "gap_labels",
-                    ):
-                        if field_name in score:
-                            best[field_name] = score[field_name]
-                    best_job = job
-                    best_score = score
-                    best_job_id = job_id
+                    candidates.append(((job_id, job), score))
             except Exception as exc:
                 failures.append(_format_failure("read", exc, job_id=job_id))
 
-        if best is not None and best_job_id in profiles_by_job_id:
-            best["searchProfiles"] = list(profiles_by_job_id[best_job_id])
+        shortlist = build_shortlist(candidates, score_threshold=config.score_threshold)
+        opportunities = []
+        for (job_id, job), score in shortlist:
+            opportunity = {
+                "title": job.get("position", job.get("title", "")),
+                "company": job.get("company", ""),
+                "location": job.get("location", ""),
+                "score": score["score"],
+                "recommendation": score.get("recommendation", ""),
+                "strengths": score.get("strengths", []),
+                "gaps": score.get("gaps", []),
+                "jobUrl": job.get("jobUrl", job.get("job_url", "")),
+                "source": job.get("source", ""),
+                "sourceJobId": job.get("sourceJobId", ""),
+            }
+            # Copy only existing additive fields; outbound contracts stay unchanged.
+            for field_name in (
+                "fit_score", "coverage_score", "classification",
+                "evidence", "evidence_labels", "gap_labels",
+            ):
+                if field_name in score:
+                    opportunity[field_name] = score[field_name]
+            if job_id in profiles_by_job_id:
+                opportunity["searchProfiles"] = list(profiles_by_job_id[job_id])
+            opportunities.append(opportunity)
+
+        best = opportunities[0] if opportunities else None
+        best_job = shortlist[0][0][1] if shortlist else None
+        best_score = shortlist[0][1] if shortlist else None
         notification_body = self._compose_notification(
             best=best,
             best_job=best_job,
@@ -1368,6 +1355,7 @@ class JobTrailAutomation:
             profile_counts,
             notification_sent=notification_sent,
             run_id=run_id,
+            opportunities=tuple(opportunities),
         )
         # Step N: record the run outcome on the breaker so it can open
         # after consecutive failures or close after a clean run.

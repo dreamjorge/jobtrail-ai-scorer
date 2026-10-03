@@ -29,7 +29,7 @@ Keep injected transports caller-owned through a minimal non-closing adapter; pre
 ## Tasks
 
 - [x] R1 — PR83: shared eligibility policy and canonical/simulation SKIP exclusion regression tests.
-- [ ] R2 — PR86: delegate shortlist eligibility; reject missing additive safety arrays. Verify PR87 propagation.
+- [x] R2 — PR86: delegate shortlist eligibility; reject missing additive safety arrays. Verify PR87 propagation.
 - [ ] R3 — PR88: reject nested credential-bearing URLs and unsafe fragments.
 - [ ] R4 — PR89: preserve borrowed injected transport lifecycle and fresh-client cookie isolation.
 - [ ] R5 — PR90: shared credential URL boundary and site-local IPv6 rejection. Verify PR91/92 propagation.
@@ -43,8 +43,10 @@ Keep injected transports caller-owned through a minimal non-closing adapter; pre
 
 ## State and evidence
 
-R1 COMPLETE; R2 IN PROGRESS; R3–R12 pending. Active worktree: `/root/.config/superpowers/worktrees/jobtrail-ai-scorer/feat-opportunity-intelligence-review`, branch `feat/job-feedback-balanced-matching`, source commit `3ef307c4cf727fa80c3cfc095efe9486364856f4`.
+R1–R2 COMPLETE; R3 IN PROGRESS; R4–R12 pending. Active worktree: `/root/.config/superpowers/worktrees/jobtrail-ai-scorer/feat-opportunity-intelligence-review`, branch `feat/opportunity-intelligence-review-02-shortlist-orchestration`, merge checkpoint `3b460b7383f7c3f77dd9dd2a69604deee228226c`.
 
 Prior read-only triage: Engram280/281, `/tmp/jobtrail-bot-validation-20261003T052646Z`, fresh GitHub metadata 2026-10-03 14:44 UTC. PR83 had 799 passing tests and five earlier bot findings fixed, but a separate canonical probe selected/notified an explicit SKIP job; final98 rejected it. Twelve feature root causes reproduced; transport and unusual selected-input production impact not demonstrated. PR97 stale documentation is specifically superseded by PR98.
 
-R1 evidence: bootstrap `40b4675`; source `3ef307c4cf727fa80c3cfc095efe9486364856f4`, 248 additions + 5 deletions. Writer observed RED 67 failures before source edits, then GREEN 67 regressions / 253 focused / 866 full, zero skips. Independent full suite: 866 passed; actual legacy/additive writer serialization both eligible. Standalone probe initially imported a stale editable sibling package; process-local `PYTHONPATH=src` and source-file assertion corrected verification only, without environment repair. Native assessment high; inspect stopped at `managed_assets_outdated`, no START/lineage/approval and no harness sync. No publishing or PR merges. Next: propagate R1 through tracker85 to origin86 using normal merges, then delegate R2. Keep subsequent source commits, exact checks, native outcome and focused budgets recorded before checkoff.
+R1 evidence: bootstrap `40b4675`; source `3ef307c4cf727fa80c3cfc095efe9486364856f4`, 248 additions + 5 deletions. Writer observed RED 67 failures before source edits, then GREEN 67 regressions / 253 focused / 866 full, zero skips. Independent full suite: 866 passed; actual legacy/additive writer serialization both eligible. Standalone probe initially imported a stale editable sibling package; process-local `PYTHONPATH=src` and source-file assertion corrected verification only, without environment repair. Native assessment high; inspect stopped at `managed_assets_outdated`, no START/lineage/approval and no harness sync. No publishing or PR merges.
+
+R2 evidence: source `286633cd31bcb08e8d468f3aadd71eff173f3cb0`, 34 additions + 39 deletions. RED 11 unsafe-shortlist assertions; GREEN 42 focused / 908 full, zero skips, independently repeated. PR86 focused diff 236/400. Normal propagation into PR87 conflicted only in automation.py; separately diagnosed and reconciled to shared shortlist orchestration plus pre-filter score counters, with one positive fixture upgraded to complete safe additive metadata. Existing negative fixtures unchanged. Writer and independent checkpoint: 231 focused / 920 full, zero skips; merge `3b460b7383f7c3f77dd9dd2a69604deee228226c`, PR87 focused diff 236/400 before this evidence update. Assessment unassessable, independent high-risk fallback; inspect `managed_assets_outdated`, no native approval/sync. Next: propagate checkpoint to PR88 and perform R3 public URL credential correction. Publishing, all remaining origin fixes and final all-head verification are pending.
