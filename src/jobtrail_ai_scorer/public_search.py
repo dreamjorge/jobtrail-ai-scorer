@@ -143,7 +143,7 @@ def _candidate_url(value: object) -> str | None:
                for k, _ in parse_qsl(parts.query, keep_blank_values=True)):
             return None
         netloc = f"[{host}]" if ":" in host else host
-        return urlunsplit(("https", netloc, parts.path or "/", parts.query, ""))
+        return urlunsplit(("https", netloc, parts.path or "/", parts.query, parts.fragment))
     except ValueError:
         return None
 

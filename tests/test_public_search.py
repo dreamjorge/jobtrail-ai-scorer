@@ -279,3 +279,17 @@ def test_client_security_configuration(monkeypatch):
     assert observed[0]["trust_env"] is False
     assert observed[0]["follow_redirects"] is False
     assert observed[0]["timeout"] == 5.0
+
+
+def test_url_fragment_preserved():
+    # Regression: _candidate_url must not strip URL fragments
+    from jobtrail_ai_scorer.public_search import _candidate_url
+    result = _candidate_url("https://public.example/jobs#section")
+    assert result == "https://public.example/jobs#section"
+
+
+def test_url_fragment_with_path_and_query_preserved():
+    # Regression: fragment preserved alongside path and query
+    from jobtrail_ai_scorer.public_search import _candidate_url
+    result = _candidate_url("https://public.example/jobs?page=2#section")
+    assert result == "https://public.example/jobs?page=2#section"
