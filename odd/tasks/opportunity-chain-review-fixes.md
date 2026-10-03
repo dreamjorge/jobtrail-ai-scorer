@@ -40,10 +40,12 @@ Keep injected transports caller-owned through a minimal non-closing adapter; pre
 - [x] R10 — PR97: null stripped empty v2 selection and align rollout documentation.
 - [x] R11 — PR98: reuse strict flag parser; preserve disabled/dry-run zero-secret-read lazy behavior.
 - [x] R12 — Independently verify every corrected head, full final suite, focused diffs/budgets/ref preservation; report delivery readiness and remaining authorization.
+- [x] R-A — PR90 (origin 05-public-http-guards): block IPv6 fec0::/10 site-local range. codex P1 finding: Python's ipaddress reports fec0::/10 as is_global=True so _public_ip allowed it. Fix: explicit check on first two bytes (0xfe and 0xc0 mask). Propagated through PR91→...→PR98.
+- [x] R-B — PR95 (origin 10-public-cards): verify result.source_url matches job.original_url in serialize_cards. codex P2 finding: misbehaving caller could pass (jobA, resultB) and card would incorrectly associate jobA's identity with resultB's status. Fix: normalization-aware check via _candidate_url. Propagated through PR96→PR97→PR98.
 
 ## State and evidence
 
-R1–R12 COMPLETE; delivery pending authorization. Active worktree: `/root/.config/superpowers/worktrees/jobtrail-ai-scorer/feat-opportunity-intelligence-review`, branch `feat/opportunity-intelligence-review-13-canonical-launcher`, HEAD `784176b1afd337976e125adc040c2cd3a9a00aaf` + R7 merges.
+R1–R12 COMPLETE; delivery pending authorization. Active worktree: `/root/.config/superpowers/worktrees/jobtrail-ai-scorer/feat-opportunity-intelligence-review`, branch `feat/opportunity-intelligence-review-FIX-A-B`, HEAD `a2f3daf` (fix: block IPv6 fec0::/10 and validate source_url in serialize_cards). Canonical-launcher branch updated to `74a27bb` after R-A/B propagation.
 
 Prior read-only triage: Engram280/281, `/tmp/jobtrail-bot-validation-20261003T052646Z`, fresh GitHub metadata 2026-10-03 14:44 UTC. PR83 had 799 passing tests and five earlier bot findings fixed, but a separate canonical probe selected/notified an explicit SKIP job; final98 rejected it. Twelve feature root causes reproduced; transport and unusual selected-input production impact not demonstrated. PR97 stale documentation is specifically superseded by PR98.
 
@@ -68,4 +70,8 @@ R10 evidence: source 029f544, 15+0 lines. Stripped empty v2 selected normalized 
 R11 evidence: source aadbfcd, 22+1 lines. Strict bool flag parsing added to AutomationConfig.from_env(). Lazy zero-secret-read verified. 106 intelligence tests pass.
 
 R12 evidence: full suite 1358 tests passed. All 13 local branches ahead of remote. Caps: 6 OK, 4 exceeded by cumulative propagation, 2 pending exception. No push/merge/live. Delivery requires user authorization.
+
+R-A evidence: codex P1 finding 2026-10-03 on PR90 (05-public-http-guards). Python ipaddress reports fec0::/1 as is_global=True, is_reserved=False, is_link_local=False. _public_ip guard allowed it. Fix: `elif address.packed[0] == 0xfe and (address.packed[1] & 0xc0) == 0xc0: raise ValueError("blocked address")`. RED confirmed: ValueError raised. GREEN confirmed. Suite: 1361 tests (3 new). Propagated to PR91→...→PR98 via cherry-pick/merge. Commits: 6ed5e31 (origin 05) + ad53787, 476d6d8, 13b1162, 196ccee, 618647e, 825b57e, 443a625, 077de53.
+
+R-B evidence: codex P2 finding 2026-10-03 on PR95 (10-public-cards). serialize_cards accepted (jobA, resultB) pairs without verifying result.source_url against job.original_url. Fix: normalization-aware check via _candidate_url. RED confirmed: ValueError raised for mismatched URLs. GREEN confirmed. Suite: 1361 tests. Propagated to PR96→PR97→PR98. Commits: acc3793 (origin 10) + f082862, 16565c4, 74a27bb.
 
