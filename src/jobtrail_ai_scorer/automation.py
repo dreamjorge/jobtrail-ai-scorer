@@ -1406,13 +1406,14 @@ class JobTrailAutomation:
             base_url=self.base_url,
             run_id=run_id,
         )
-        if notification_body is not None and best and config.opportunity_intelligence_enabled:
-            from .opportunity_cards import serialize_cards, render_cards
-            try:
-                public_body = render_cards(serialize_cards(card_inputs))
-            except Exception:
-                public_body = "Public information: unavailable"
-            notification_body += "\n\n" + public_body
+        if notification_body is not None and config.opportunity_intelligence_enabled:
+            if (config.notify_enabled and best) or (config.notify_on_failure and failures):
+                from .opportunity_cards import serialize_cards, render_cards
+                try:
+                    public_body = render_cards(serialize_cards(card_inputs))
+                except Exception:
+                    public_body = "Public information: unavailable"
+                notification_body += "\n\n" + public_body
         notification_sent = False
         if notification_body is not None:
             try:

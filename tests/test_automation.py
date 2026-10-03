@@ -23,6 +23,7 @@ from jobtrail_ai_scorer.automation import (
 )
 from jobtrail_ai_scorer.seen_cache import SeenCache
 from jobtrail_ai_scorer.sources import JobSpySourceAdapter, NormalizedJob
+from jobtrail_ai_scorer.opportunity_intelligence import OpportunityResult
 
 
 class FakeJobTrail:
@@ -2930,3 +2931,80 @@ def test_preflight_healthy_runs_pipeline_with_injected_breaker(tmp_path):
     assert result.failures == ("breaker:open",)
     assert result.imported == 0
     assert result.scored == 0
+
+
+class _FakeIntelligenceResolver:
+    """Minimal resolver that returns a verified result for any identity."""
+    def resolve(self, job, context, *, enabled=False):
+        return OpportunityResult('verified', job.original_url)
+
+
+def test_public_cards_not_appended_when_notify_disabled():
+    """Public cards must not be appended when neither notify_enabled nor notify_on_failure is set,
+    even when opportunity_intelligence_enabled is True and a best match exists."""
+
+    gateway = FakeJobTrail()
+    scorer = FakeScorer()
+    scorer.jobs = gateway.jobs
+
+    notifier = FakeNotifier()
+
+    result = JobSearchAutomation(
+        gateway,
+        scorer=scorer,
+        notifier=notifier,
+        intelligence_resolver=_FakeIntelligenceResolver(),
+    ).run(
+        config=AutomationConfig(
+            scorer_config_path="safe/config.yaml",
+            opportunity_intelligence_enabled=True,
+            notify_enabled=False,
+            notify_on_failure=False,
+        )
+    )
+
+    # A best match exists (score 91 >= threshold 80), so notification_body is not None,
+    # but no notification should be sent because both notify flags are off.
+    assert result.notification_sent is False
+    assert len(notifier.messages) == 0
+    # Sanity: the best match was still scored and selected.
+    assert result.scored == 1
+
+
+def test_public_cards_appended_when_notify_on_failure_with_failures():
+    """Public cards ARE appended when notify_on_failure is True and failures occurred,
+    even if notify_enabled is False."""
+
+    gateway = FakeJobTrail()
+
+    # Force an import failure so the failure summary is triggered.
+    def boom_import(payload):
+        request = httpx.Request("POST", "http://test/import")
+        response = httpx.Response(503, request=request)
+        raise httpx.HTTPStatusError("transient", request=request, response=response)
+
+    gateway.import_job = boom_import
+    scorer = FakeScorer()
+    scorer.jobs = gateway.jobs
+
+    notifier = FakeNotifier()
+
+    result = JobSearchAutomation(
+        gateway,
+        scorer=scorer,
+        notifier=notifier,
+        intelligence_resolver=_FakeIntelligenceResolver(),
+    ).run(
+        config=AutomationConfig(
+            scorer_config_path="safe/config.yaml",
+            opportunity_intelligence_enabled=True,
+            notify_enabled=False,
+            notify_on_failure=True,
+        )
+    )
+
+    # A failure summary notification must be sent.
+    assert result.notification_sent is True
+    assert len(notifier.messages) == 1
+    # The failure summary must include the public cards block.
+    assert "Public information" in notifier.messages[0]
