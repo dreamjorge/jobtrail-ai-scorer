@@ -903,11 +903,13 @@ def build_planned_operations(
     candidates: list[tuple[NormalizedJob, dict[str, Any]]] = []
     max_score = _bounded_score_limit(config.max_score)
     eligible_identities = list(islice(history_by_identity, max_score))
+    planned_scores = 0
     for identity in eligible_identities:
         notes = history_by_identity[identity]
         score = parse_score_note([{"body": body} for body in notes])
         if score is None:
             continue
+        planned_scores += 1
         candidates.append((jobs_by_identity[identity], score))
 
     eligible = build_shortlist(candidates, score_threshold=config.score_threshold)
@@ -928,7 +930,7 @@ def build_planned_operations(
         scenario=scenario.name,
         searched=len(bounded_jobs),
         planned_imports=len(jobs_by_identity),
-        planned_scores=len(candidates),
+        planned_scores=planned_scores,
         would_notify=bool(scrubbed_best and config.notify_enabled),
         best=scrubbed_best,
         clock=_resolve_simulation_clock(clock_iso),
