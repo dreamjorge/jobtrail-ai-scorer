@@ -24,7 +24,7 @@ MAX_RESPONSE_BYTES = 256 * 1024
 # Mirror n8n_outbound's credential-query policy without importing runtime state.
 _SECRET_QUERY_KEYS = frozenset({
     "token", "api_key", "apikey", "access_token", "password", "client_secret",
-    "secret", "app_id", "app_key",
+    "secret", "secretkey", "secret_key", "app_id", "app_key",
 })
 Status = Literal[
     "disabled", "dry_run", "provider_unconfigured", "budget_exhausted",
@@ -109,6 +109,68 @@ class PublicSearchResult:
     leads: tuple[SearchLead, ...] = ()
 
 
+def _url_value(value: str) -> bool:
+    return bool(re.match(r"^(?:https?:|[a-z][a-z0-9+.-]*://|//)", value, re.IGNORECASE))
+
+
+def _decode_component(value: str, *, stop_at_url: bool = False) -> str | None:
+    """At most three decode passes; unresolved escapes are not trusted."""
+    for _ in range(3):
+        if stop_at_url and _url_value(value):
+            return value
+        decoded = unquote(value, errors="strict")
+        if decoded == value:
+            return value
+        value = decoded
+    if stop_at_url and _url_value(value):
+        return value
+    return None if re.search(r"%[0-9a-f]{2}", value, re.IGNORECASE) else value
+
+
+def _credential_fields(value: str, depth: int, *, fragment: bool = False) -> bool:
+    # Inspect fragment URI envelopes without decoding ordinary query boundaries.
+    if fragment or "=" not in value:
+        decoded = _decode_component(value, stop_at_url=True)
+        if decoded is None:
+            return True
+        if fragment and (_url_value(decoded) or decoded.startswith("/")):
+            return _url_credentials(decoded, depth + 1)
+        if "=" not in value:
+            value = decoded
+    if _url_value(value):
+        return _url_credentials(value, depth + 1)
+    if value.startswith("/") and "?" in value:
+        value = value.partition("?")[2]
+    if fragment and "=" not in value:
+        return False
+    for key, item in parse_qsl(value.lstrip("?"), keep_blank_values=True):
+        key = _decode_component(key)
+        if key is None or key.casefold() in _SECRET_QUERY_KEYS:
+            return True
+        item = _decode_component(item, stop_at_url=True)
+        if item is None or (_url_value(item) and _url_credentials(item, depth + 1)):
+            return True
+    return False
+
+
+def _url_credentials(value: str, depth: int = 0) -> bool:
+    """Inspect bounded URL-valued fields without changing the returned URL."""
+    if depth > 4:
+        return True
+    parts = urlsplit(value)
+    if depth and (
+        (not parts.netloc and not value.startswith("/"))
+        or re.search(r"%(?![0-9a-f]{2})", value, re.IGNORECASE)
+    ):
+        return True
+    authority = _decode_component(parts.netloc)
+    if authority is None or urlsplit("//" + authority).username is not None:
+        return True
+    return _credential_fields(parts.query, depth) or _credential_fields(
+        parts.fragment, depth, fragment=True,
+    )
+
+
 def _candidate_url(value: object) -> str | None:
     """Syntactic filtering only. No DNS or destination fetching in this slice."""
     if not isinstance(value, str) or len(value) > 2048:
@@ -139,8 +201,7 @@ def _candidate_url(value: object) -> str | None:
         else:
             if not address.is_global or address.is_multicast or address.is_reserved:
                 return None
-        if any(k.lower() in _SECRET_QUERY_KEYS
-               for k, _ in parse_qsl(parts.query, keep_blank_values=True)):
+        if _url_credentials(value):
             return None
         netloc = f"[{host}]" if ":" in host else host
         return urlunsplit(("https", netloc, parts.path or "/", parts.query, ""))
