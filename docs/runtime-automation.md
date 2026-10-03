@@ -159,6 +159,13 @@ those checks belong to the separate public-fetching slice before any destination
 is contacted. Mocked tests exercise synthetic requests and bodies only; no live
 provider validation has been performed.
 
+## Public HTTPS retrieval
+
+This snapshot exposes FetchConfig/FetchResult, HTTPS URL/address guards and
+bounded DNS resolution only. No fetch or transport API is wired to automation.
+Every numeric address must be public; DNS workers are capped at two and do not
+block process exit. Running libc lookups cannot be cancelled.
+
 ## Optional Adzuna source
 
 `AdzunaSourceAdapter` is an optional source the automation launcher can
