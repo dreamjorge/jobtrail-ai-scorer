@@ -22,7 +22,8 @@ Use these examples to run JobTrail AI Scorer from a local scheduler while keepin
 
 Recommendation eligibility fails closed on SKIP, exclusions and missing hard
 requirements. The legacy score threshold and stable discovery-order ties remain.
-`build_shortlist` returns at most three eligible entries; runtime wiring is separate.
+`build_shortlist` returns at most three eligible entries in production and simulation.
+Selected compatibility and default notification behavior remain unchanged.
 
 ## Backend URL resolution
 

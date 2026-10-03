@@ -97,6 +97,112 @@ def _automation_test_job(source_job_id: str) -> NormalizedJob:
     )
 
 
+@pytest.mark.parametrize("payloads,expected", [
+    ([{"score": 99, "recommendation": "SKIP"}, {"score": 81}], ["1"]),
+    ([{"score": 99, "classification": "SKIP"}], []),
+    ([{"score": 99, "recommendation": "SKIP"}] * 3, []),
+    ([{"score": 99, "hard_requirements_missing": ["license"]}], []),
+    ([{"score": 99, "exclusion_signals": ["excluded"]}], []),
+    ([{"score": 99, "fit_score": 20, "coverage_score": 20,
+       "classification": "APPLY"}], []),
+    ([{"score": 99, "fit_score": "99", "coverage_score": 99}], []),
+    ([{"score": 99, "exclusion_signals": False}], []),
+    ([{"score": n} for n in (80, 91, 91, 90, 79)], ["1", "2", "3"]),
+    ([{"score": 80, "fit_score": 30, "coverage_score": 60,
+       "classification": "APPLY"}], ["0"]),
+    ([{"score": 79, "fit_score": 99, "coverage_score": 99}], []),
+])
+def test_shortlist_production_simulation_parity_and_boundaries(payloads, expected):
+    class Gateway:
+        def __init__(self):
+            self.jobs = {}
+
+        def import_job(self, payload):
+            job_id = payload["sourceJobId"]
+            self.jobs[job_id] = {**payload, "id": job_id}
+            return {"id": job_id}
+
+        def get_job(self, job_id):
+            return self.jobs[job_id]
+
+    jobs = tuple(_automation_test_job(str(i)) for i in range(len(payloads)))
+
+    class Source:
+        name = "synthetic"
+
+        def search(self, request):
+            return jobs
+
+    gateway = Gateway()
+
+    def note(payload):
+        return "[AI_JOB_SCORE_V1]\n" + json.dumps(payload)
+
+    def scorer(job_id, config_path):
+        # A later invalid legacy score must not hide the latest valid note.
+        gateway.jobs[job_id]["notes"] = [
+            {"body": note({"score": 100, "recommendation": "APPLY"})},
+            {"body": note(payloads[int(job_id)])},
+            {"body": note({"score": "invalid"})},
+        ]
+
+    messages = []
+    config = AutomationConfig(
+        scorer_config_path="safe/config.yaml", locations=("remote",),
+        score_threshold=80, max_score=10, notify_enabled=True,
+    )
+    production = automation.JobTrailAutomation(
+        gateway, scorer=scorer, notifier=messages.append, source_adapters=(Source(),)
+    ).run(config=config)
+    assert (production.selected or {}).get("sourceJobId") == (
+        expected[0] if expected else None
+    )
+    assert any("*JobTrail match:" in message for message in messages) == bool(expected)
+    if not expected:
+        assert all("sin coincidencias" in message for message in messages)
+    assert [job["sourceJobId"] for job in production.opportunities] == expected
+    assert production.selected == (production.opportunities[0] if expected else None)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("simulation touched an external boundary")
+
+    class ForbiddenGateway:
+        search = import_job = get_job = forbidden
+
+    class ForbiddenSource:
+        name = "synthetic"
+        search = forbidden
+
+    class ForbiddenCache:
+        transaction = forbidden
+
+    captured = tuple(
+        NormalizedJob(**{**job.__dict__, "metadata": {"score_note": note(payload)}})
+        for job, latest in zip(jobs, payloads)
+        for payload in (
+            {"score": 100, "recommendation": "APPLY"}, latest, {"score": "invalid"},
+        )
+    )
+    simulation = automation.JobTrailAutomation(
+        ForbiddenGateway(), scorer=forbidden, notifier=forbidden,
+        source_adapters=(ForbiddenSource(),), seen_cache=ForbiddenCache(),
+        preflight_runner=forbidden, circuit_breaker=object(),
+        simulation=automation.SimulationScenario("shortlist", captured),
+    ).run(config=config, clock_iso="2026-01-01T00:00:00+00:00")
+    assert [job["sourceJobId"] for job in simulation.opportunities] == expected
+    assert simulation.selected == (simulation.opportunities[0] if expected else None)
+    assert simulation.envelope["would_notify"] == bool(expected)
+    assert simulation.envelope["best"] == simulation.selected
+    assert simulation.imported == simulation.scored == 0
+    assert simulation.failures == ()
+
+
+def test_automation_run_positional_compatibility():
+    run = automation.AutomationRun(1, 2, 3, (), None, {}, None, False, "run")
+    assert run.run_id == "run"
+    assert run.opportunities == ()
+
+
 def test_production_equal_scores_keep_first_input_job():
     class Gateway:
         def __init__(self):
