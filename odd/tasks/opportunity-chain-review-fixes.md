@@ -28,7 +28,7 @@ Keep injected transports caller-owned through a minimal non-closing adapter; pre
 
 ## Tasks
 
-- [ ] R1 — PR83: shared eligibility policy and canonical/simulation SKIP exclusion regression tests.
+- [x] R1 — PR83: shared eligibility policy and canonical/simulation SKIP exclusion regression tests.
 - [ ] R2 — PR86: delegate shortlist eligibility; reject missing additive safety arrays. Verify PR87 propagation.
 - [ ] R3 — PR88: reject nested credential-bearing URLs and unsafe fragments.
 - [ ] R4 — PR89: preserve borrowed injected transport lifecycle and fresh-client cookie isolation.
@@ -43,8 +43,8 @@ Keep injected transports caller-owned through a minimal non-closing adapter; pre
 
 ## State and evidence
 
-R1 IN PROGRESS; R2–R12 pending. No correction source edits yet. Active worktree: `/root/.config/superpowers/worktrees/jobtrail-ai-scorer/feat-opportunity-intelligence-review`, safely switched to `feat/job-feedback-balanced-matching` at `a17c6320a964189b42c38c23176069c32c34b6df`.
+R1 COMPLETE; R2 IN PROGRESS; R3–R12 pending. Active worktree: `/root/.config/superpowers/worktrees/jobtrail-ai-scorer/feat-opportunity-intelligence-review`, branch `feat/job-feedback-balanced-matching`, source commit `3ef307c4cf727fa80c3cfc095efe9486364856f4`.
 
 Prior read-only triage: Engram280/281, `/tmp/jobtrail-bot-validation-20261003T052646Z`, fresh GitHub metadata 2026-10-03 14:44 UTC. PR83 had 799 passing tests and five earlier bot findings fixed, but a separate canonical probe selected/notified an explicit SKIP job; final98 rejected it. Twelve feature root causes reproduced; transport and unusual selected-input production impact not demonstrated. PR97 stale documentation is specifically superseded by PR98.
 
-No new task has been verified, committed, published or merged yet. Native review outcome pending. Next: commit this tracking bootstrap under retained local commit authority, then delegate R1 with exact allowed source/test surfaces and focused verification commands. Record observed RED/GREEN, exact tests, source/evidence commits, propagation checkpoints, native outcome and actual budgets before checking tasks off.
+R1 evidence: bootstrap `40b4675`; source `3ef307c4cf727fa80c3cfc095efe9486364856f4`, 248 additions + 5 deletions. Writer observed RED 67 failures before source edits, then GREEN 67 regressions / 253 focused / 866 full, zero skips. Independent full suite: 866 passed; actual legacy/additive writer serialization both eligible. Standalone probe initially imported a stale editable sibling package; process-local `PYTHONPATH=src` and source-file assertion corrected verification only, without environment repair. Native assessment high; inspect stopped at `managed_assets_outdated`, no START/lineage/approval and no harness sync. No publishing or PR merges. Next: propagate R1 through tracker85 to origin86 using normal merges, then delegate R2. Keep subsequent source commits, exact checks, native outcome and focused budgets recorded before checkoff.
