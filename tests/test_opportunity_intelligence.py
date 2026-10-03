@@ -14,7 +14,7 @@ from jobtrail_ai_scorer.public_http import FetchResult
 NOW = datetime(2026, 6, 1, tzinfo=timezone.utc)
 CAREERS = 'https://acme.example/careers'
 LISTING = 'https://jobs.lever.co/acme/123'
-ORIGINAL = 'https://aggregator.example/jobs/77'
+ORIGINAL = 'https://aggregator.example/jobs/77#public-section'
 
 
 def identity(**kwargs):
@@ -383,7 +383,7 @@ def test_cross_page_requisition_conflict_or_distinct_plausible_vacancies(conflic
 def test_equivalent_normalized_reference_copies_not_conflicting():
     job = identity(requisition_id=None, requisition_namespace=None)
     result = resolve_post([posting(sameAs=ORIGINAL),
-        posting(sameAs='https://AGGREGATOR.example:443/jobs/77#section')], job=job)
+        posting(sameAs='https://AGGREGATOR.example:443/jobs/77#public-section')], job=job)
     assert result.status == 'verified'
 
 
