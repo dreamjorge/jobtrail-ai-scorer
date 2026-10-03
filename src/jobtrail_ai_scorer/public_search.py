@@ -207,3 +207,95 @@ def _candidate_url(value: object) -> str | None:
         return urlunsplit(("https", netloc, parts.path or "/", parts.query, ""))
     except ValueError:
         return None
+
+
+class _BorrowedTransport(httpx.BaseTransport):
+    """Delegate requests while leaving transport closure to the caller."""
+
+    def __init__(self, transport: httpx.BaseTransport) -> None:
+        self._transport = transport
+
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        return self._transport.handle_request(request)
+
+
+class BravePublicSearchAdapter:
+    """Sequential per-run attempt and candidate budgets; no retries or cookies."""
+
+    def __init__(self, config: PublicSearchConfig = PublicSearchConfig(), *,
+                 transport: httpx.BaseTransport | None = None) -> None:
+        self.config = config
+        self._transport = _BorrowedTransport(transport) if transport is not None else None
+        self._attempts = 0
+        self._seen: set[str] = set()
+
+    def search(self, request: PublicSearchRequest, *, dry_run: bool = False) -> PublicSearchResult:
+        if type(request) is not PublicSearchRequest:
+            raise TypeError("expected public search request")
+        if type(dry_run) is not bool:
+            raise ValueError("invalid dry-run flag")
+        if not self.config.enabled:
+            return PublicSearchResult("disabled")
+        if dry_run:
+            return PublicSearchResult("dry_run")
+        if not self.config.api_key:
+            return PublicSearchResult("provider_unconfigured")
+        if self._attempts >= MAX_QUERIES or len(self._seen) >= MAX_CANDIDATES:
+            return PublicSearchResult("budget_exhausted")
+        self._attempts += 1
+        try:
+            # A fresh client per query prevents response cookies becoming ambient auth.
+            with httpx.Client(transport=self._transport, trust_env=False,
+                              follow_redirects=False, timeout=self.config.timeout_seconds) as client:
+                with client.stream("GET", BRAVE_SEARCH_URL,
+                                   params={"q": request.query, "count": MAX_RESULTS},
+                                   headers={"X-Subscription-Token": self.config.api_key,
+                                            "Accept": "application/json", "Accept-Encoding": "identity"}) as response:
+                    if response.status_code == 429:
+                        return PublicSearchResult("quota_exceeded")
+                    if 400 <= response.status_code < 500:
+                        return PublicSearchResult("provider_error")
+                    if response.status_code >= 500:
+                        return PublicSearchResult("unavailable")
+                    if response.status_code != 200:
+                        return PublicSearchResult("bad_response")
+                    # Reject compressed bodies rather than decompressing an unbounded bomb.
+                    if response.headers.get("content-encoding", "identity").lower() != "identity":
+                        return PublicSearchResult("bad_response")
+                    body = bytearray()
+                    for chunk in response.iter_bytes(chunk_size=8192):
+                        if len(body) + len(chunk) > MAX_RESPONSE_BYTES:
+                            return PublicSearchResult("oversized_response")
+                        body.extend(chunk)
+            payload = json.loads(body)
+        except httpx.TimeoutException:
+            return PublicSearchResult("timeout")
+        except httpx.TransportError:
+            return PublicSearchResult("unavailable")
+        except (ValueError, UnicodeError, RecursionError, httpx.DecodingError):
+            return PublicSearchResult("bad_response")
+        if not isinstance(payload, dict) or not isinstance(payload.get("web"), dict):
+            return PublicSearchResult("bad_response")
+        results = payload["web"].get("results")
+        if not isinstance(results, list):
+            return PublicSearchResult("bad_response")
+        if not results:
+            return PublicSearchResult("not_found")
+        leads = []
+        for item in results[:MAX_RESULTS]:
+            if len(self._seen) >= MAX_CANDIDATES:
+                break
+            if not isinstance(item, dict):
+                continue
+            title, snippet = item.get("title"), item.get("description")
+            url = _candidate_url(item.get("url"))
+            if (
+                url is None or not isinstance(title, str) or not title.strip()
+                or not isinstance(snippet, str) or len(title) > 300 or len(snippet) > 2000
+                or any(_forbidden(v) or self.config.api_key in v for v in (title, snippet, url))
+                or url in self._seen
+            ):
+                continue
+            self._seen.add(url)
+            leads.append(SearchLead(title, url, snippet))
+        return PublicSearchResult("found" if leads else "untrusted", tuple(leads))
