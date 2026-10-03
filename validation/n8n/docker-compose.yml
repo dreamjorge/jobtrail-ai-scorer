@@ -1,0 +1,13 @@
+services:
+  n8n-validation:
+    profiles:
+      - n8n-validation
+    image: "${N8N_IMAGE:?N8N_IMAGE must name a reviewed image}"
+    ports:
+      - "127.0.0.1:${N8N_HOST_PORT:-5678}:5678"
+    volumes:
+      - n8n-validation-data:/home/node/.n8n
+
+volumes:
+  n8n-validation-data:
+    driver: local

@@ -17,6 +17,8 @@ discovery and uses the URL verbatim (highest priority).
 """
 
 import argparse
+from datetime import datetime, timezone
+import json
 import os
 import sys
 
@@ -26,13 +28,132 @@ from jobtrail_ai_scorer.automation import (
     DISCOVER_DEFAULT_CONTAINER,
     JobSearchAutomation,
     JobTrailHTTPClient,
+    SimulationScenario,
+    build_n8n_envelope,
+    build_planned_operations,
+    build_run_id,
     merge_resolved_base_url,
     resolve_automation_base_url,
 )
+from jobtrail_ai_scorer.sources import NormalizedJob
+from jobtrail_ai_scorer.n8n_outbound import N8nOutboundAdapter
+from jobtrail_ai_scorer.run_journal import DEFAULT_RUN_JOURNAL_PATH, record_delivery, record_run
 from jobtrail_ai_scorer.seen_cache import DEFAULT_SEEN_CACHE_PATH, SeenCache
 
 
 _TRUTHY = {"1", "true", "yes", "on"}
+_FALSY = {"0", "false", "no", "off"}
+
+
+def _parse_truthy(value: str | None) -> bool | None:
+    """Return a tristate bool for an env-style value.
+
+    ``True``/``False`` reflect the recognised truthy/falsy tokens; ``None``
+    signals an unparseable value so the caller can fail closed without
+    silently accepting the input.
+    """
+
+    if value is None:
+        return None
+    lowered = value.strip().lower()
+    if lowered in _TRUTHY:
+        return True
+    if lowered in _FALSY:
+        return False
+    return None
+
+
+def _resolve_automation_dry_run(args: argparse.Namespace) -> bool | None:
+    """Return whether the automation dry-run is requested, or ``None`` on bad input.
+
+    Precedence: ``--automation-dry-run`` CLI flag >
+    ``JOBTRAIL_AUTOMATION_DRY_RUN`` environment variable. ``False`` means
+    "explicitly disabled", ``True`` means "enabled", ``None`` means
+    "unparseable input; fail closed".
+    """
+
+    if getattr(args, "automation_dry_run", False):
+        return True
+    raw = os.environ.get("JOBTRAIL_AUTOMATION_DRY_RUN")
+    if raw is None or raw.strip() == "":
+        return False
+    return _parse_truthy(raw)
+
+
+def _build_default_scenario() -> SimulationScenario:
+    """Return a deterministic, hermetic scenario for the offline dry-run.
+
+    The launcher never reads the operator profile, CV, environment
+    variables beyond the ones listed in :mod:`scripts.automated-job-search`,
+    or runtime state. The scenario data is hard-coded so every invocation
+    produces the same envelope, which the launcher emits as JSON.
+    """
+
+    from jobtrail_ai_scorer.scoring import CURRENT_MARKER
+
+    def _note(score: int) -> str:
+        body = json.dumps(
+            {
+                "score": score,
+                "recommendation": "APPLY",
+                "strengths": [],
+                "gaps": [],
+                "needs_confirmation": [],
+                "hard_requirements_missing": [],
+                "career_value": "Medium",
+                "reasoning": "dry-run scenario",
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return f"{CURRENT_MARKER}\n{body}"
+
+    def _job(source: str, source_job_id: str, score: int, title: str) -> NormalizedJob:
+        return NormalizedJob(
+            source=source,
+            source_job_id=source_job_id,
+            title=title,
+            company="DryRunCo",
+            description="Synthetic scenario job for offline dry-run.",
+            source_url=f"https://example.test/dry-run/{source_job_id}",
+            location="Remote",
+            metadata={"score_note": _note(score)},
+        )
+
+    return SimulationScenario(
+        name="built-in",
+        jobs=(
+            _job("synthetic", "1", 78, "Backend Engineer"),
+            _job("synthetic", "2", 91, "Senior Backend Engineer"),
+            _job("synthetic", "3", 55, "Junior Engineer"),
+        ),
+    )
+
+
+def _run_automation_dry_run(config: AutomationConfig) -> int:
+    """Run the offline simulation and emit the bounded envelope on stdout.
+
+    The dry-run path never instantiates ``JobTrailHTTPClient``,
+    ``SeenCache`` or the production ``JobSearchAutomation``. The
+    :func:`build_planned_operations` helper produces a deterministic
+    envelope which the launcher serialises as JSON.
+    """
+
+    scenario = _build_default_scenario()
+    planned = build_planned_operations(scenario, config)
+    envelope = planned.to_envelope()
+    summary = {
+        "mode": "automation-dry-run",
+        "searched": envelope["searched"],
+        "planned_imports": envelope["planned_imports"],
+        "planned_scores": envelope["planned_scores"],
+        "would_notify": envelope["would_notify"],
+        "selected": envelope["best"],
+        "envelope": envelope,
+        "failures": [],
+    }
+    print(json.dumps(summary, sort_keys=True))
+    return 0
 
 
 def _resolve_reset_request(args: argparse.Namespace) -> bool:
@@ -69,6 +190,24 @@ def _build_seen_cache(args: argparse.Namespace) -> SeenCache | None:
         except Exception as exc:
             print(f"seen cache reset failed at {cache.path}: {exc}", file=sys.stderr)
     return cache
+
+
+def _record_local_then_deliver(
+    result, config: AutomationConfig, *, base_url_source: str,
+    started_at: datetime | None = None, finished_at: datetime | None = None,
+) -> None:
+    """Persist local outcome before attempting the optional outbound handoff."""
+    started_at = started_at or datetime.now(timezone.utc)
+    finished_at = finished_at or started_at
+    journal_path = os.environ.get("JOBTRAIL_RUN_JOURNAL_PATH", DEFAULT_RUN_JOURNAL_PATH)
+    record_run(journal_path, result, started_at=started_at, finished_at=finished_at, base_url_source=base_url_source)
+    run_id = getattr(result, "run_id", "") or build_run_id(moment=started_at, seed=started_at.isoformat())
+    envelope = build_n8n_envelope(
+        result, occurred_at=finished_at.isoformat(), run_id=run_id,
+        feedback_actions=getattr(config, "feedback_actions_enabled", False),
+    )
+    delivery = N8nOutboundAdapter(config.n8n).send(envelope)
+    record_delivery(journal_path, run_id=run_id, event_id=envelope["event_id"], result=delivery)
 
 
 def main() -> int:
@@ -109,14 +248,37 @@ def main() -> int:
         ),
     )
     parser.add_argument(
-        "--dry-run",
+        "--automation-dry-run",
         action="store_true",
         help=(
-            "Search and score without importing jobs, writing runtime state, "
-            "or sending WhatsApp notifications (overrides JOBTRAIL_AUTOMATION_DRY_RUN)."
+            "Run the offline automation dry-run instead of the production"
+            " pipeline. Uses an in-process SimulationScenario; never touches"
+            " the gateway, the scorer subprocess, the WhatsApp helper or the"
+            " runtime seen cache. Also enabled by JOBTRAIL_AUTOMATION_DRY_RUN."
         ),
     )
     args = parser.parse_args()
+
+    # Offline automation dry-run short-circuit (issue #36). The flag/env
+    # MUST be evaluated before any gateway, cache or production-state
+    # construction so the forbidden boundary is respected. Fail closed
+    # when the env var carries an unrecognised value.
+    dry_run_choice = _resolve_automation_dry_run(args)
+    if dry_run_choice is None:
+        print(
+            "JOBTRAIL_AUTOMATION_DRY_RUN must be one of 1/true/yes/on or 0/false/no/off",
+            file=sys.stderr,
+        )
+        return 2
+    if dry_run_choice:
+        config = AutomationConfig.from_env()
+        print(
+            "automation-dry-run: offline simulation enabled; "
+            "no gateway, scorer or notifier will be invoked",
+            file=sys.stderr,
+        )
+        return _run_automation_dry_run(config)
+
     config = AutomationConfig.from_env()
     if not config.whatsapp_command:
         overrides = {
@@ -124,13 +286,12 @@ def main() -> int:
             "whatsapp_command": "./notify-whatsapp-via-hermes.local.sh",
         }
         config = AutomationConfig(**overrides)
-    if args.config or args.notify or args.dry_run:
+    if args.config or args.notify:
         config = AutomationConfig(
             **{
                 **config.__dict__,
                 "scorer_config_path": args.config or config.scorer_config_path,
                 "notify_enabled": args.notify or config.notify_enabled,
-                "dry_run": args.dry_run or config.dry_run,
             }
         )
 
@@ -161,16 +322,19 @@ def main() -> int:
     config = merge_resolved_base_url(config, base_url)
 
     gateway = JobTrailHTTPClient(config.base_url)
-    # Dry-run is deliberately state-free: the automation layer also skips
-    # breaker and journal writes, while the launcher must not even construct
-    # the seen cache (construction can create its parent directory).
-    seen_cache = None if config.dry_run else _build_seen_cache(args)
+    seen_cache = _build_seen_cache(args)
     try:
+        started_at = datetime.now(timezone.utc)
         result = JobSearchAutomation(
             gateway, seen_cache=seen_cache, ats_boards=config.ats_boards
         ).run(config=config)
+        finished_at = datetime.now(timezone.utc)
     finally:
         gateway.close()
+    _record_local_then_deliver(
+        result, config, base_url_source=source,
+        started_at=started_at, finished_at=finished_at,
+    )
     print(
         {
             "searched": result.searched,
@@ -179,9 +343,6 @@ def main() -> int:
             "selected": result.selected is not None,
             "failures": list(result.failures),
             "profile_counts": result.profile_counts,
-            "dry_run": getattr(result, "dry_run", False),
-            "planned_operations": getattr(result, "planned_operations", {}),
-            "notification_preview": getattr(result, "notification_preview", None),
         }
     )
     return 1 if result.failures else 0

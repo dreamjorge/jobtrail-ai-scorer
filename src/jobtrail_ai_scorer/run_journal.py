@@ -89,8 +89,38 @@ def record_run(
         clock=clock,
     )
     line = json.dumps(payload, ensure_ascii=False, sort_keys=True)
-    with _maybe_lock(lock_path):
+    with _maybe_lock(lock_path or _default_lock_path(path)):
         _append_jsonl_line(path, line)
+
+
+def _delivery_line(*, run_id: str, event_id: str, result: Any) -> dict[str, Any]:
+    """Return an additive delivery record containing no request or secret data."""
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "record_type": "delivery",
+        "run_id": str(run_id),
+        "event_id": str(event_id),
+        "status": str(getattr(result, "status", "failed")),
+        "classification": str(getattr(result, "classification", "")),
+        "attempts": max(0, int(getattr(result, "attempts", 0) or 0)),
+    }
+
+
+def record_delivery(
+    path: str | os.PathLike[str], *, run_id: str, event_id: str, result: Any,
+    lock_path: str | os.PathLike[str] | None = None,
+) -> None:
+    """Append a linked delivery outcome after the local run record."""
+    line = json.dumps(_delivery_line(run_id=run_id, event_id=event_id, result=result), sort_keys=True)
+    with _maybe_lock(lock_path or _default_lock_path(path)):
+        _append_jsonl_line(path, line)
+
+
+def _default_lock_path(path: str | os.PathLike[str]) -> Path:
+    """Return the stable sibling lock shared by all journal record writers."""
+
+    target = Path(path)
+    return target.with_name(f"{target.name}.lock")
 
 
 def iter_runs(
@@ -155,12 +185,17 @@ def _line_for_run(
         profile_counts=profile_counts,
     )
     scored_failed = sum(1 for f in failures if f.startswith(_SCORE_FAILURE_PREFIX))
-    notified = bool(selected) or bool(failures)
+    notification_sent = getattr(run, "notification_sent", None)
+    notified = (
+        bool(notification_sent)
+        if notification_sent is not None
+        else bool(selected) or bool(failures)
+    )
     notification_kind = _classify_notification_kind(
-        selected=selected, failures=failures
+        selected=selected, failures=failures, notification_sent=notification_sent
     )
 
-    run_id = _build_run_id(started_at=started_at, clock=clock)
+    run_id = getattr(run, "run_id", None) or _build_run_id(started_at=started_at, clock=clock)
     return {
         "schema_version": SCHEMA_VERSION,
         "run_id": run_id,
@@ -215,6 +250,7 @@ def _classify_notification_kind(
     *,
     selected: Any,
     failures: list[str],
+    notification_sent: bool | None = None,
 ) -> str:
     """Return the notification kind for one run.
 
@@ -226,6 +262,8 @@ def _classify_notification_kind(
 
     if selected is not None:
         return "match"
+    if notification_sent is True and not failures:
+        return "no_match"
     if any(f.startswith(_BREAKER_FAILURE_PREFIX) for f in failures):
         return "breaker"
     if any(f.startswith(_PREFLIGHT_FAILURE_PREFIX) for f in failures):
@@ -397,5 +435,6 @@ __all__ = [
     "DEFAULT_RUN_JOURNAL_PATH",
     "SCHEMA_VERSION",
     "iter_runs",
+    "record_delivery",
     "record_run",
 ]

@@ -3,15 +3,15 @@
 from __future__ import annotations
 
 import contextlib
-import inspect
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from itertools import islice
 import json
 import os
 import shlex
 import subprocess
 from typing import Any, Callable, Mapping, Protocol
-from urllib.parse import quote
+from urllib.parse import quote, unquote
 
 import httpx
 
@@ -21,6 +21,7 @@ from .discover import (  # noqa: F401  (re-exported on purpose)
 )
 from .retry import RetryPolicy, classify_retryable, retry_call
 from .seen_cache import SeenCache
+from .shortlist import build_shortlist
 from .sources import (
     JobSpySourceAdapter,
     NormalizedJob,
@@ -29,8 +30,14 @@ from .sources import (
     build_ats_adapters,
     normalize_jobspy_job,
 )
-from .notify import NotificationBuilder, recommendation_label
-from .run_journal import record_run
+from .notify import (
+    NotificationBuilder,
+    _clip_text,
+    _scrub,
+    build_run_id,
+    recommendation_label,
+)
+from .n8n_outbound import N8nConfig, build_envelope
 
 
 DEFAULT_TERMS = (
@@ -227,7 +234,6 @@ class AutomationConfig:
     score_threshold: int = 80
     scorer_command: str = "jobtrail-ai-scorer"
     scorer_config_path: str = ""
-    run_journal_path: str = ""
     notify_enabled: bool = False
     notify_on_failure: bool = False
     whatsapp_command: str = ""
@@ -244,7 +250,8 @@ class AutomationConfig:
     breaker_cooldown_seconds: float = 3600.0
     breaker_alert_cooldown_seconds: float = 3600.0
     breaker_state_path: str = ""
-    dry_run: bool = False
+    n8n: N8nConfig = field(default_factory=N8nConfig)
+    feedback_actions_enabled: bool = False
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "AutomationConfig":
@@ -299,7 +306,6 @@ class AutomationConfig:
             score_threshold=int(e.get("JOB_SCORE_THRESHOLD", "80")),
             scorer_command=e.get("SCORER_COMMAND", "jobtrail-ai-scorer"),
             scorer_config_path=e.get("SCORER_CONFIG_PATH", ""),
-                run_journal_path=e.get("JOBTRAIL_RUN_JOURNAL_PATH", "").strip(),
             notify_enabled=truthy("WHATSAPP_NOTIFY_ENABLED", "0"),
             notify_on_failure=truthy("WHATSAPP_NOTIFY_ON_FAILURE", "0"),
             whatsapp_command=e.get("WHATSAPP_NOTIFY_COMMAND", ""),
@@ -315,7 +321,8 @@ class AutomationConfig:
                 "BREAKER_ALERT_COOLDOWN_SECONDS", cls.breaker_alert_cooldown_seconds
             ),
             breaker_state_path=e.get("BREAKER_STATE_PATH", "").strip(),
-            dry_run=truthy("JOBTRAIL_AUTOMATION_DRY_RUN", "0"),
+            n8n=N8nConfig.from_env(e),
+            feedback_actions_enabled=truthy("N8N_FEEDBACK_ACTIONS_ENABLED"),
         )
 
 
@@ -436,19 +443,16 @@ def map_jobspy_job(job: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def parse_score_note(notes: Any) -> dict[str, Any] | None:
-    if not isinstance(notes, list):
-        return None
-    for note in reversed(notes):
-        body = note.get("body") if isinstance(note, dict) else None
-        if not isinstance(body, str) or "[AI_JOB_SCORE_V1]" not in body:
-            continue
-        try:
-            value = json.loads(body.split("[AI_JOB_SCORE_V1]", 1)[1].strip())
-            if isinstance(value, dict) and isinstance(value.get("score"), (int, float)):
-                return value
-        except (json.JSONDecodeError, TypeError, ValueError):
-            continue
-    return None
+    """Return the latest valid score payload found in ``notes``.
+
+    Thin re-export of :func:`jobtrail_ai_scorer.scoring.parse_score_note`. The
+    helper lives in ``scoring`` so it can be reused by the offline automation
+    dry-run slice (see #36) without pulling in the orchestrator module.
+    """
+
+    from .scoring import parse_score_note as _parse_score_note
+
+    return _parse_score_note(notes)
 
 
 def build_notification_summary(
@@ -456,6 +460,7 @@ def build_notification_summary(
     score: Mapping[str, Any],
     *,
     base_url: str = "",
+    run_id: str = "",
 ) -> dict[str, Any]:
     """Build a bounded notification from explicitly allowlisted fields.
 
@@ -468,11 +473,53 @@ def build_notification_summary(
 
     builder = NotificationBuilder.from_env(base_url=base_url)
     summary = builder.build(score=score, job=job)
+    if run_id:
+        summary["runId"] = _scrub(_clip_text(run_id))
     if "recommendationLabel" not in summary:
         # Defensive fallback for the no-base-url path so the legacy callers
         # still get a stable, normalized recommendation label.
         summary["recommendationLabel"] = recommendation_label(score.get("recommendation"))
     return summary
+
+
+def _render_notification_summary(summary: Mapping[str, Any]) -> str:
+    """Render an allowlisted notification summary as readable WhatsApp text."""
+
+    title = summary.get("title") or "JobTrail match"
+    lines = [f"*JobTrail match: {title}*"]
+
+    for label, key in (
+        ("Company", "company"),
+        ("Location", "location"),
+        ("Score", "score"),
+    ):
+        value = summary.get(key)
+        if value is not None and value != "":
+            lines.append(f"*{label}:* {value}")
+
+    recommendation = summary.get("recommendationLabel") or summary.get("recommendation")
+    if recommendation is not None and recommendation != "":
+        lines.append(f"*Recommendation:* {recommendation}")
+
+    for label, key in (("JobTrail", "jobTrailLink"), ("Source", "jobUrl")):
+        value = summary.get(key)
+        if value is not None and value != "":
+            lines.append(f"*{label}:* {value}")
+
+    for label, key in (
+        ("Search profiles", "searchProfiles"),
+        ("Strengths", "strengths"),
+        ("Gaps", "gaps"),
+    ):
+        values = summary.get(key) or []
+        if values:
+            lines.append(f"*{label}:*")
+            lines.extend(f"• {value}" for value in values if value not in (None, ""))
+
+    run_id = summary.get("runId")
+    if run_id is not None and run_id != "":
+        lines.append(f"*Run ID:* {run_id}")
+    return "\n".join(lines)
 
 
 class AutomationGateway(Protocol):
@@ -552,9 +599,344 @@ class AutomationRun:
     failures: tuple[str, ...] = ()
     selected: dict[str, Any] | None = None
     profile_counts: dict[str, dict[str, int]] = field(default_factory=dict)
-    dry_run: bool = False
-    planned_operations: dict[str, int] = field(default_factory=dict)
-    notification_preview: dict[str, Any] | None = None
+    envelope: dict[str, Any] | None = None
+    notification_sent: bool | None = None
+    run_id: str = ""
+    opportunities: tuple[dict[str, Any], ...] = ()
+
+
+def build_n8n_envelope(
+    run: AutomationRun, *, occurred_at: str, feedback_actions: bool = False,
+    run_id: str | None = None,
+) -> dict[str, Any]:
+    """Translate a completed run at the n8n handoff boundary.
+
+    The HTTP adapter is intentionally constructed and invoked by the caller;
+    this function only maps the run result into the outbound contract. Keeping
+    transport ownership outside orchestration avoids introducing a second
+    scheduler or hiding delivery policy in the search pipeline.
+    """
+
+    return build_envelope(
+        run_id=run_id if run_id is not None else run.run_id,
+        occurred_at=occurred_at,
+        searched=run.searched,
+        imported=run.imported,
+        scored=run.scored,
+        failures=run.failures,
+        selected=run.selected,
+        feedback_actions=feedback_actions,
+    )
+
+
+# --- Simulation seam (issue #36) --------------------------------------------
+#
+# The offline automation dry-run slice swaps the production pipeline for a
+# deterministic replay built from a :class:`SimulationScenario`. No
+# ``AutomationGateway``, ``SeenCache``, score subprocess or WhatsApp helper is
+# invoked while the seam is active. Output is shaped like an
+# :class:`AutomationRun` so callers and the launcher can introspect it without
+# special-casing the simulation branch.
+
+# Maximum number of captured jobs retained by one dry-run scenario. Keeping
+# this bound at the scenario boundary prevents planning from traversing or
+# retaining an unbounded captured history.
+MAX_SIMULATION_JOBS = 100
+
+
+@dataclass(frozen=True)
+class SimulationScenario:
+    """A reproducible, in-memory dataset for the automation dry-run.
+
+    ``jobs`` is the captured set the orchestrator would otherwise import from
+    JobSpy, Lever, Greenhouse or Adzuna. ``score`` is provided as a captured
+    :class:`NormalizedJob` ``metadata['score_note']`` entry so the parser from
+    :mod:`jobtrail_ai_scorer.scoring` can extract it without ever invoking a
+    live provider.
+    """
+
+    name: str
+    jobs: tuple["NormalizedJob", ...] = ()
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.name, str):
+            raise ValueError("SimulationScenario.name must be a string")
+        if not isinstance(self.jobs, tuple):
+            raise ValueError("SimulationScenario.jobs must be a tuple")
+        bounded_jobs = self.jobs[:MAX_SIMULATION_JOBS]
+        object.__setattr__(self, "jobs", bounded_jobs)
+        for index, job in enumerate(bounded_jobs):
+            if not isinstance(job, NormalizedJob):
+                raise ValueError(
+                    "SimulationScenario.jobs[{}] must be a NormalizedJob".format(index)
+                )
+
+
+def _normalize_simulation_clock(clock_iso: str) -> str:
+    """Validate and normalize a supplied simulation clock.
+
+    The envelope boundary must never carry a naive, date-only, or otherwise
+    unparsable timestamp.  ``datetime.fromisoformat`` accepts timezone offsets
+    and the normalized ISO representation keeps fixed-clock output stable.
+    """
+
+    if not isinstance(clock_iso, str):
+        raise ValueError("clock_iso must be a timezone-aware ISO datetime")
+    try:
+        parsed = datetime.fromisoformat(clock_iso)
+    except ValueError as exc:
+        raise ValueError(
+            "clock_iso must be a timezone-aware ISO datetime"
+        ) from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError("clock_iso must be a timezone-aware ISO datetime")
+    return parsed.isoformat()
+
+
+@dataclass(frozen=True)
+class PlannedOperations:
+    """Bounded envelope describing the operations the dry-run would perform.
+
+    The envelope is deterministic for a fixed clock and scenario. It is the
+    payload emitted by the launcher (``scripts/automated-job-search.example.py``)
+    when ``--automation-dry-run`` is requested.
+    """
+
+    scenario: str
+    searched: int
+    planned_imports: int
+    planned_scores: int
+    would_notify: bool
+    best: dict[str, Any] | None
+    clock: str
+    redacted: bool = True
+    # Internal only: preserve the existing launcher envelope contract.
+    opportunities: tuple[dict[str, Any], ...] = ()
+
+    def to_envelope(self) -> dict[str, Any]:
+        return _scrub_simulation_value(
+            {
+                "scenario": self.scenario,
+                "searched": self.searched,
+                "planned_imports": self.planned_imports,
+                "planned_scores": self.planned_scores,
+                "would_notify": self.would_notify,
+                "best": self.best,
+                "clock": _normalize_simulation_clock(self.clock),
+                "redacted": self.redacted,
+            }
+        )
+
+
+# Strings and collections in the dry-run envelope have explicit bounds so a
+# captured scenario cannot turn the advertised bounded payload into an
+# unbounded one.
+_SIMULATION_MAX_STRING = 256
+_SIMULATION_MAX_LIST = 32
+_SIMULATION_MAX_DICT_ENTRIES = 32
+_SIMULATION_MAX_DEPTH = 8
+
+
+# Strings the dry-run envelope MUST scrub from any captured payload.
+_SIMULATION_FORBIDDEN_SUBSTRINGS: tuple[str, ...] = (
+    "/DATA/",
+    "RESUME_SENTINEL",
+    "PROMPT_SENTINEL",
+    "/AppData/",
+)
+
+# Query-string keys whose values the envelope MUST NOT expose.
+_SIMULATION_FORBIDDEN_QUERY_KEYS: tuple[str, ...] = (
+    "app_id",
+    "app_key",
+    "api_key",
+    "apikey",
+    "token",
+    "access_token",
+    "secret",
+    "password",
+    "client_secret",
+)
+
+
+def _bounded_simulation_string(value: str) -> str:
+    """Keep one scrubbed simulation string within the output envelope bound."""
+
+    return value[:_SIMULATION_MAX_STRING]
+
+
+def _bounded_simulation_list(value: list[Any]) -> list[Any]:
+    """Keep one simulation list within the output envelope bound."""
+
+    return value[:_SIMULATION_MAX_LIST]
+
+
+def _scrub_simulation_value(value: Any, *, _depth: int = 0) -> Any:
+    """Recursively scrub and bound values in the simulation envelope.
+
+    Dictionary keys are untrusted captured data too, so they receive the same
+    string scrubbing and length bound as values.  The entry and depth limits
+    keep adversarial mappings from producing an oversized or deeply recursive
+    envelope.
+    """
+
+    if _depth >= _SIMULATION_MAX_DEPTH:
+        return "[redacted]"
+    if isinstance(value, str):
+        cleaned = _scrub_query_string(value)
+        for needle in _SIMULATION_FORBIDDEN_SUBSTRINGS:
+            if needle in cleaned:
+                cleaned = cleaned.replace(needle, "[redacted]")
+        return _bounded_simulation_string(cleaned)
+    if isinstance(value, Mapping):
+        scrubbed: dict[str, Any] = {}
+        for index, (key, item) in enumerate(value.items()):
+            if index >= _SIMULATION_MAX_DICT_ENTRIES:
+                break
+            scrubbed_key = _scrub_simulation_value(str(key), _depth=_depth + 1)
+            scrubbed[scrubbed_key] = _scrub_simulation_value(
+                item, _depth=_depth + 1
+            )
+        return scrubbed
+    if isinstance(value, (list, tuple)):
+        return _bounded_simulation_list(
+            [
+                _scrub_simulation_value(item, _depth=_depth + 1)
+                for item in value[:_SIMULATION_MAX_LIST]
+            ]
+        )
+    return value
+
+
+_SIMULATION_QUERY_STRING_SPLIT = "&"
+
+
+def _scrub_query_string(value: str) -> str:
+    """Return ``value`` with any forbidden query-string credentials removed."""
+
+    if "?" not in value or "=" not in value:
+        return value
+    head, _, query = value.partition("?")
+    cleaned_pairs: list[str] = []
+    changed = False
+    for pair in query.split(_SIMULATION_QUERY_STRING_SPLIT):
+        if not pair:
+            continue
+        key, sep, _ = pair.partition("=")
+        if unquote(key).lower() in _SIMULATION_FORBIDDEN_QUERY_KEYS:
+            changed = True
+            continue
+        cleaned_pairs.append(pair)
+    if not changed:
+        return value
+    cleaned_query = _SIMULATION_QUERY_STRING_SPLIT.join(cleaned_pairs)
+    return f"{head}?{cleaned_query}" if cleaned_query else head
+
+
+def _normalized_identity(
+    source: Any, source_job_id: Any
+) -> tuple[str, str] | None:
+    """Return the production identity key, or ``None`` when it is invalid."""
+
+    if not isinstance(source, str) or not source.strip():
+        return None
+    if not isinstance(source_job_id, str) or not source_job_id.strip():
+        return None
+    return source.strip().lower(), source_job_id.strip().lower()
+
+
+def _bounded_score_limit(max_score: Any) -> int:
+    """Interpret score caps consistently across production and simulation."""
+
+    return max(0, int(max_score or 0))
+
+
+def _resolve_simulation_clock(clock_iso: str | None) -> str:
+    """Return the deterministic clock string used by the dry-run envelope."""
+
+    if clock_iso is not None:
+        return _normalize_simulation_clock(clock_iso)
+    # Import locally so callers that never opt in do not pay the cost.
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc).isoformat()
+
+
+def build_planned_operations(
+    scenario: "SimulationScenario",
+    config: "AutomationConfig",
+    *,
+    clock_iso: str | None = None,
+) -> PlannedOperations:
+    """Compute the dry-run envelope from a scenario and the resolved config.
+
+    The function performs scenario-only deduplication (same
+    ``(source, source_job_id)`` identity), parses captured score notes
+    through :func:`jobtrail_ai_scorer.scoring.parse_score_note`, applies
+    ``config.score_threshold`` and ``config.max_score``, and redacts
+    forbidden substrings from any value that would leak to the launcher.
+    """
+
+    from .scoring import parse_score_note
+
+    # Scenario-only dedup: collect every score note for the same identity
+    # (source, source_job_id) so we can later resolve to the latest
+    # valid score, matching how ``parse_score_note`` would handle a
+    # multi-note history on a real JobTrail record.  Keep this local slice as
+    # an explicit defense in depth for callers holding a scenario-like object.
+    bounded_jobs = scenario.jobs[:MAX_SIMULATION_JOBS]
+    history_by_identity: dict[tuple[str, str], list[str]] = {}
+    jobs_by_identity: dict[tuple[str, str], NormalizedJob] = {}
+    for index, job in enumerate(bounded_jobs):
+        identity = _normalized_identity(job.source, job.source_job_id)
+        # Production does not retain invalid identities in its deduplication
+        # index, so each invalid job remains independently importable.
+        if identity is None:
+            identity = ("", f"__invalid_identity_{index}")
+        note_body = (job.metadata or {}).get("score_note")
+        history_by_identity.setdefault(identity, [])
+        if isinstance(note_body, str):
+            notes = history_by_identity[identity]
+            notes.append(note_body)
+
+        jobs_by_identity.setdefault(identity, job)
+    candidates: list[tuple[NormalizedJob, dict[str, Any]]] = []
+    max_score = _bounded_score_limit(config.max_score)
+    eligible_identities = list(islice(history_by_identity, max_score))
+    planned_scores = 0
+    for identity in eligible_identities:
+        notes = history_by_identity[identity]
+        score = parse_score_note([{"body": body} for body in notes])
+        if score is None:
+            continue
+        planned_scores += 1
+        candidates.append((jobs_by_identity[identity], score))
+
+    eligible = build_shortlist(candidates, score_threshold=config.score_threshold)
+    opportunities = tuple(
+        _scrub_simulation_value({
+            "title": job.title or "",
+            "company": job.company or "",
+            "location": job.location or "",
+            "score": score["score"],
+            "jobUrl": job.source_url or "",
+            "sourceJobId": job.source_job_id or "",
+            "source": job.source or "",
+        })
+        for job, score in eligible
+    )
+    scrubbed_best = opportunities[0] if opportunities else None
+    return PlannedOperations(
+        scenario=scenario.name,
+        searched=len(bounded_jobs),
+        planned_imports=len(jobs_by_identity),
+        planned_scores=planned_scores,
+        would_notify=bool(scrubbed_best and config.notify_enabled),
+        best=scrubbed_best,
+        clock=_resolve_simulation_clock(clock_iso),
+        opportunities=opportunities,
+    )
+
 
 
 def _format_failure(stage: str, exc: BaseException, *, job_id: str | None = None) -> str:
@@ -605,9 +987,13 @@ class JobTrailAutomation:
         ats_boards: AtsBoardConfig | None = None,
         preflight_runner: Callable[["AutomationConfig"], Any] | None = None,
         circuit_breaker: Any | None = None,
-            run_journal: Callable[..., Any] | None = None,
-            clock: Callable[[], datetime] | None = None,
+            simulation: "SimulationScenario | None" = None,
     ) -> None:
+        if simulation is not None and not isinstance(simulation, SimulationScenario):
+            raise ValueError(
+                "simulation must be a SimulationScenario instance or None"
+            )
+        self._simulation = simulation
         self.gateway, self.scorer, self.notifier = (
             gateway,
             scorer or self._score,
@@ -621,7 +1007,6 @@ class JobTrailAutomation:
         self.seen_cache = seen_cache
         self._scorer_command = "jobtrail-ai-scorer"
         self._whatsapp_command = ""
-        self._dry_run = False
         self.base_url = AutomationConfig.base_url
         # Scorer subprocess invocations are idempotent (the CLI runs with
         # ``--force``) so retry is safe. The default policy bounds attempts
@@ -645,8 +1030,6 @@ class JobTrailAutomation:
         # :meth:`_resolve_breaker`).
         self._preflight_runner = preflight_runner
         self._circuit_breaker = circuit_breaker
-        self._run_journal = run_journal or record_run
-        self._clock = clock or (lambda: datetime.now(timezone.utc))
         # Default ``source_adapters`` preserves the historical
         # ``(JobSpySourceAdapter(gateway),)`` tuple when no ATS boards are
         # configured. When ``ats_boards`` is supplied, the factory appends
@@ -662,17 +1045,7 @@ class JobTrailAutomation:
                 )
         self.source_adapters = source_adapters
 
-    def _invoke_scorer(self, job_id: str, config_path: str,
-                       payload: dict[str, Any] | None = None) -> Any:
-        """Call injected scorers with payload when supported."""
-        try:
-            inspect.signature(self.scorer).bind(job_id, config_path, payload)
-        except (TypeError, ValueError):
-            return self.scorer(job_id, config_path)
-        return self.scorer(job_id, config_path, payload)
-
-    def _score(self, job_id: str, config_path: str,
-               payload: dict[str, Any] | None = None) -> Any:
+    def _score(self, job_id: str, config_path: str) -> None:
         # No retry here: ``run()`` already wraps every call to ``self.scorer``
         # (default or injected) in a single ``retry_call`` with
         # ``_scorer_retry_policy``. Retrying here too would nest attempts
@@ -683,45 +1056,20 @@ class JobTrailAutomation:
         # ``AutomationConfig.base_url`` in ``run()``) so the scorer targets
         # the same backend instead of falling back to whatever static
         # ``jobtrail_base_url`` is committed in the scorer's own YAML config.
-        command = [*shlex.split(self._scorer_command), "score"]
-        if self._dry_run:
-            result = subprocess.run(
-                [
-                    *command,
-                    "--dry-run",
-                    "--json",
-                    "--job-json",
-                    "-",
-                    "--config",
-                    config_path,
-                ],
-                check=True,
-                capture_output=True,
-                input=json.dumps(
-                    payload if payload is not None else {"id": job_id},
-                    sort_keys=True,
-                    separators=(",", ":"),
-                ),
-                text=True,
-            )
-            value = json.loads(result.stdout)
-            if isinstance(value, list):
-                value = next(
-                    (
-                        item
-                        for item in value
-                        if isinstance(item, dict)
-                        and str(item.get("job_id")) == str(job_id)
-                    ),
-                    value[0] if len(value) == 1 else None,
-                )
-            if not isinstance(value, dict) or not isinstance(
-                value.get("score"), (int, float)
-            ):
-                raise ValueError("scorer dry-run output must be a score mapping")
-            return value
-        subprocess.run([*command, "--config", config_path, "--job-id", job_id, "--force", "--base-url", self.base_url], check=True)
-        return None
+        subprocess.run(
+            [
+                *shlex.split(self._scorer_command),
+                "score",
+                "--config",
+                config_path,
+                "--job-id",
+                job_id,
+                "--force",
+                "--base-url",
+                self.base_url,
+            ],
+            check=True,
+        )
 
     def _notify(self, message: str) -> None:
         if not self._whatsapp_command:
@@ -732,21 +1080,82 @@ class JobTrailAutomation:
             shlex.split(self._whatsapp_command), input=message, text=True, check=True
         )
 
-    def run(self, *, config: AutomationConfig) -> AutomationRun:
-        started_at = self._clock()
+    def _run_simulation(
+        self, config: AutomationConfig, *, clock_iso: str | None = None
+    ) -> AutomationRun:
+        """Return a deterministic ``AutomationRun`` from the configured scenario.
+
+        The dry-run path never touches ``self.gateway``, ``self.scorer`` or
+        ``self.notifier``. The :class:`AutomationRun` mirrors the production
+        shape (searched, imported=0, scored=0, selected) so callers and the
+        launcher can introspect a uniform object. The ``envelope`` attribute
+        is the bounded JSON payload printed by the launcher; it carries the
+        :class:`PlannedOperations` envelope produced by
+        :func:`build_planned_operations`.
+        """
+
+        assert self._simulation is not None
+        scenario = self._simulation
+        # Validate the source clock before redaction.  Parsing the scrubbed
+        # envelope would turn a redacted sentinel into a ValueError and would
+        # also make the run-id path depend on presentation-layer output.
+        try:
+            planned = build_planned_operations(
+                scenario, config, clock_iso=clock_iso
+            )
+            simulation_clock = datetime.fromisoformat(planned.clock)
+            if (
+                simulation_clock.tzinfo is None
+                or simulation_clock.utcoffset() is None
+            ):
+                raise ValueError("simulation clock must be timezone-aware")
+        except (TypeError, ValueError):
+            return AutomationRun(
+                searched=0,
+                imported=0,
+                scored=0,
+                failures=("simulation:invalid_clock",),
+                selected=None,
+                profile_counts={},
+                envelope={
+                    "error": "invalid_clock",
+                    "redacted": True,
+                },
+            )
+
+        envelope = planned.to_envelope()
+        selected = envelope["best"]
+        return AutomationRun(
+            searched=envelope["searched"],
+            imported=0,
+            scored=0,
+            failures=(),
+            selected=selected,
+            profile_counts={},
+            envelope=envelope,
+            opportunities=planned.opportunities,
+            run_id=build_run_id(
+                seed=f"simulation:{scenario.name}",
+                clock=lambda: simulation_clock,
+            ),
+        )
+
+    def run(
+        self, *, config: AutomationConfig, clock_iso: str | None = None
+    ) -> AutomationRun:
+        # Offline automation dry-run (issue #36). When the constructor
+        # was given a SimulationScenario, the production pipeline is
+        # bypassed entirely: no gateway, no scorer subprocess, no
+        # notifier, no production-state mutation.
+        if self._simulation is not None:
+            return self._run_simulation(config, clock_iso=clock_iso)
+        started_at = datetime.now(timezone.utc)
+        run_id = build_run_id(moment=started_at, seed=started_at.isoformat())
         if not config.scorer_config_path:
             raise ValueError("SCORER_CONFIG_PATH is required")
         self._scorer_command = config.scorer_command
         self._whatsapp_command = config.whatsapp_command
-        self._dry_run = config.dry_run
         self.base_url = config.base_url
-
-        if config.dry_run:
-            if self._preflight_runner is not None:
-                report = self._preflight_runner(config)
-                if getattr(report, "should_abort", False):
-                    return self._empty_run(tuple(self._preflight_failure_labels(report)), breaker=None, dry_run=True)
-            return self._run_dry(config=config)
 
         # Step 0: resolve the circuit breaker.
         #
@@ -761,21 +1170,21 @@ class JobTrailAutomation:
             # the operator's notify flags), and return an empty run. The
             # breaker-opened run MUST NOT increment the failure counter
             # so the alert does not extend the cooldown.
-            run = self._handle_breaker_open(
+            return self._handle_breaker_open(
                 breaker=breaker,
                 config=config,
             )
 
-            self._journal_run(config, run, started_at)
-            return run
-
+        # Step 0b: preflight is opt-in. When ``preflight_runner`` is
+        # provided, a non-empty ``should_abort`` aborts the run before
+        # any search/import/score work.
         if self._preflight_runner is not None:
             report = self._preflight_runner(config)
             if getattr(report, "should_abort", False):
                 preflight_failures = self._preflight_failure_labels(report)
-                run = self._empty_run(tuple(preflight_failures), breaker=breaker)
-                self._journal_run(config, run, started_at)
-                return run
+                return self._empty_run(
+                    tuple(preflight_failures), breaker=breaker
+                )
 
         failures: list[str] = []
         ids: list[str] = []
@@ -864,7 +1273,7 @@ class JobTrailAutomation:
                     failures.append(_format_failure("search", exc))
                     if count_profiles:
                         profile_counts[profile_name]["failures"] += 1
-        for job_id in ids[: config.max_score]:
+        for job_id in ids[: _bounded_score_limit(config.max_score)]:
             try:
                 retry_call(
                     self.scorer,
@@ -878,37 +1287,45 @@ class JobTrailAutomation:
                 scored += 1
             except Exception as exc:
                 failures.append(_format_failure("score", exc, job_id=job_id))
-        best = None
-        best_job = None
-        best_score = None
-        best_job_id = None
+        candidates = []
         for job_id in scored_ids:
             try:
                 job = self.gateway.get_job(job_id)
                 score = parse_score_note(job.get("notes"))
-                if (
-                    score
-                    and score.get("score", -1) >= config.score_threshold
-                    and (best is None or score["score"] > best["score"])
-                ):
-                    best = {
-                        "title": job.get("position", job.get("title", "")),
-                        "company": job.get("company", ""),
-                        "location": job.get("location", ""),
-                        "score": score["score"],
-                        "recommendation": score.get("recommendation", ""),
-                        "strengths": score.get("strengths", []),
-                        "gaps": score.get("gaps", []),
-                        "jobUrl": job.get("jobUrl", job.get("job_url", "")),
-                    }
-                    best_job = job
-                    best_score = score
-                    best_job_id = job_id
+                if score is not None:
+                    candidates.append(((job_id, job), score))
             except Exception as exc:
                 failures.append(_format_failure("read", exc, job_id=job_id))
 
-        if best is not None and best_job_id in profiles_by_job_id:
-            best["searchProfiles"] = list(profiles_by_job_id[best_job_id])
+        shortlist = build_shortlist(candidates, score_threshold=config.score_threshold)
+        opportunities = []
+        for (job_id, job), score in shortlist:
+            opportunity = {
+                "title": job.get("position", job.get("title", "")),
+                "company": job.get("company", ""),
+                "location": job.get("location", ""),
+                "score": score["score"],
+                "recommendation": score.get("recommendation", ""),
+                "strengths": score.get("strengths", []),
+                "gaps": score.get("gaps", []),
+                "jobUrl": job.get("jobUrl", job.get("job_url", "")),
+                "source": job.get("source", ""),
+                "sourceJobId": job.get("sourceJobId", ""),
+            }
+            # Copy only existing additive fields; outbound contracts stay unchanged.
+            for field_name in (
+                "fit_score", "coverage_score", "classification",
+                "evidence", "evidence_labels", "gap_labels",
+            ):
+                if field_name in score:
+                    opportunity[field_name] = score[field_name]
+            if job_id in profiles_by_job_id:
+                opportunity["searchProfiles"] = list(profiles_by_job_id[job_id])
+            opportunities.append(opportunity)
+
+        best = opportunities[0] if opportunities else None
+        best_job = shortlist[0][0][1] if shortlist else None
+        best_score = shortlist[0][1] if shortlist else None
         notification_body = self._compose_notification(
             best=best,
             best_job=best_job,
@@ -916,11 +1333,17 @@ class JobTrailAutomation:
             failures=tuple(failures),
             notify_enabled=config.notify_enabled,
             notify_on_failure=config.notify_on_failure,
+            searched=searched,
+            scored=scored,
+            score_threshold=config.score_threshold,
             base_url=self.base_url,
+            run_id=run_id,
         )
+        notification_sent = False
         if notification_body is not None:
             try:
                 self.notifier(notification_body)
+                notification_sent = True
             except Exception:
                 failures.append("notify")
         run = AutomationRun(
@@ -930,6 +1353,9 @@ class JobTrailAutomation:
             tuple(failures),
             best,
             profile_counts,
+            notification_sent=notification_sent,
+            run_id=run_id,
+            opportunities=tuple(opportunities),
         )
         # Step N: record the run outcome on the breaker so it can open
         # after consecutive failures or close after a clean run.
@@ -938,94 +1364,7 @@ class JobTrailAutomation:
                 breaker.record_failure()
             else:
                 breaker.record_success()
-        self._journal_run(config, run, started_at)
         return run
-
-    def _run_dry(self, *, config: AutomationConfig) -> AutomationRun:
-        failures: list[str] = []
-        searched = scored = planned_imported = planned_notified = 0
-        previews: list[tuple[str, dict[str, Any]]] = []
-        identities: dict[tuple[str, str], str] = {}
-        profiles_by_id: dict[str, list[str]] = {}
-        count_profiles = bool(config.search_profiles)
-        profile_counts = ({p.name: {"searched": 0, "imported": 0, "duplicates": 0, "failures": 0}
-                          for p in config.search_profiles} if count_profiles else {})
-        for adapter in self.source_adapters:
-            requests = (ats_source_search_requests(config)
-                        if getattr(adapter, "name", None) in {"lever", "greenhouse"}
-                        else source_search_requests(config))
-            for request in requests:
-                try:
-                    jobs = adapter.search(request)
-                    searched += len(jobs)
-                    if count_profiles:
-                        profile_counts[request.profile_name]["searched"] += len(jobs)
-                    for job in jobs:
-                        payload = job.to_import_payload()
-                        identity = self._cache_identity(job)
-                        if identity is not None and identity in identities:
-                            if count_profiles:
-                                profile_counts[request.profile_name]["duplicates"] += 1
-                            self._append_profile_provenance(profiles_by_id, identities[identity], request.profile_name)
-                            continue
-                        job_id = identity[1] if identity else str(payload.get("jobUrl") or payload.get("position") or searched)
-                        if identity is not None:
-                            identities[identity] = job_id
-                        previews.append((job_id, payload))
-                        planned_imported += 1
-                        if count_profiles:
-                            profile_counts[request.profile_name]["imported"] += 1
-                        self._append_profile_provenance(profiles_by_id, job_id, request.profile_name)
-                except Exception as exc:
-                    failures.append(_format_failure("search", exc))
-                    if count_profiles:
-                        profile_counts[request.profile_name]["failures"] += 1
-        scored_previews: list[tuple[str, dict[str, Any], dict[str, Any]]] = []
-        for job_id, job in previews[:config.max_score]:
-            try:
-                score = retry_call(
-                    self._invoke_scorer, job_id, config.scorer_config_path, job,
-                    policy=self._scorer_retry_policy, sleep=self._scorer_retry_sleep,
-                    label=f"scorer score {job_id}",
-                )
-                if not isinstance(score, Mapping) or not isinstance(score.get("score"), (int, float)):
-                    raise ValueError("scorer preview must be a score mapping")
-                scored_previews.append((job_id, job, dict(score)))
-                scored += 1
-            except Exception as exc:
-                failures.append(_format_failure("score", exc, job_id=job_id))
-        best = best_job = best_score = best_job_id = None
-        for job_id, job, score in scored_previews:
-            if score["score"] >= config.score_threshold and (best is None or score["score"] > best["score"]):
-                best = {"title": job.get("position", job.get("title", "")), "company": job.get("company", ""),
-                        "location": job.get("location", ""), "score": score["score"],
-                        "recommendation": score.get("recommendation", ""), "strengths": score.get("strengths", []),
-                        "gaps": score.get("gaps", []), "jobUrl": job.get("jobUrl", job.get("job_url", ""))}
-                best_job, best_score, best_job_id = job, score, job_id
-        if best is not None and best_job_id in profiles_by_id:
-            best["searchProfiles"] = list(profiles_by_id[best_job_id])
-        body = self._compose_notification(best=best, best_job=best_job, best_score=best_score,
-                                           failures=tuple(failures), notify_enabled=config.notify_enabled,
-                                           notify_on_failure=config.notify_on_failure, base_url=self.base_url)
-        notification_preview = None
-        if body is not None:
-            planned_notified = 1
-            try:
-                notification_preview = json.loads(body.split("\n", 1)[0])
-            except (TypeError, json.JSONDecodeError):
-                notification_preview = {"kind": "notification_preview"}
-        return AutomationRun(searched, 0, scored, tuple(failures), best, profile_counts, True,
-                             {"searched": searched, "imported": planned_imported, "scored": scored,
-                              "notified": planned_notified}, notification_preview)
-
-    def _journal_run(self, config: AutomationConfig, run: AutomationRun, started_at: datetime) -> None:
-        if not config.run_journal_path:
-            return
-        try:
-            self._run_journal(config.run_journal_path, run, started_at=started_at,
-                              finished_at=self._clock(), base_url_source="static")
-        except Exception:
-            pass
 
     # --- Breaker / preflight helpers --------------------------------------
 
@@ -1129,7 +1468,6 @@ class JobTrailAutomation:
         failures: tuple[str, ...],
         *,
         breaker: Any | None,
-        dry_run: bool = False,
     ) -> "AutomationRun":
         """Return an empty :class:`AutomationRun` for the short-circuit paths.
 
@@ -1141,8 +1479,7 @@ class JobTrailAutomation:
         state machine and would extend the cooldown).
         """
 
-        run = AutomationRun(0, 0, 0, failures, None, {}, dry_run,
-                             {"searched": 0, "imported": 0, "scored": 0, "notified": 0} if dry_run else {})
+        run = AutomationRun(0, 0, 0, failures, None, {})
         if breaker is not None and failures:
             breaker.record_failure()
         return run
@@ -1156,7 +1493,11 @@ class JobTrailAutomation:
         failures: tuple[str, ...],
         notify_enabled: bool,
         notify_on_failure: bool,
+        searched: int,
+        scored: int,
+        score_threshold: int,
         base_url: str = "",
+        run_id: str = "",
     ) -> str | None:
         """Assemble the WhatsApp helper message from the run's outcome.
 
@@ -1178,14 +1519,22 @@ class JobTrailAutomation:
             score_for_notification = dict(best_score or {})
             if best.get("searchProfiles"):
                 score_for_notification["searchProfiles"] = best["searchProfiles"]
-            match_body = json.dumps(
+            match_body = _render_notification_summary(
                 build_notification_summary(
                     best_job or {},
                     score_for_notification,
                     base_url=base_url,
-                ),
-                ensure_ascii=False,
-                sort_keys=True,
+                    run_id=run_id,
+                )
+            )
+        no_match_body: str | None = None
+        if notify_enabled and best is None and not failures:
+            no_match_body = (
+                "JobTrail — sin coincidencias\n"
+                f"Buscadas: {searched}\n"
+                f"Puntuadas: {scored}\n"
+                f"Umbral: {score_threshold}\n"
+                "No hubo ofertas que calificaran."
             )
         failure_body: str | None = None
         if notify_on_failure and failures:
@@ -1194,19 +1543,16 @@ class JobTrailAutomation:
                 ensure_ascii=False,
                 sort_keys=True,
             )
-        if match_body is not None and failure_body is not None:
-            return f"{match_body}\n{failure_body}"
-        return match_body or failure_body
+        primary_body = match_body or no_match_body
+        if primary_body is not None and failure_body is not None:
+            return f"{primary_body}\n{failure_body}"
+        return primary_body or failure_body
 
     @staticmethod
     def _normalized_identity(
         source: Any, source_job_id: Any
     ) -> tuple[str, str] | None:
-        if not isinstance(source, str) or not source.strip():
-            return None
-        if not isinstance(source_job_id, str) or not source_job_id.strip():
-            return None
-        return source.strip().lower(), source_job_id.strip().lower()
+        return _normalized_identity(source, source_job_id)
 
     @staticmethod
     def _append_profile_provenance(

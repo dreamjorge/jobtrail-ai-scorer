@@ -3,13 +3,13 @@ from dataclasses import dataclass, field
 
 import pytest
 
+from jobtrail_ai_scorer.models import ScoreResult
 from jobtrail_ai_scorer.scoring import (
-    CURRENT_MARKER,
     ScoreOutcome,
-    job_fingerprint,
+    classify_score,
+    parse_score_note,
     render_prompt,
     score_jobs,
-    serialize_score_note,
     should_score,
 )
 
@@ -71,6 +71,90 @@ def full_job(job_id: str, description: str = "Job description", notes=None) -> d
     }
 
 
+def test_additive_prompt_contract_mentions_scores_evidence_and_classification():
+    prompt = render_prompt(
+        full_job("j1"),
+        "Generic profile",
+        strategy_context={"target_roles": ["Backend Engineer"]},
+    )
+
+    for literal in ("fit_score", "coverage_score", "evidence", "direct", "equivalent", "inferred", "missing", "classification"):
+        assert literal in prompt
+    assert "Backend Engineer" in prompt
+
+
+def test_deterministic_classification_covers_all_classes_and_exclusions():
+    assert classify_score(90, 80) == "APPLY"
+    assert classify_score(70, 40) == "REVIEW"
+    assert classify_score(60, 0) == "SKIP"
+    assert classify_score(60, 30) == "SKIP"
+    assert classify_score(40, 90) == "EXPLORE"
+    assert classify_score(40, 50) == "EXPLORE"
+    assert classify_score(40, 49) == "SKIP"
+    assert classify_score(40, 90, exclusion_signal=True) == "SKIP"
+    assert classify_score(40, 90, critical_requirements_missing=["clearance"]) == "SKIP"
+    assert classify_score(90, 90, exclusion_signal=True) == "SKIP"
+    assert classify_score(90, 90, critical_requirements_missing=["security clearance"]) == "SKIP"
+
+
+@pytest.mark.parametrize(
+    "fit_score,coverage_score",
+    [(True, 80), (80, False), (80.5, 80), (80, "80"), (-1, 80), (80, 101)],
+)
+def test_direct_classification_rejects_invalid_score_types_and_ranges(fit_score, coverage_score):
+    with pytest.raises(ValueError, match="scores must be strict integers between 0 and 100"):
+        classify_score(fit_score, coverage_score)
+
+
+def test_legacy_score_only_provider_response_gets_safe_defaults():
+    result = ScoreResult.model_validate(VALID_SCORE)
+    assert result.fit_score == 85
+    assert result.coverage_score == 85
+    assert result.classification == "APPLY"
+    assert result.evidence == []
+
+
+def test_missing_hard_requirement_normalizes_classification_to_skip():
+    result = ScoreResult.model_validate(
+        {
+            **VALID_SCORE,
+            "fit_score": 99,
+            "coverage_score": 98,
+            "classification": "APPLY",
+            "hard_requirements_missing": ["security clearance"],
+        }
+    )
+
+    assert result.classification == "SKIP"
+
+
+def test_invalid_additive_provider_values_are_rejected():
+    with pytest.raises(Exception):
+        ScoreResult.model_validate({**VALID_SCORE, "fit_score": 101})
+    with pytest.raises(Exception):
+        ScoreResult.model_validate({**VALID_SCORE, "evidence": [{"label": "direct", "text": ""}]})
+    with pytest.raises(Exception):
+        ScoreResult.model_validate({**VALID_SCORE, "evidence": [{"label": "unsupported", "text": "claim"}]})
+
+
+def test_evidence_accepts_each_explicit_label():
+    for label in ("direct", "equivalent", "inferred", "missing"):
+        result = ScoreResult.model_validate(
+            {**VALID_SCORE, "evidence": [{"label": label, "text": "evidence"}]}
+        )
+        assert result.evidence[0].label == label
+
+
+def test_note_round_trip_preserves_additive_fields_and_legacy_parser():
+    payload = {**VALID_SCORE, "fit_score": 72, "coverage_score": 64, "classification": "REVIEW", "evidence": [{"label": "equivalent", "text": "Python maps to tooling"}]}
+    client = FakeClient([candidate("j1")], {"j1": full_job("j1")})
+    score_jobs(client, FakeProvider(json.dumps(payload)), "Generic profile")
+    parsed = parse_score_note([{"body": client.notes[0][1]}])
+    assert parsed is not None
+    assert parsed["fit_score"] == 72
+    assert parsed["evidence"][0]["label"] == "equivalent"
+
+
 def test_render_prompt_enumerates_strict_score_result_contract():
     prompt = render_prompt(full_job("j1"), "Generic profile")
 
@@ -113,6 +197,19 @@ def test_empty_description_is_skipped_without_fetching_full_record():
     assert client.notes == []
 
 
+@pytest.mark.parametrize("existing_marker", ["[AI_JOB_SCORE_V1]", "[HERMES_JOB_SCORE_V1]"])
+def test_custom_marker_does_not_dedupe_current_or_legacy_notes(existing_marker):
+    job = full_job("j1", notes=[{"body": f"{existing_marker}\n{json.dumps(VALID_SCORE)}"}])
+
+    assert should_score(job, marker="[CUSTOM_SCORE_V1]") is True
+
+
+def test_default_marker_dedupes_legacy_notes():
+    job = full_job("j1", notes=[{"body": f"[HERMES_JOB_SCORE_V1]\n{json.dumps(VALID_SCORE)}"}])
+
+    assert should_score(job) is False
+
+
 def test_selected_candidate_fetches_full_record_before_inspecting_notes():
     client = FakeClient(
         [candidate("j1")],
@@ -137,6 +234,43 @@ def test_invalid_provider_json_does_not_save_note():
     assert result.outcomes[0].reason == "invalid_score"
 
 
+@pytest.mark.parametrize(
+    "response",
+    [
+        json.dumps(VALID_SCORE),
+        "```json\n" + json.dumps(VALID_SCORE) + "\n```",
+    ],
+    ids=["plain-json", "fenced-json"],
+)
+def test_provider_accepts_plain_or_single_fenced_json(response):
+    client = FakeClient([candidate("j1")], {"j1": full_job("j1")})
+
+    result = score_jobs(client, FakeProvider(response), "Generic profile", dry_run=True)
+
+    assert result.processed == 1
+    assert result.failed == 0
+    assert result.outcomes[0].status == "dry_run"
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        "Here is the score: " + json.dumps(VALID_SCORE),
+        json.dumps(VALID_SCORE) + json.dumps(VALID_SCORE),
+    ],
+    ids=["surrounding-prose", "repeated-objects"],
+)
+def test_provider_rejects_prose_or_repeated_json(response):
+    client = FakeClient([candidate("j1")], {"j1": full_job("j1")})
+
+    result = score_jobs(client, FakeProvider(response), "Generic profile")
+
+    assert result.processed == 0
+    assert result.failed == 1
+    assert result.outcomes[0].reason == "invalid_score"
+    assert client.notes == []
+
+
 def test_dry_run_does_not_save_valid_note(capsys):
     client = FakeClient([candidate("j1")], {"j1": full_job("j1")})
 
@@ -159,12 +293,7 @@ def test_valid_score_saves_marker_and_canonical_json_note():
     assert result.processed == 1
     assert result.skipped == 0
     assert result.failed == 0
-    expected_note = {
-        **VALID_SCORE,
-        "fingerprint_version": 1,
-        "input_fingerprint": job_fingerprint(full_job("j1")),
-    }
-    assert client.notes == [("j1", "[AI_JOB_SCORE_V1]\n" + json.dumps(expected_note, sort_keys=True, separators=(",", ":")))]
+    assert client.notes == [("j1", "[AI_JOB_SCORE_V1]\n" + json.dumps(VALID_SCORE, sort_keys=True, separators=(",", ":")))]
     assert "Generic profile" in provider.prompts[0]
 
 
@@ -248,52 +377,3 @@ def test_score_jobs_normalizes_marker_for_dedupe_and_note_serialization():
     score_jobs(new_job, FakeProvider(json.dumps(VALID_SCORE)), "Generic profile", marker=marker)
 
     assert new_job.notes[0][1].startswith("[CUSTOM]\n")
-
-
-def test_unchanged_fingerprinted_job_is_skipped():
-    job = full_job("j1")
-    job["notes"] = [{"body": serialize_score_note(CURRENT_MARKER, VALID_SCORE, job=job)}]
-
-    assert should_score(job, current_fingerprint=job_fingerprint(job)) is False
-
-
-def test_meaningful_change_is_eligible_again():
-    original = full_job("j1")
-    changed = {**original, "salaryMax": 200, "notes": [
-        {"body": serialize_score_note(CURRENT_MARKER, VALID_SCORE, job=original)}
-    ]}
-
-    assert should_score(changed, current_fingerprint=job_fingerprint(changed)) is True
-
-
-def test_whitespace_only_change_remains_skipped():
-    original = full_job("j1")
-    changed = {**original, "description": "  Job\n description ", "notes": [
-        {"body": serialize_score_note(CURRENT_MARKER, VALID_SCORE, job=original)}
-    ]}
-
-    assert should_score(changed, current_fingerprint=job_fingerprint(changed)) is False
-
-
-def test_legacy_current_marker_note_remains_skipped():
-    job = full_job("j1", notes=[{"body": CURRENT_MARKER + "\n" + json.dumps(VALID_SCORE)}])
-
-    assert should_score(job, current_fingerprint=job_fingerprint(job)) is False
-
-
-def test_force_overrides_fingerprint_eligibility():
-    job = full_job("j1")
-    job["notes"] = [{"body": serialize_score_note(CURRENT_MARKER, VALID_SCORE, job=job)}]
-
-    assert should_score(job, force=True, current_fingerprint=job_fingerprint(job)) is True
-
-
-def test_score_history_uses_latest_fingerprinted_note():
-    old = full_job("j1")
-    changed = {**old, "salaryMax": 200}
-    changed["notes"] = [
-        {"body": serialize_score_note(CURRENT_MARKER, VALID_SCORE, job=old)},
-        {"body": serialize_score_note(CURRENT_MARKER, VALID_SCORE, job=changed)},
-    ]
-
-    assert should_score(changed, current_fingerprint=job_fingerprint(changed)) is False

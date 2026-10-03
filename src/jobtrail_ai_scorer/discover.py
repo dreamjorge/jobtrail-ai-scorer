@@ -18,6 +18,7 @@ invoked from any launcher or test without importing ``httpx``.
 
 from __future__ import annotations
 
+import json
 import subprocess
 import urllib.error
 import urllib.request
@@ -128,20 +129,58 @@ def _make_default_inspect(timeout: float) -> InspectFn:
 
 
 def _probe_url(url: str, *, timeout: float) -> bool:
-    """Return True iff ``url`` answers an HTTP request within ``timeout`` seconds.
+    """Return True iff the JobTrail health endpoint returns a 2xx response.
 
-    Uses ``urllib.request`` to keep the helper dependency-free. Any
-    ``URLError``/``HTTPError``/timeout/connection issue is treated as
-    "unreachable" so the next branch can be tried.
+    Uses ``urllib.request`` to keep the helper dependency-free. Probing a
+    service-specific endpoint avoids mistaking an unrelated application on the
+    published port for JobTrail (for example, a login redirect from pyLoad).
     """
-    request = urllib.request.Request(url, method="GET")
+    health_url = f"{url.rstrip('/')}/api/health"
+    request = urllib.request.Request(health_url, method="GET")
     try:
-        urllib.request.urlopen(request, timeout=timeout)
-        return True
-    except urllib.error.HTTPError:
-        # The server replied; for discovery purposes an HTTP response means
-        # the backend is reachable (e.g. 404 on root is fine — we want any reply).
-        return True
+        response = urllib.request.urlopen(request, timeout=timeout)
+        return 200 <= getattr(response, "status", 200) < 300
+    except urllib.error.HTTPError as error:
+        if error.code != 404:
+            return 200 <= error.code < 300
+        # Older JobTrail backends may not implement GET /api/health but still
+        # expose the endpoint to the conventional HEAD probe.
+        try:
+            response = urllib.request.urlopen(
+                urllib.request.Request(health_url, method="HEAD"), timeout=timeout
+            )
+            if 200 <= getattr(response, "status", 200) < 300:
+                return True
+        except urllib.error.HTTPError as head_error:
+            if 200 <= head_error.code < 300:
+                return True
+        except (urllib.error.URLError, TimeoutError, ConnectionError, OSError):
+            return False
+
+        # Some older supported backends expose only the conventional
+        # service-specific health endpoint. Any HTTP failure from the HEAD
+        # probe is allowed to reach this fallback; transport failures remain
+        # rejected above.
+        try:
+            response = urllib.request.urlopen(
+                urllib.request.Request(f"{url.rstrip('/')}/health", method="GET"),
+                timeout=timeout,
+            )
+            if not 200 <= getattr(response, "status", 200) < 300:
+                return False
+            try:
+                payload = json.loads(response.read())
+            except (AttributeError, TypeError, ValueError):
+                return False
+            return (
+                isinstance(payload, dict)
+                and payload.get("status") == "ok"
+                and payload.get("service") == "jobtrail"
+            )
+        except urllib.error.HTTPError:
+            return False
+        except (urllib.error.URLError, TimeoutError, ConnectionError, OSError):
+            return False
     except (urllib.error.URLError, TimeoutError, ConnectionError, OSError):
         return False
 

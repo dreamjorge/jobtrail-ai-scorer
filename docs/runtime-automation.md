@@ -29,6 +29,13 @@ Use these examples to run JobTrail AI Scorer from a local scheduler while keepin
 > [`scripts/legacy/README.md`](scripts/legacy/README.md) for the replacement
 > mapping and target removal date.
 
+## Shortlist policy
+
+Recommendation eligibility fails closed on SKIP, exclusions and missing hard
+requirements. The legacy score threshold and stable discovery-order ties remain.
+`build_shortlist` returns at most three eligible entries in production and simulation.
+Selected compatibility and default notification behavior remain unchanged.
+
 ## Backend URL resolution
 
 The systemd service must reach the JobTrail backend. Instead of baking a private
@@ -105,6 +112,63 @@ Example:
 The JSON is configuration only: it must not contain secrets, credentials, private filesystem paths, CV/profile text, provider prompts, or new source-provider definitions. `sites` only selects among the source providers already supported by the automation boundary. If `JOB_SEARCH_PROFILES` is unset, the launcher preserves the legacy single-profile behavior using `JOB_SEARCH_SITES`, `JOB_SEARCH_TERMS`, and `JOB_SEARCH_LOCATIONS`.
 
 The final launcher output includes `profile_counts` with `searched`, `imported`, `duplicates`, and `failures` per profile when profiles are configured; it is `{}` for the legacy fallback.
+
+## Public opportunity search
+
+`jobtrail_ai_scorer.public_search.BravePublicSearchAdapter` provides opt-in
+Brave discovery through direct API injection only in this snapshot. The canonical
+launcher remains unchanged. No result destination is fetched by this adapter;
+DNS/fetch safety and evidence resolution are later boundaries.
+
+`PublicSearchConfig` defaults to `enabled=False`, no API key and a five-second
+HTTP timeout (finite, positive, at most 30 seconds). `from_env` accepts an
+explicitly supplied environment mapping, rather than reading ambient variables:
+
+| Variable | Default | Contract |
+| --- | --- | --- |
+| `OPPORTUNITY_INTELLIGENCE_ENABLED` | `false` | `1/true/yes/on` enables; `0/false/no/off` disables. Other values are rejected. |
+| `BRAVE_SEARCH_API_KEY` | absent | Secret configuration only, excluded from config repr. Missing/blank when enabled yields `provider_unconfigured`, with zero HTTP attempts. |
+
+Fake placeholders only (do not commit real keys):
+
+```text
+OPPORTUNITY_INTELLIGENCE_ENABLED=1
+BRAVE_SEARCH_API_KEY=fake-placeholder-not-a-real-key
+```
+
+Callers must construct `PublicSearchRequest(company, title, location)` from
+approved public identifiers only, never raw job/profile/description/notes
+mappings. Fields are required nonblank strings, bounded to 160/200/120 characters;
+existing forbidden markers, controls and query-injection punctuation are
+rejected. The deterministic query quotes each field and appends `jobs` (at most
+493 characters). This defense does not prove that arbitrary caller-supplied text
+is public: callers still own the public-field boundary.
+
+Each **new adapter per run** has a shared budget of three attempts and ten
+unique candidate URLs. Each query makes one GET to the fixed
+`https://api.search.brave.com/res/v1/web/search` endpoint with
+`X-Subscription-Token`, requesting five results. There are no retries,
+pagination, dynamic endpoints or caching. Only the first five result members
+are inspected. Disabled and `dry_run=True` calls make zero HTTP attempts.
+Clients disable ambient proxy configuration and redirects; a fresh client per
+query prevents response cookies being reused. Response bodies are limited to
+256 KiB before JSON parsing; compressed responses are rejected.
+
+Statuses distinguish `found`, successful empty `not_found`, discarded or
+duplicate-only `untrusted`, `provider_error` (terminal 4xx), `quota_exceeded`
+(429), `timeout`, `unavailable` (transport/5xx), `bad_response`,
+`oversized_response`, `budget_exhausted`, and the three no-network gates
+`disabled`, `dry_run`, `provider_unconfigured`. Failures return labels only,
+never raw provider errors/bodies or keys. Malformed results are discarded.
+
+Returned title/description snippets are **unverified leads** (`verified=False`)
+with a source URL, not cited company claims or ownership/job-identity evidence.
+HTTPS URL filtering rejects credentials, obvious local/private literal hosts,
+nonstandard ports and unknown/malformed URL forms. It does not resolve DNS,
+prove public destination addresses, or protect a later fetch against rebinding;
+those checks belong to the separate public-fetching slice before any destination
+is contacted. Mocked tests exercise synthetic requests and bodies only; no live
+provider validation has been performed.
 
 ## Optional Adzuna source
 
@@ -574,6 +638,112 @@ least one failure. It is independent of `WHATSAPP_NOTIFY_ENABLED`:
 The summary exposes only the failure count and the first five abstract labels.
 It never includes descriptions, profiles, prompts, notes, credentials, or
 secrets. Default is off; opt in explicitly.
+
+## Offline automation dry-run (Issue #36)
+
+Operators can preview a full automation run without contacting any live
+source, provider or the JobTrail backend. The dry-run builds a
+deterministic `SimulationScenario` with three synthetic jobs and runs
+them through `build_planned_operations`, then prints a bounded JSON
+envelope on stdout. Use it to confirm threshold, cap and dedup
+behaviour without burning API quota or hitting the runtime database.
+
+### Flag and environment variable
+
+Trigger the dry-run with either:
+
+```sh
+python scripts/automated-job-search.example.py --automation-dry-run
+JOBTRAIL_AUTOMATION_DRY_RUN=1 python scripts/automated-job-search.example.py
+```
+
+The CLI flag wins over the environment variable. Recognised values for
+`JOBTRAIL_AUTOMATION_DRY_RUN` are `1/true/yes/on` (enable) and
+`0/false/no/off` (disable). Any other value fails closed with exit code
+2 **before** any gateway, cache or production `JobSearchAutomation` is
+constructed.
+
+### Forbidden side effects
+
+When the dry-run is enabled, the launcher never:
+
+- instantiates `JobTrailHTTPClient`,
+- reads, writes or resets the seen cache (`JOBTRAIL_SEEN_CACHE_PATH` is
+  ignored),
+- spawns the scorer subprocess,
+- invokes the configured provider (Hermes, OpenAI-compatible, ...),
+- sends a WhatsApp message through the configured helper,
+- probes the published port or the Docker container for backend discovery,
+- reads the operator profile, CV or any environment variables beyond the
+  ones listed above.
+
+Tests pin every one of these boundaries: see
+`tests/test_automation_dry_run.py` and
+`tests/test_launcher_automation_dry_run.py`.
+
+### JSON envelope
+
+The launcher emits one JSON object on stdout. The shape is stable and
+safe to diff across runs because the scenario is hard-coded and the
+optional clock parameter defaults to a fixed value for hermetic tests.
+
+```json
+{
+  "mode": "automation-dry-run",
+  "searched": 3,
+  "planned_imports": 3,
+  "planned_scores": 3,
+  "would_notify": false,
+  "selected": {
+    "title": "Senior Backend Engineer",
+    "company": "DryRunCo",
+    "location": "Remote",
+    "score": 91,
+    "jobUrl": "https://example.test/dry-run/2",
+    "sourceJobId": "2",
+    "source": "synthetic"
+  },
+  "envelope": {"scenario": "built-in", "clock": "..."},
+  "failures": []
+}
+```
+
+### Redaction guarantees
+
+The envelope is scrubbed before being printed. The redaction layer:
+
+- replaces private filesystem substrings (`/DATA/`, `/AppData/`,
+  `RESUME_SENTINEL`, `PROMPT_SENTINEL`) with `[redacted]`,
+- removes a fixed allowlist of credential query-string keys
+  (`app_id`, `app_key`, `api_key`, `apikey`, `token`, `access_token`,
+  `secret`, `password`, `client_secret`) so URLs that embed API
+  credentials are safe to share.
+
+The launch does **not** add new fields to the envelope beyond what
+`build_planned_operations` produces; if you need additional fields,
+extend the planner and pin them with a regression test.
+
+### Difference from scorer-only dry-run
+
+`jobtrail-ai-scorer score --dry-run` suppresses the score-note write but
+*still* invokes the configured provider and *still* lists jobs from
+JobTrail. The launcher `--automation-dry-run` mode is offline end to
+end: no source calls, no provider calls, no persistence writes, no
+network. They serve different purposes and are not interchangeable.
+
+## One-way n8n handoff
+
+JobTrail remains the sole scheduler, source collector, importer, scorer, SeenCache owner, and journal authority. The optional n8n adapter is disabled by default and sends one bounded, versioned, redacted run envelope only after the local run record is written. Hermes WhatsApp remains an independent local channel; n8n delivery never invokes or configures Hermes.
+
+Configure `N8N_ENABLED=1`, `N8N_ENDPOINT`, and optionally `N8N_TIMEOUT_SECONDS`, `N8N_RETRY_ATTEMPTS`, and `N8N_AUTH_HEADER`. Authentication values are configuration-only and are never copied into payloads, logs, or journal records. 2xx responses are acknowledgements; 4xx responses are terminal failures, while bounded 5xx/timeout attempts are recorded as exhausted or uncertain. Remove the endpoint or set `N8N_ENABLED=0` to roll back without disabling local automation.
+
+Feedback actions are independently default-off. Set `N8N_FEEDBACK_ACTIONS_ENABLED=1` to include bounded `applied`, `dismissed`, and `interesting` action descriptors via the canonical launcher handoff helper. This does not enable transport, authenticate callbacks, or perform write-back. Actions require a valid source/job identity and expire after one day. Selected evidence retains only bounded, redacted `{label, text}` entries with labels `direct`, `equivalent`, `inferred`, or `missing`.
+
+The scorer's default public matching strategy ships as package data and does not depend on the working directory. An explicit `matching_strategy_path` still selects the operator's file (including relative-path semantics); missing or invalid overrides safely continue without strategy context, rather than falling back to bundled rules. Classification uses coverage for EXPLORE after APPLY/REVIEW: fit 40 / coverage 90 is EXPLORE, while fit 60 / coverage 0 is SKIP. Exclusions and missing hard requirements always force SKIP.
+
+Delivery records are additive JSONL entries linked by `run_id` and `event_id`; local outcomes are retained when n8n is unavailable. Dry-run mode performs no network delivery and records no delivery acknowledgement. Verification uses only `python -m pytest` with injected `httpx.MockTransport` and fakes; no live automation, Docker, systemd, Hermes, WhatsApp, or public service is required.
+
+Telegram callbacks, public HTTPS ingress, authenticated write-back, Google Sheets as canonical storage, n8n-owned collection, Docker/systemd changes, and generic webhook behavior remain deferred.
 
 ## Safety rules
 

@@ -197,6 +197,166 @@ def test_probe_url_returns_false_on_urllib_error(monkeypatch):
     assert discover._probe_url(DEFAULT_PUBLISHED_URL, timeout=1.0) is False
 
 
+def test_probe_url_accepts_older_jobtrail_health_head_fallback(monkeypatch):
+    import urllib.error
+    import urllib.request
+
+    methods = []
+
+    def fake_urlopen(request, *, timeout):
+        methods.append(request.method)
+        if request.method == "GET":
+            raise urllib.error.HTTPError(request.full_url, 404, "not found", {}, None)
+        return type("Response", (), {"status": 204})()
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    assert discover._probe_url(DEFAULT_PUBLISHED_URL, timeout=1.0) is True
+    assert methods == ["GET", "HEAD"]
+
+
+@pytest.mark.parametrize("head_status", [403, 405])
+def test_probe_url_falls_back_to_legacy_health_after_head_http_error(
+    monkeypatch, head_status
+):
+    import urllib.error
+    import urllib.request
+
+    def fake_urlopen(request, *, timeout):
+        if request.method == "GET" and request.full_url.endswith("/api/health"):
+            raise urllib.error.HTTPError(request.full_url, 404, "not found", {}, None)
+        if request.method == "HEAD":
+            raise urllib.error.HTTPError(
+                request.full_url, head_status, "not allowed", {}, None
+            )
+        return type(
+            "Response",
+            (),
+            {
+                "status": 200,
+                "read": lambda self: b'{"status": "ok", "service": "jobtrail"}',
+            },
+        )()
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    assert discover._probe_url(DEFAULT_PUBLISHED_URL, timeout=1.0) is True
+
+
+def test_probe_url_falls_back_to_legacy_health_endpoint(monkeypatch):
+    import urllib.error
+    import urllib.request
+
+    methods_and_urls = []
+
+    def fake_urlopen(request, *, timeout):
+        methods_and_urls.append((request.method, request.full_url))
+        if request.full_url.endswith("/api/health"):
+            raise urllib.error.HTTPError(request.full_url, 404, "not found", {}, None)
+        return type(
+            "Response",
+            (),
+            {
+                "status": 200,
+                "read": lambda self: b'{"status": "ok", "service": "jobtrail"}',
+            },
+        )()
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    assert discover._probe_url(DEFAULT_PUBLISHED_URL, timeout=1.0) is True
+    assert methods_and_urls == [
+        ("GET", f"{DEFAULT_PUBLISHED_URL}/api/health"),
+        ("HEAD", f"{DEFAULT_PUBLISHED_URL}/api/health"),
+        ("GET", f"{DEFAULT_PUBLISHED_URL}/health"),
+    ]
+
+
+def test_probe_url_legacy_health_requires_jobtrail_payload(monkeypatch):
+    import urllib.error
+    import urllib.request
+
+    def fake_urlopen(request, *, timeout):
+        if request.full_url.endswith("/api/health"):
+            raise urllib.error.HTTPError(request.full_url, 404, "not found", {}, None)
+        return type("Response", (), {"status": 200, "read": lambda self: b'{"status": "ok", "service": "other"}'})()
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    assert discover._probe_url(DEFAULT_PUBLISHED_URL, timeout=1.0) is False
+
+
+def test_probe_url_accepts_jobtrail_legacy_health_payload(monkeypatch):
+    import urllib.error
+    import urllib.request
+
+    def fake_urlopen(request, *, timeout):
+        if request.full_url.endswith("/api/health"):
+            raise urllib.error.HTTPError(request.full_url, 404, "not found", {}, None)
+        return type("Response", (), {"status": 200, "read": lambda self: b'{"status": "ok", "service": "jobtrail"}'})()
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    assert discover._probe_url(DEFAULT_PUBLISHED_URL, timeout=1.0) is True
+
+
+@pytest.mark.parametrize(
+    ("legacy_status", "legacy_body"),
+    [(200, b"not json"), (204, None), (200, b'{"status": "ok", "service": "other"}')],
+)
+def test_probe_url_rejects_invalid_legacy_health_response(
+    monkeypatch, legacy_status, legacy_body
+):
+    import urllib.error
+    import urllib.request
+
+    def fake_urlopen(request, *, timeout):
+        if request.full_url.endswith("/api/health"):
+            if request.method == "GET":
+                raise urllib.error.HTTPError(request.full_url, 404, "not found", {}, None)
+            raise urllib.error.HTTPError(request.full_url, 405, "not allowed", {}, None)
+        return type(
+            "Response",
+            (),
+            {"status": legacy_status, "read": lambda self: legacy_body},
+        )()
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    assert discover._probe_url(DEFAULT_PUBLISHED_URL, timeout=1.0) is False
+
+
+@pytest.mark.parametrize("method", ["GET", "HEAD"])
+def test_probe_url_rejects_api_health_5xx(monkeypatch, method):
+    import urllib.error
+    import urllib.request
+
+    def fake_urlopen(request, *, timeout):
+        if request.full_url.endswith("/api/health"):
+            if request.method == "GET" and method == "GET":
+                raise urllib.error.HTTPError(
+                    request.full_url, 503, "unavailable", {}, None
+                )
+            if request.method == "GET":
+                raise urllib.error.HTTPError(request.full_url, 404, "not found", {}, None)
+            raise urllib.error.HTTPError(
+                request.full_url, 503, "unavailable", {}, None
+            )
+        return type("Response", (), {"status": 503})()
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    assert discover._probe_url(DEFAULT_PUBLISHED_URL, timeout=1.0) is False
+
+
+def test_probe_url_rejects_another_service_on_the_published_port(monkeypatch):
+    import urllib.error
+    import urllib.request
+
+    def fake_urlopen(request, *, timeout):
+        assert request.full_url == f"{DEFAULT_PUBLISHED_URL}/api/health"
+        raise urllib.error.HTTPError(
+            request.full_url, 401, "unauthorized", {}, None
+        )
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+
+    assert discover._probe_url(DEFAULT_PUBLISHED_URL, timeout=1.0) is False
+
+
 def test_docker_inspect_ip_extracts_ip_from_docker_output(monkeypatch):
     fake_output = f"{_DOC_IP_2}\n"
 

@@ -84,6 +84,257 @@ class FakeNotifier:
         self.messages.append(message)
 
 
+def _automation_test_job(source_job_id: str) -> NormalizedJob:
+    return NormalizedJob(
+        source="synthetic",
+        source_job_id=source_job_id,
+        title=source_job_id,
+        company="Acme",
+        description="Build things.",
+        source_url=f"https://example.test/{source_job_id}",
+        location="Remote",
+        metadata={},
+    )
+
+
+@pytest.mark.parametrize("payloads,expected", [
+    ([{"score": 99, "recommendation": "SKIP"}, {"score": 81}], ["1"]),
+    ([{"score": 99, "classification": "SKIP"}], []),
+    ([{"score": 99, "recommendation": "SKIP"}] * 3, []),
+    ([{"score": 99, "hard_requirements_missing": ["license"]}], []),
+    ([{"score": 99, "exclusion_signals": ["excluded"]}], []),
+    ([{"score": 99, "fit_score": 20, "coverage_score": 20,
+       "classification": "APPLY"}], []),
+    ([{"score": 99, "fit_score": "99", "coverage_score": 99}], []),
+    ([{"score": 99, "exclusion_signals": False}], []),
+    ([{"score": n} for n in (80, 91, 91, 90, 79)], ["1", "2", "3"]),
+    ([{"score": 80, "fit_score": 30, "coverage_score": 60,
+       "classification": "APPLY", "hard_requirements_missing": [],
+       "exclusion_signals": []}], ["0"]),
+    ([{"score": 79, "fit_score": 99, "coverage_score": 99}], []),
+])
+def test_shortlist_production_simulation_parity_and_boundaries(payloads, expected):
+    class Gateway:
+        def __init__(self):
+            self.jobs = {}
+
+        def import_job(self, payload):
+            job_id = payload["sourceJobId"]
+            self.jobs[job_id] = {**payload, "id": job_id}
+            return {"id": job_id}
+
+        def get_job(self, job_id):
+            return self.jobs[job_id]
+
+    jobs = tuple(_automation_test_job(str(i)) for i in range(len(payloads)))
+
+    class Source:
+        name = "synthetic"
+
+        def search(self, request):
+            return jobs
+
+    gateway = Gateway()
+
+    def note(payload):
+        return "[AI_JOB_SCORE_V1]\n" + json.dumps(payload)
+
+    def scorer(job_id, config_path):
+        # A later invalid legacy score must not hide the latest valid note.
+        gateway.jobs[job_id]["notes"] = [
+            {"body": note({"score": 100, "recommendation": "APPLY"})},
+            {"body": note(payloads[int(job_id)])},
+            {"body": note({"score": "invalid"})},
+        ]
+
+    messages = []
+    config = AutomationConfig(
+        scorer_config_path="safe/config.yaml", locations=("remote",),
+        score_threshold=80, max_score=10, notify_enabled=True,
+    )
+    production = automation.JobTrailAutomation(
+        gateway, scorer=scorer, notifier=messages.append, source_adapters=(Source(),)
+    ).run(config=config)
+    assert (production.selected or {}).get("sourceJobId") == (
+        expected[0] if expected else None
+    )
+    assert any("*JobTrail match:" in message for message in messages) == bool(expected)
+    if not expected:
+        assert all("sin coincidencias" in message for message in messages)
+    assert [job["sourceJobId"] for job in production.opportunities] == expected
+    assert production.selected == (production.opportunities[0] if expected else None)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("simulation touched an external boundary")
+
+    class ForbiddenGateway:
+        search = import_job = get_job = forbidden
+
+    class ForbiddenSource:
+        name = "synthetic"
+        search = forbidden
+
+    class ForbiddenCache:
+        transaction = forbidden
+
+    captured = tuple(
+        NormalizedJob(**{**job.__dict__, "metadata": {"score_note": note(payload)}})
+        for job, latest in zip(jobs, payloads)
+        for payload in (
+            {"score": 100, "recommendation": "APPLY"}, latest, {"score": "invalid"},
+        )
+    )
+    simulation = automation.JobTrailAutomation(
+        ForbiddenGateway(), scorer=forbidden, notifier=forbidden,
+        source_adapters=(ForbiddenSource(),), seen_cache=ForbiddenCache(),
+        preflight_runner=forbidden, circuit_breaker=object(),
+        simulation=automation.SimulationScenario("shortlist", captured),
+    ).run(config=config, clock_iso="2026-01-01T00:00:00+00:00")
+    assert [job["sourceJobId"] for job in simulation.opportunities] == expected
+    assert simulation.selected == (simulation.opportunities[0] if expected else None)
+    assert simulation.envelope["would_notify"] == bool(expected)
+    assert simulation.envelope["best"] == simulation.selected
+    assert simulation.imported == simulation.scored == 0
+    assert simulation.failures == ()
+
+
+def test_automation_run_positional_compatibility():
+    run = automation.AutomationRun(1, 2, 3, (), None, {}, None, False, "run")
+    assert run.run_id == "run"
+    assert run.opportunities == ()
+
+
+def test_production_equal_scores_keep_first_input_job():
+    class Gateway:
+        def __init__(self):
+            self.jobs = {}
+
+        def import_job(self, payload):
+            job_id = payload["sourceJobId"]
+            self.jobs[job_id] = {
+                **payload,
+                "id": job_id,
+                "notes": [],
+            }
+            return {"id": job_id}
+
+        def get_job(self, job_id):
+            return self.jobs[job_id]
+
+    class Source:
+        name = "synthetic"
+
+        def search(self, request):
+            return [_automation_test_job("first"), _automation_test_job("second")]
+
+    gateway = Gateway()
+
+    def scorer(job_id, config_path):
+        gateway.jobs[job_id]["notes"] = [
+            {
+                "body": "[AI_JOB_SCORE_V1]\n"
+                + json.dumps(
+                    {
+                        "score": 80,
+                        "recommendation": "APPLY",
+                        "strengths": [],
+                        "gaps": [],
+                    }
+                )
+            }
+        ]
+
+    result = JobSearchAutomation(
+        gateway, scorer=scorer, source_adapters=(Source(),)
+    ).run(
+        config=AutomationConfig(
+            scorer_config_path="safe/config.yaml", score_threshold=70, max_score=10
+        )
+    )
+
+    assert result.selected is not None
+    assert result.selected["sourceJobId"] == "first"
+
+
+@pytest.mark.parametrize("blocked", [
+    {"classification": "SKIP"}, {"recommendation": "SKIP"},
+    {"hard_requirements_missing": ["License"]},
+    {"exclusion_signals": ["Excluded employer"]},
+    {"fit_score": True}, {"fit_score": 80, "coverage_score": 80},
+])
+@pytest.mark.parametrize("with_controls", [False, True])
+def test_production_eligibility_gates_latest_note_before_ranking(blocked, with_controls):
+    class Gateway:
+        def __init__(self):
+            self.jobs = {}
+
+        def import_job(self, payload):
+            job_id = payload["sourceJobId"]
+            self.jobs[job_id] = {**payload, "id": job_id, "notes": []}
+            return {"id": job_id}
+
+        def get_job(self, job_id):
+            return self.jobs[job_id]
+
+    class Source:
+        name = "synthetic"
+
+        def search(self, request):
+            ids = ("blocked", "first", "second") if with_controls else ("blocked",)
+            return [_automation_test_job(job_id) for job_id in ids]
+
+    gateway = Gateway()
+    calls = []
+    notifier = FakeNotifier()
+
+    def scorer(job_id, config_path):
+        calls.append(job_id)
+        payload = {"score": 99, **blocked} if job_id == "blocked" else {"score": 80}
+        gateway.jobs[job_id]["notes"] = [
+            {"body": "[AI_JOB_SCORE_V1]\n" + json.dumps({"score": 100})},
+            {"body": "[AI_JOB_SCORE_V1]\n" + json.dumps(payload)},
+        ]
+
+    result = JobSearchAutomation(
+        gateway, scorer=scorer, notifier=notifier, source_adapters=(Source(),)
+    ).run(config=AutomationConfig(
+        scorer_config_path="safe/config.yaml", score_threshold=80,
+        notify_enabled=True,
+    ))
+
+    assert (result.selected or {}).get("sourceJobId") == ("first" if with_controls else None)
+    assert result.imported == result.scored == len(calls) == len(gateway.jobs)
+    assert result.failures == ()
+    envelope = automation.build_n8n_envelope(result, occurred_at="2026-10-03T00:00:00Z")
+    assert (envelope["selected"] is not None) == with_controls
+    assert len(notifier.messages) == 1
+    assert "blocked" not in notifier.messages[0]
+    assert ("sin coincidencias" in notifier.messages[0]) == (not with_controls)
+
+
+def test_production_negative_score_cap_is_bounded_to_zero():
+    class Source:
+        name = "synthetic"
+
+        def search(self, request):
+            return [_automation_test_job("first")]
+
+    gateway = FakeJobTrail()
+    scored: list[str] = []
+
+    def scorer(job_id, config_path):
+        scored.append(job_id)
+
+    result = JobSearchAutomation(
+        gateway, scorer=scorer, source_adapters=(Source(),)
+    ).run(
+        config=AutomationConfig(scorer_config_path="safe/config.yaml", max_score=-1)
+    )
+
+    assert scored == []
+    assert result.scored == 0
+
+
 def test_search_payloads_split_sites_and_locations():
     config = AutomationConfig.from_env({})
     payloads = search_payloads(config)
@@ -557,6 +808,17 @@ def test_automation_source_adapter_failure_is_partial():
     assert result.failures == ("search:terminal:RuntimeError",)
 
 
+def test_automation_run_exposes_stable_context_and_selected_summary():
+    run = automation.AutomationRun(run_id="run-1", selected={"title": "T", "description": "private"})
+    assert run.run_id == "run-1"
+    assert run.selected == {"title": "T", "description": "private"}
+
+
+def test_automation_config_n8n_delivery_is_disabled_by_default():
+    config = AutomationConfig.from_env({})
+    assert config.n8n.enabled is False
+
+
 def test_automation_run_profile_counts_defaults_empty():
     assert automation.AutomationRun().profile_counts == {}
 
@@ -920,6 +1182,7 @@ def test_run_scores_real_mode_and_notifies_once_for_best_match():
     )
     assert scorer.calls == [("j1", "safe/config.yaml")]
     assert len(notifier.messages) == 1
+    assert result.notification_sent is True
     assert result.selected["score"] == 91
     assert "good" not in notifier.messages[0]
     assert "candidate" not in notifier.messages[0].lower()
@@ -963,8 +1226,10 @@ def test_selected_notification_includes_public_search_profiles():
     )
 
     assert result.selected["searchProfiles"] == ["python", "backend"]
-    message = json.loads(notifier.messages[0])
-    assert message["searchProfiles"] == ["python", "backend"]
+    message = notifier.messages[0]
+    assert "*Search profiles:*" in message
+    assert "• python" in message
+    assert "• backend" in message
 
 
 def test_selected_notification_contains_job_and_score_data(monkeypatch):
@@ -990,36 +1255,68 @@ def test_selected_notification_contains_job_and_score_data(monkeypatch):
 
     assert summary_args[0][0] is gateway.jobs["j1"]
     assert summary_args[0][1]["score"] == 91
-    message = json.loads(notifier.messages[0])
-    assert set(message) == {
-        "title",
-        "company",
-        "location",
-        "score",
-        "recommendation",
-        "recommendationLabel",
-        "strengths",
-        "gaps",
-        "jobUrl",
-        "jobTrailLink",
-        "runId",
-    }
-    assert message["title"] == "Python Engineer"
-    assert message["company"] == "Acme"
-    assert message["location"] == "Queretaro"
-    assert message["jobUrl"] == "https://jobs.test/1"
-    assert message["score"] == 91
-    assert message["recommendation"] == "PRIORITY_APPLY"
-    assert message["recommendationLabel"] == "Priority Apply"
-    assert message["strengths"] == ["Python"]
-    assert message["gaps"] == ["None"]
-    assert message["jobTrailLink"] == "http://jobtrail.example.com/jobs/j1"
+    message = notifier.messages[0]
+    assert "*JobTrail match: Python Engineer*" in message
+    assert "*Company:* Acme" in message
+    assert "*Location:* Queretaro" in message
+    assert "*Score:* 91" in message
+    assert "*Recommendation:* Priority Apply" in message
+    assert "• Python" in message
+    assert "• None" in message
+    assert "*JobTrail:* http://jobtrail.example.com/jobs/j1" in message
     import re as _re
 
-    assert _re.match(r"^\d{4}-\d{2}-\d{2}-\d{4}-[a-f0-9]{6}$", message["runId"])
+    run_id = re.search(r"\*Run ID:\* (\S+)", message).group(1)
+    assert _re.match(r"^\d{4}-\d{2}-\d{2}-\d{4}-[a-f0-9]{6}$", run_id)
 
 
-def test_no_notification_when_score_below_threshold():
+def test_selected_notification_renders_readable_whatsapp_text(monkeypatch):
+    summary = {
+        "title": "Python Engineer",
+        "company": "Acme",
+        "location": "",
+        "score": 91,
+        "recommendation": "PRIORITY_APPLY",
+        "recommendationLabel": "Priority Apply",
+        "strengths": ["Python", "APIs"],
+        "gaps": ["None"],
+        "jobUrl": "https://jobs.test/1",
+        "jobTrailLink": "https://jobtrail.test/jobs/j1",
+        "runId": "20260926-1234-abcdef",
+    }
+    monkeypatch.setattr(automation, "build_notification_summary", lambda *args, **kwargs: summary)
+
+    message = JobSearchAutomation._compose_notification(
+        best={"id": "j1"},
+        best_job={},
+        best_score={},
+        failures=(),
+        notify_enabled=True,
+        notify_on_failure=False,
+        searched=1,
+        scored=1,
+        score_threshold=80,
+    )
+
+    assert message == (
+        "*JobTrail match: Python Engineer*\n"
+        "*Company:* Acme\n"
+        "*Score:* 91\n"
+        "*Recommendation:* Priority Apply\n"
+        "*JobTrail:* https://jobtrail.test/jobs/j1\n"
+        "*Source:* https://jobs.test/1\n"
+        "*Strengths:*\n"
+        "• Python\n"
+        "• APIs\n"
+        "*Gaps:*\n"
+        "• None\n"
+        "*Run ID:* 20260926-1234-abcdef"
+    )
+    assert "Location" not in message
+    assert not message.startswith("{")
+
+
+def test_no_match_notification_when_score_below_threshold():
     gateway = FakeJobTrail()
 
     def score(job_id, config_path):
@@ -1036,7 +1333,47 @@ def test_no_notification_when_score_below_threshold():
         )
     )
     assert result.selected is None
-    assert notifier.messages == []
+    assert result.notification_sent is True
+    assert len(notifier.messages) == 1
+    assert "Buscadas: 2" in notifier.messages[0]
+    assert "Puntuadas: 1" in notifier.messages[0]
+    assert "Umbral: 80" in notifier.messages[0]
+
+
+def test_no_match_notification_has_bounded_summary():
+    message = JobSearchAutomation._compose_notification(
+        best=None,
+        best_job=None,
+        best_score=None,
+        failures=(),
+        notify_enabled=True,
+        notify_on_failure=False,
+        searched=16,
+        scored=2,
+        score_threshold=80,
+    )
+    assert message == (
+        "JobTrail — sin coincidencias\n"
+        "Buscadas: 16\n"
+        "Puntuadas: 2\n"
+        "Umbral: 80\n"
+        "No hubo ofertas que calificaran."
+    )
+
+
+def test_no_match_notification_disabled():
+    message = JobSearchAutomation._compose_notification(
+        best=None,
+        best_job=None,
+        best_score=None,
+        failures=(),
+        notify_enabled=False,
+        notify_on_failure=False,
+        searched=1,
+        scored=1,
+        score_threshold=80,
+    )
+    assert message is None
 
 
 def test_parse_score_note_is_safe_and_uses_latest_valid_marker():
@@ -1143,6 +1480,19 @@ def test_failed_scorer_cannot_select_or_notify_old_high_marker():
 
     assert result.selected is None
     assert notifier.messages == []
+
+
+def test_supplied_run_id_is_clipped_and_scrubbed():
+    summary = build_notification_summary(
+        {"id": "j1"},
+        {"score": 88},
+        base_url="https://jobtrail.example.com",
+        run_id="RESUME_SENTINEL" + "x" * 300,
+    )
+
+    assert len(summary["runId"]) <= 200
+    assert "RESUME_SENTINEL" not in summary["runId"]
+    assert summary["runId"].startswith("[REDACTED]")
 
 
 def test_notification_summary_allowlist_and_bounded_text():
@@ -1682,7 +2032,7 @@ def test_automation_no_notification_when_nothing_to_report():
     scorer.jobs = gateway.jobs
 
     notifier = FakeNotifier()
-    JobSearchAutomation(gateway, scorer=scorer, notifier=notifier).run(
+    result = JobSearchAutomation(gateway, scorer=scorer, notifier=notifier).run(
         config=AutomationConfig(
             scorer_config_path="safe/config.yaml",
             notify_enabled=True,
@@ -1690,18 +2040,43 @@ def test_automation_no_notification_when_nothing_to_report():
     )
 
     # Existing behavior: a best match above the threshold triggers one notification.
+    assert result.notification_sent is True
     assert len(notifier.messages) == 1
 
     # With both flags off and no failures, the notifier must not be called again.
     notifier_off = FakeNotifier()
-    JobSearchAutomation(gateway, scorer=scorer, notifier=notifier_off).run(
+    result_off = JobSearchAutomation(
+        gateway, scorer=scorer, notifier=notifier_off
+    ).run(
         config=AutomationConfig(
             scorer_config_path="safe/config.yaml",
             notify_enabled=False,
             notify_on_failure=False,
         )
     )
+    assert result_off.notification_sent is False
     assert notifier_off.messages == []
+
+
+def test_notification_failure_sets_notification_sent_false():
+    gateway = FakeJobTrail()
+    scorer = FakeScorer()
+    scorer.jobs = gateway.jobs
+
+    def failing_notifier(_message):
+        raise RuntimeError("notifier unavailable")
+
+    result = JobSearchAutomation(
+        gateway, scorer=scorer, notifier=failing_notifier
+    ).run(
+        config=AutomationConfig(
+            scorer_config_path="safe/config.yaml",
+            notify_enabled=True,
+        )
+    )
+
+    assert result.notification_sent is False
+    assert result.failures[-1] == "notify"
 
 
 _RUN_ID_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}-\d{4}-[a-f0-9]{6}$")
@@ -1744,7 +2119,7 @@ def test_compose_notification_includes_three_new_fields_in_run():
     scorer.jobs = gateway.jobs
     notifier = FakeNotifier()
 
-    JobSearchAutomation(gateway, scorer=scorer, notifier=notifier).run(
+    result = JobSearchAutomation(gateway, scorer=scorer, notifier=notifier).run(
         config=AutomationConfig(
             base_url="http://jobtrail.example.com",
             scorer_config_path="safe/config.yaml",
@@ -1753,12 +2128,13 @@ def test_compose_notification_includes_three_new_fields_in_run():
     )
 
     assert len(notifier.messages) == 1
-    message = json.loads(notifier.messages[0])
+    message = notifier.messages[0]
     # The three new fields are present and stable.
-    assert message["jobTrailLink"].endswith("/jobs/j1")
-    assert message["jobTrailLink"].startswith("http://jobtrail.example.com")
-    assert message["recommendationLabel"] in {"Apply", "Priority Apply", "Review", "Skip"}
-    assert _RUN_ID_PATTERN.match(message["runId"])
+    assert "*JobTrail:* http://jobtrail.example.com/jobs/j1" in message
+    assert "*Recommendation:* Priority Apply" in message
+    run_id = re.search(r"\*Run ID:\* (\S+)", message).group(1)
+    assert _RUN_ID_PATTERN.match(run_id)
+    assert run_id == result.run_id
 
 
 def test_compose_notification_link_uses_whatsapp_short_url_base(monkeypatch):
@@ -1778,10 +2154,9 @@ def test_compose_notification_link_uses_whatsapp_short_url_base(monkeypatch):
         )
     )
 
-    message = json.loads(notifier.messages[0])
-    assert message["jobTrailLink"].startswith("https://sho.rt/")
-    assert message["jobTrailLink"].endswith("/jobs/j1")
-    assert "jobtrail.example.com" not in message["jobTrailLink"]
+    message = notifier.messages[0]
+    assert "*JobTrail:* https://sho.rt/jobs/j1" in message
+    assert "jobtrail.example.com" not in message
 
 
 def test_compose_notification_redacts_sensitive_substrings_in_run():

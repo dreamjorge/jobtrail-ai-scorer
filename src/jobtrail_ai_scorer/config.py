@@ -6,6 +6,8 @@ from typing import Literal
 import yaml
 from pydantic import AnyHttpUrl, BaseModel, field_validator
 
+from .matching_strategy import DEFAULT_STRATEGY_PATH
+
 
 class AppConfig(BaseModel):
     """Validated application configuration."""
@@ -13,6 +15,7 @@ class AppConfig(BaseModel):
     jobtrail_base_url: AnyHttpUrl
     candidate_profile_path: Path
     candidate_cv_path: Path | None = None
+    matching_strategy_path: Path = DEFAULT_STRATEGY_PATH
     provider: Literal["hermes", "openai_compatible"] = "hermes"
     hermes_executable: str = "hermes"
     hermes_profile: str = "default"

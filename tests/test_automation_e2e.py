@@ -49,7 +49,9 @@ from jobtrail_ai_scorer.automation import (
     AutomationRun,
     JobSearchAutomation,
     JobTrailHTTPClient,
+    build_n8n_envelope,
 )
+from jobtrail_ai_scorer.n8n_outbound import N8nConfig, N8nOutboundAdapter
 from jobtrail_ai_scorer.notify import ALLOWED_FIELDS
 from jobtrail_ai_scorer.retry import RetryPolicy
 from jobtrail_ai_scorer.seen_cache import SeenCache
@@ -61,6 +63,53 @@ from stubs.stub_whatsapp import StubWhatsApp
 
 
 pytestmark = pytest.mark.e2e
+
+
+def test_real_score_model_evidence_survives_outbound_boundary():
+    from jobtrail_ai_scorer.scoring import score_jobs
+
+    class Gateway:
+        note = None
+
+        def list_jobs(self):
+            return [{"id": "synthetic-1", "description": "Build services"}]
+
+        def get_job(self, job_id):
+            return {"id": job_id, "description": "Build services", "notes": []}
+
+        def add_note(self, job_id, body):
+            self.note = body
+
+    class Provider:
+        def score(self, prompt):
+            return json.dumps({
+                "score": 90, "fit_score": 40, "coverage_score": 90,
+                "recommendation": "REVIEW", "strengths": [], "gaps": [],
+                "needs_confirmation": [], "hard_requirements_missing": [],
+                "career_value": "Medium", "reasoning": "Synthetic evidence",
+                "evidence": [{"label": "equivalent", "text": "/DATA/ " + "x" * 300}],
+            })
+
+    gateway = Gateway()
+    result = score_jobs(gateway, Provider(), "Synthetic profile", emit_status=False)
+    assert result.processed == 1
+    from jobtrail_ai_scorer.scoring import parse_score_note
+    score = parse_score_note([{"body": gateway.note}])
+    run = AutomationRun(run_id="synthetic-run", selected={
+        **score, "source": "synthetic", "sourceJobId": "synthetic-1",
+    })
+    envelope = build_n8n_envelope(run, occurred_at="2030-01-01T00:00:00+00:00")
+    assert envelope["selected"]["evidence"] == [{
+        "label": "equivalent", "text": ("[redacted] " + "x" * 300)[:200],
+    }]
+    assert envelope["selected"]["classification"] == "EXPLORE"
+    captured = []
+    adapter = N8nOutboundAdapter(
+        N8nConfig(enabled=True, endpoint="https://synthetic.test/events"),
+        transport=httpx.MockTransport(lambda request: (captured.append(json.loads(request.content)) or httpx.Response(200))),
+    )
+    assert adapter.send(envelope).status == "accepted"
+    assert captured == [envelope]
 
 
 # --- Fixtures ----------------------------------------------------------------
@@ -248,15 +297,15 @@ def test_happy_path_drives_full_pipeline(server, state):
         for note in state.jobs[job_id_alpha]["notes"]
     )
 
-    # Exactly one best-match WhatsApp message with only allowlisted fields.
+    # Exactly one best-match WhatsApp message rendered as readable text.
     assert len(whatsapp.messages) == 1
-    payload = json.loads(whatsapp.messages[0])
-    _assert_allowlisted_notification_payload(payload)
-    assert payload["score"] == 91
-    assert payload["recommendation"] == "PRIORITY_APPLY"
+    body = whatsapp.messages[0]
+    assert body.startswith("*JobTrail match:")
+    assert "*Score:* 91" in body
+    assert "*Recommendation:* Priority Apply" in body
     # The link is percent-encoded; decode it before comparing to the raw id.
-    assert unquote(payload["jobTrailLink"]).endswith(f"/jobs/{job_id_alpha}")
-    rendered = json.dumps(payload).lower()
+    assert f"/jobs/{job_id_alpha}" in unquote(body)
+    rendered = body.lower()
     for forbidden in (
         "description",
         "candidate",
@@ -350,7 +399,8 @@ def test_dedup_skip_second_search(tmp_path, server, state):
     assert run_two.imported == 0
     assert run_two.scored == 0
     assert run_two.failures == ()
-    assert whatsapp_two.messages == []
+    assert len(whatsapp_two.messages) == 1
+    assert "No hubo ofertas que calificaran." in whatsapp_two.messages[0]
 
 
 def test_partial_failure_continues_run(server, state):
@@ -431,18 +481,15 @@ def test_redaction_strips_forbidden_tokens_from_notification(server, state):
         assert sentinel not in body
     assert "[REDACTED]" in body
 
-    # The parsed payload still exposes the strengths/gaps arrays but with
-    # the sentinels replaced by the redacted placeholder.
-    payload = json.loads(body)
-    flat = json.dumps(payload)
+    # Readable text still exposes the redacted strengths/gaps content.
     for sentinel in (
         "RESUME_SENTINEL",
         "PROFILE_SENTINEL",
         "PROMPT_SENTINEL",
         "CREDENTIAL_SENTINEL",
     ):
-        assert sentinel not in flat
-    assert "[REDACTED]" in flat
+        assert sentinel not in body
+    assert "[REDACTED]" in body
 
 
 def test_get_job_endpoint_serves_persisted_notes(server, state):
@@ -477,6 +524,74 @@ def test_get_job_endpoint_serves_persisted_notes(server, state):
     assert payload["recommendation"] == "APPLY"
 
 
+def test_n8n_handoff_preserves_scoring_metadata(server, state):
+    """The automation-to-n8n boundary carries the selected score metadata."""
+
+    class MetadataScorer(StubScorer):
+        def __call__(self, job_id: str, config_path: str) -> None:
+            super().__call__(job_id, config_path)
+            note = self.state.jobs[job_id]["notes"][0]
+            payload = json.loads(note["body"].split("[AI_JOB_SCORE_V1]", 1)[1])
+            payload.update(
+                {
+                    "fit_score": 87,
+                    "coverage_score": 76,
+                    "needs_confirmation": [],
+                    "hard_requirements_missing": [],
+                    "career_value": "Medium",
+                    "reasoning": "Synthetic service experience",
+                    "classification": "REVIEW",
+                    "strengths": ["Python services match"],
+                    "evidence": [{"label": "direct", "text": "Python services match"}],
+                    "gaps": ["Cloud deployment experience"],
+                }
+            )
+            from jobtrail_ai_scorer.models import ScoreResult
+            payload = ScoreResult.model_validate(payload).model_dump(mode="json")
+            self.state.set_notes(
+                job_id,
+                [{"body": f"[AI_JOB_SCORE_V1]\n{json.dumps(payload)}"}],
+            )
+
+    scorer = MetadataScorer(
+        state, default_score=91, recommendation="PRIORITY_APPLY"
+    )
+    result = _run(server, scorer=scorer, notifier=StubWhatsApp())
+    envelope = build_n8n_envelope(
+        result,
+        occurred_at="2025-01-01T00:00:00+00:00",
+        feedback_actions=True,
+    )
+    requests = []
+    adapter = N8nOutboundAdapter(
+        N8nConfig(enabled=True, endpoint="https://n8n.test/hook"),
+        transport=httpx.MockTransport(
+            lambda request: (requests.append(request) or httpx.Response(202))
+        ),
+    )
+
+    assert adapter.send(envelope).status == "accepted"
+    delivered = json.loads(requests[0].content)
+    selected = delivered["selected"]
+    assert selected["score"] == 91
+    assert selected["recommendation"] == "PRIORITY_APPLY"
+    assert selected["fit_score"] == 87
+    assert selected["coverage_score"] == 76
+    assert selected["classification"] == "APPLY"
+    assert selected["strengths"] == ["Python services match"]
+    assert selected["evidence"] == [{"label": "direct", "text": "Python services match"}]
+    assert selected["gaps"] == ["Cloud deployment experience"]
+    assert {item["action"] for item in delivered["actions"]} == {
+        "applied", "dismissed", "interesting"
+    }
+    assert all(
+        set(item) == {"action", "action_id", "token_id", "expires_at"}
+        for item in delivered["actions"]
+    )
+    assert "description" not in selected
+    assert "notes" not in selected
+
+
 def test_single_notification_invariant_above_threshold(server, state):
     """Multiple scored jobs above the threshold produce one notification."""
 
@@ -489,16 +604,17 @@ def test_single_notification_invariant_above_threshold(server, state):
     _run(server, scorer=scorer, notifier=whatsapp)
 
     assert len(whatsapp.messages) == 1
-    payload = json.loads(whatsapp.messages[0])
-    assert payload["score"] == 92
-    assert payload["recommendation"] == "PRIORITY_APPLY"
-    _assert_allowlisted_notification_payload(payload)
+    body = whatsapp.messages[0]
+    assert "*Score:* 92" in body
+    assert "*Recommendation:* Priority Apply" in body
     # The run id matches the documented ``YYYY-MM-DD-HHMM-<6 hex>`` shape.
-    assert re.match(r"^\d{4}-\d{2}-\d{2}-\d{4}-[a-f0-9]{6}$", payload["runId"])
+    assert re.search(
+        r"\*Run ID:\* \d{4}-\d{2}-\d{2}-\d{4}-[a-f0-9]{6}", body
+    )
     # Exactly one of the two jobs is referenced by the rendered link.
-    decoded_link = unquote(payload["jobTrailLink"])
+    decoded_body = unquote(body)
     expected_ids = {
         state.id_for("indeed", "alpha-1"),
         state.id_for("linkedin", "beta-2"),
     }
-    assert any(decoded_link.endswith(f"/jobs/{job_id}") for job_id in expected_ids)
+    assert sum(f"/jobs/{job_id}" in decoded_body for job_id in expected_ids) == 1

@@ -1,0 +1,924 @@
+"""Offline automation dry-run seam (issue #36).
+
+The ``JobTrailAutomation`` constructor accepts an optional ``simulation``
+keyword that swaps the production pipeline for a deterministic, hermetic
+replay built from a :class:`SimulationScenario`. This module pins that
+contract:
+
+* No live network, no Docker, no subprocess, no private-profile read.
+* No ``gateway.import_job`` / ``gateway.get_job`` calls.
+* The pipeline still produces an :class:`AutomationRun`-shaped object that
+  callers (and the launcher) can introspect, plus a
+  :class:`PlannedOperations` envelope summarising what would have happened.
+* Output is deterministic for a fixed clock/seed/scenario.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+import json
+
+import pytest
+
+import jobtrail_ai_scorer.automation as _automation
+
+_REQUIRED_SYMBOLS: tuple[str, ...] = (
+    "AutomationConfig",
+    "AutomationGateway",
+    "AutomationRun",
+    "JobTrailAutomation",
+)
+
+# Optional (slice-specific) symbols. They are looked up lazily inside the
+# helper functions below so module collection succeeds in RED phase and the
+# per-test ``pytest.fail`` reports the missing names with context.
+_OPTIONAL_SYMBOLS: tuple[str, ...] = (
+    "PlannedOperations",
+    "SimulationScenario",
+    "build_planned_operations",
+)
+
+
+_automation_state: dict[str, Any] = {}
+_missing_optional: list[str] = []
+
+
+def _bootstrap_automation_symbols() -> None:
+    """Resolve the simulation helpers from the automation module.
+
+    When the slice is RED, the slice-specific symbols do not exist yet.
+    Instead of failing module collection (which would block the entire
+    test session), the adapter records the missing names and exposes
+    ``None`` placeholders. Individual tests call :func:`require_optional`
+    to obtain the helper and receive a meaningful ``pytest.fail`` listing
+    every missing symbol.
+    """
+
+    for name in _REQUIRED_SYMBOLS:
+        value = getattr(_automation, name, None)
+        if value is None:
+            raise RuntimeError(
+                f"required automation symbol {name!r} unexpectedly missing"
+            )
+        _automation_state[name] = value
+
+    for name in _OPTIONAL_SYMBOLS:
+        value = getattr(_automation, name, None)
+        if value is None:
+            _missing_optional.append(name)
+        _automation_state[name] = value
+
+
+def require_optional(name: str) -> Any:
+    """Return the optional symbol ``name`` or fail RED-style."""
+
+    value = _automation_state.get(name)
+    if value is None:
+        pytest.fail(
+            "Automation dry-run RED step missing helpers: "
+            + ", ".join(_missing_optional or [name])
+        )
+    return value
+
+
+_bootstrap_automation_symbols()
+
+AutomationConfig = _automation_state["AutomationConfig"]
+AutomationGateway = _automation_state["AutomationGateway"]
+AutomationRun = _automation_state["AutomationRun"]
+JobTrailAutomation = _automation_state["JobTrailAutomation"]
+
+from jobtrail_ai_scorer.scoring import CURRENT_MARKER  # noqa: E402
+from jobtrail_ai_scorer.sources import NormalizedJob  # noqa: E402
+
+
+# --- Gateway stubs ------------------------------------------------------------
+
+
+class _RecordingGateway(AutomationGateway):
+    """In-process gateway that records every call it receives.
+
+    The dry-run contract states that the gateway MUST NOT be touched when
+    ``simulation=`` is supplied. The tests below use the absence of any
+    recorded call as evidence that the forbidden boundary was respected.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, tuple[Any, ...]]] = []
+
+    def import_job(self, payload: dict[str, Any]) -> dict[str, Any]:
+        self.calls.append(("import_job", (payload,)))
+        return {"id": "live-id"}
+
+    def get_job(self, job_id: str) -> dict[str, Any]:
+        self.calls.append(("get_job", (job_id,)))
+        return {"id": job_id, "notes": []}
+
+    def list_jobs(self) -> list[dict[str, Any]]:
+        self.calls.append(("list_jobs", ()))
+        return []
+
+    def add_note(self, job_id: str, body: str) -> None:
+        self.calls.append(("add_note", (job_id, body)))
+
+
+# --- Helpers ------------------------------------------------------------------
+
+
+def _score_note(score: int, recommendation: str = "APPLY") -> str:
+    return (
+        f'{CURRENT_MARKER}\n'
+        f'{{"score":{score},"recommendation":"{recommendation}",'
+        f'"strengths":[],"gaps":[],"needs_confirmation":[],'
+        f'"hard_requirements_missing":[],"career_value":"Medium",'
+        f'"reasoning":"ok"}}'
+    )
+
+
+def _job(
+    *,
+    source: str = "synthetic",
+    source_job_id: str = "1",
+    title: str = "Engineer",
+    company: str = "Acme",
+    description: str = "Build things.",
+    score: int | None = None,
+) -> NormalizedJob:
+    metadata: dict[str, Any] = {}
+    if score is not None:
+        metadata["score_note"] = _score_note(score)
+    return NormalizedJob(
+        source=source,
+        source_job_id=source_job_id,
+        title=title,
+        company=company,
+        description=description,
+        source_url=f"https://example.com/jobs/{source_job_id}",
+        location="Remote",
+        metadata=metadata,
+    )
+
+
+def _base_config() -> AutomationConfig:
+    return AutomationConfig(
+        scorer_config_path="unused.yaml",
+        scorer_command="unused",
+        score_threshold=70,
+        max_score=10,
+        notify_enabled=False,
+        whatsapp_command="",
+        base_url="https://example.test",
+    )
+
+
+# --- Tests --------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("blocked", [
+    {"classification": "SKIP"}, {"recommendation": "SKIP"},
+    {"hard_requirements_missing": ["License"]},
+    {"exclusion_signals": ["Excluded employer"]},
+    {"fit_score": True}, {"fit_score": 80, "coverage_score": 80},
+])
+@pytest.mark.parametrize("with_controls", [False, True])
+def test_simulation_eligibility_gates_latest_note_before_ranking(blocked, with_controls):
+    SimulationScenario = require_optional("SimulationScenario")
+    build_planned_operations = require_optional("build_planned_operations")
+    latest = _job(source_job_id="blocked")
+    latest.metadata["score_note"] = CURRENT_MARKER + "\n" + json.dumps({"score": 99, **blocked})
+    jobs = (_job(source_job_id="blocked", score=100), latest)
+    if with_controls:
+        jobs += (_job(source_job_id="first", score=80), _job(source_job_id="second", score=80))
+    scenario = SimulationScenario(name="eligibility", jobs=jobs)
+    config = _base_config()
+    gateway = _RecordingGateway()
+    planned = build_planned_operations(scenario, config=config)
+    result = JobTrailAutomation(gateway, simulation=scenario).run(config=config)
+
+    assert (planned.best or {}).get("sourceJobId") == ("first" if with_controls else None)
+    assert result.selected == planned.best
+    assert planned.planned_imports == (3 if with_controls else 1)
+    assert planned.planned_scores == (3 if with_controls else 1)
+    assert result.imported == result.scored == 0
+    assert result.failures == ()
+    assert gateway.calls == []
+
+
+def test_simulation_seam_is_optional_and_does_not_affect_constructor() -> None:
+    gateway = _RecordingGateway()
+    JobTrailAutomation(gateway)
+    # Constructor did not call into the gateway.
+    assert gateway.calls == []
+
+
+def test_simulation_seam_does_not_call_gateway_when_provided() -> None:
+    SimulationScenario = require_optional("SimulationScenario")
+    gateway = _RecordingGateway()
+    scenario = SimulationScenario(
+        name="two-jobs",
+        jobs=(_job(source_job_id="1", score=80), _job(source_job_id="2", score=55)),
+    )
+    automation = JobTrailAutomation(gateway, simulation=scenario)
+    result = automation.run(config=_base_config())
+    assert isinstance(result, AutomationRun)
+    assert gateway.calls == []
+
+
+def test_simulation_seam_does_not_invoke_default_scorer_subprocess() -> None:
+    """``self.scorer`` must remain unused when the simulation supplies scores."""
+
+    SimulationScenario = require_optional("SimulationScenario")
+    captured: list[tuple[str, str]] = []
+
+    def forbidden_scorer(job_id: str, config_path: str) -> None:
+        captured.append((job_id, config_path))
+
+    gateway = _RecordingGateway()
+    scenario = SimulationScenario(
+        name="single",
+        jobs=(_job(source_job_id="1", score=85),),
+    )
+    automation = JobTrailAutomation(
+        gateway,
+        scorer=forbidden_scorer,
+        simulation=scenario,
+    )
+    automation.run(config=_base_config())
+    assert captured == []
+
+
+def test_simulation_does_not_invoke_notifier_even_when_enabled() -> None:
+    SimulationScenario = require_optional("SimulationScenario")
+    sent: list[str] = []
+
+    def notifier(message: str) -> None:
+        sent.append(message)
+
+    gateway = _RecordingGateway()
+    scenario = SimulationScenario(
+        name="match",
+        jobs=(_job(source_job_id="1", score=90, title="Top"),),
+    )
+    automation = JobTrailAutomation(gateway, notifier=notifier, simulation=scenario)
+    config = AutomationConfig(
+        scorer_config_path="unused.yaml",
+        scorer_command="unused",
+        score_threshold=70,
+        max_score=10,
+        notify_enabled=True,  # even with notify on, no message is sent
+        whatsapp_command="unused",
+        base_url="https://example.test",
+    )
+    automation.run(config=config)
+    assert sent == []
+
+
+def test_simulation_picks_best_job_above_threshold() -> None:
+    SimulationScenario = require_optional("SimulationScenario")
+    gateway = _RecordingGateway()
+    scenario = SimulationScenario(
+        name="three",
+        jobs=(
+            _job(source_job_id="1", score=80, title="A"),
+            _job(source_job_id="2", score=95, title="B"),
+            _job(source_job_id="3", score=42, title="C"),
+        ),
+    )
+    automation = JobTrailAutomation(gateway, simulation=scenario)
+    result = automation.run(config=_base_config())
+    assert result.selected is not None
+    assert result.selected["title"] == "B"
+    assert result.selected["score"] == 95
+    assert result.searched == 3
+    assert result.imported == 0  # no live imports
+    assert result.scored == 0  # scoring happened inside the scenario
+
+
+def test_simulation_filters_below_threshold() -> None:
+    SimulationScenario = require_optional("SimulationScenario")
+    gateway = _RecordingGateway()
+    scenario = SimulationScenario(
+        name="all-low",
+        jobs=(
+            _job(source_job_id="1", score=30),
+            _job(source_job_id="2", score=50),
+        ),
+    )
+    automation = JobTrailAutomation(gateway, simulation=scenario)
+    result = automation.run(config=_base_config())
+    assert result.selected is None
+
+
+def test_simulation_respects_non_positive_score_caps() -> None:
+    SimulationScenario = require_optional("SimulationScenario")
+    gateway = _RecordingGateway()
+    scenario = SimulationScenario(
+        name="one",
+        jobs=(_job(source_job_id="1", score=90),),
+    )
+    automation = JobTrailAutomation(gateway, simulation=scenario)
+
+    for max_score in (0, -1):
+        result = automation.run(
+            config=AutomationConfig(score_threshold=70, max_score=max_score)
+        )
+        assert result.selected is None
+        assert result.scored == 0
+
+
+def test_simulation_deduplicates_normalized_jobs_inside_the_scenario() -> None:
+    """Equivalent trimmed/case-folded identities only count once."""
+
+    SimulationScenario = require_optional("SimulationScenario")
+    gateway = _RecordingGateway()
+    scenario = SimulationScenario(
+        name="normalized-dup",
+        jobs=(
+            _job(source=" Indeed ", source_job_id=" JOB-1 ", score=70),
+            _job(source="indeed", source_job_id="job-1", score=88),
+        ),
+    )
+    automation = JobTrailAutomation(gateway, simulation=scenario)
+    result = automation.run(config=_base_config())
+    assert result.selected is not None
+    assert result.selected["score"] == 88
+    assert result.envelope["planned_imports"] == 1
+
+
+def test_simulation_does_not_deduplicate_invalid_identities() -> None:
+    """Invalid production identities are imported independently."""
+
+    SimulationScenario = require_optional("SimulationScenario")
+    scenario = SimulationScenario(
+        name="invalid-identities",
+        jobs=(
+            _job(source=" ", source_job_id="JOB-1", score=80),
+            _job(source="indeed", source_job_id=" ", score=90),
+        ),
+    )
+    planned = require_optional("build_planned_operations")(
+        scenario, _base_config(), clock_iso="2025-01-01T00:00:00+00:00"
+    )
+    assert planned.to_envelope()["planned_imports"] == 2
+
+
+def test_simulation_deduplicates_jobs_inside_the_scenario() -> None:
+    """Scenario-only dedup: same identity only counts once."""
+
+    SimulationScenario = require_optional("SimulationScenario")
+    gateway = _RecordingGateway()
+    scenario = SimulationScenario(
+        name="dup",
+        jobs=(
+            _job(source="jobspy", source_job_id="42", score=70),
+            _job(source="jobspy", source_job_id="42", score=88),
+        ),
+    )
+    automation = JobTrailAutomation(gateway, simulation=scenario)
+    result = automation.run(config=_base_config())
+    assert result.selected is not None
+    # The later score is retained as history for the deduplicated identity.
+    assert result.selected["score"] == 88
+    assert result.envelope["planned_imports"] == 1
+
+
+def test_simulation_caps_discovery_order_before_ranking() -> None:
+    SimulationScenario = require_optional("SimulationScenario")
+    build_planned_operations = require_optional("build_planned_operations")
+    scenario = SimulationScenario(
+        name="cap",
+        jobs=(
+            _job(source_job_id="78", score=80, title="First"),
+            _job(source_job_id="91", score=99, title="Higher"),
+        ),
+    )
+    config = AutomationConfig(score_threshold=70, max_score=1)
+
+    envelope = build_planned_operations(
+        scenario, config, clock_iso="2025-01-01T00:00:00+00:00"
+    ).to_envelope()
+
+    assert envelope["planned_imports"] == 2
+    assert envelope["planned_scores"] == 1
+    assert envelope["best"]["sourceJobId"] == "78"
+
+
+def test_simulation_bounds_oversized_scenario_before_planning() -> None:
+    SimulationScenario = require_optional("SimulationScenario")
+    build_planned_operations = require_optional("build_planned_operations")
+    max_jobs = _automation.MAX_SIMULATION_JOBS
+    scenario = SimulationScenario(
+        name="oversized",
+        jobs=tuple(
+            _job(source_job_id=str(index), score=80, title="Prefix")
+            for index in range(max_jobs)
+        )
+        + (_job(source_job_id="after-bound", score=99, title="Unbounded"),),
+    )
+
+    envelope = build_planned_operations(
+        scenario, AutomationConfig(score_threshold=70, max_score=max_jobs),
+        clock_iso="2025-01-01T00:00:00+00:00",
+    ).to_envelope()
+
+    assert len(scenario.jobs) == max_jobs
+    assert envelope["searched"] == max_jobs
+    assert envelope["planned_imports"] == max_jobs
+    assert envelope["best"]["sourceJobId"] == "0"
+
+
+def test_simulation_breaks_ties_by_input_order() -> None:
+    SimulationScenario = require_optional("SimulationScenario")
+    gateway = _RecordingGateway()
+    scenario = SimulationScenario(
+        name="ties",
+        jobs=(
+            _job(source_job_id="1", score=80, title="First"),
+            _job(source_job_id="2", score=80, title="Second"),
+        ),
+    )
+    automation = JobTrailAutomation(gateway, simulation=scenario)
+    result = automation.run(config=_base_config())
+    assert result.selected is not None
+    assert result.selected["title"] == "First"
+
+
+def test_simulation_handles_empty_discovery() -> None:
+    SimulationScenario = require_optional("SimulationScenario")
+    gateway = _RecordingGateway()
+    scenario = SimulationScenario(name="empty", jobs=())
+    automation = JobTrailAutomation(gateway, simulation=scenario)
+    result = automation.run(config=_base_config())
+    assert result.selected is None
+    assert result.searched == 0
+
+
+def test_simulation_emits_planned_operations_envelope() -> None:
+    SimulationScenario = require_optional("SimulationScenario")
+    PlannedOperations = require_optional("PlannedOperations")
+    build_planned_operations = require_optional("build_planned_operations")
+    scenario = SimulationScenario(
+        name="envelope",
+        jobs=(
+            _job(source_job_id="1", score=80),
+            _job(source_job_id="2", score=55),
+        ),
+    )
+    config = AutomationConfig(
+        scorer_config_path="unused.yaml",
+        scorer_command="unused",
+        score_threshold=70,
+        max_score=10,
+        notify_enabled=True,  # required for would_notify to be True
+        whatsapp_command="unused",
+        base_url="https://example.test",
+    )
+    planned = build_planned_operations(scenario, config)
+    assert isinstance(planned, PlannedOperations)
+    envelope = planned.to_envelope()
+    assert envelope["scenario"] == "envelope"
+    assert envelope["searched"] == 2
+    assert envelope["planned_imports"] == 2
+    assert envelope["planned_scores"] == 2
+    assert envelope["would_notify"] is True
+    assert envelope["best"]["score"] == 80
+    # Envelope must be JSON-serialisable.
+    import json
+
+    json.dumps(envelope)
+
+
+def test_simulation_envelope_is_deterministic_with_fixed_clock() -> None:
+    SimulationScenario = require_optional("SimulationScenario")
+    build_planned_operations = require_optional("build_planned_operations")
+    scenario = SimulationScenario(
+        name="deterministic",
+        jobs=(_job(source_job_id="1", score=80),),
+    )
+    fixed_clock = "2025-01-01T00:00:00+00:00"
+    a = build_planned_operations(scenario, _base_config(), clock_iso=fixed_clock)
+    b = build_planned_operations(scenario, _base_config(), clock_iso=fixed_clock)
+    assert a.to_envelope() == b.to_envelope()
+
+
+def test_simulation_run_accepts_fixed_clock_for_deterministic_replays() -> None:
+    SimulationScenario = require_optional("SimulationScenario")
+    scenario = SimulationScenario(
+        name="deterministic-run",
+        jobs=(_job(source_job_id="1", score=80),),
+    )
+    fixed_clock = "2025-01-01T00:00:00+00:00"
+    first = JobTrailAutomation(_RecordingGateway(), simulation=scenario).run(
+        config=_base_config(), clock_iso=fixed_clock
+    )
+    second = JobTrailAutomation(_RecordingGateway(), simulation=scenario).run(
+        config=_base_config(), clock_iso=fixed_clock
+    )
+    assert first.envelope == second.envelope
+    assert first.run_id == second.run_id
+
+
+@pytest.mark.parametrize(
+    "clock_iso",
+    ["not-a-clock", "2025-01-01T00:00:00", "2025-01-01"],
+    ids=["invalid", "naive", "date-only"],
+)
+def test_build_planned_operations_rejects_invalid_clocks(clock_iso: str) -> None:
+    SimulationScenario = require_optional("SimulationScenario")
+    build_planned_operations = require_optional("build_planned_operations")
+    scenario = SimulationScenario(name="clock", jobs=())
+
+    with pytest.raises(ValueError, match="timezone-aware ISO datetime"):
+        build_planned_operations(scenario, _base_config(), clock_iso=clock_iso)
+
+
+@pytest.mark.parametrize(
+    "clock_iso",
+    ["not-a-clock", "2025-01-01T00:00:00", "2025-01-01"],
+    ids=["invalid", "naive", "date-only"],
+)
+def test_simulation_run_returns_stable_failure_for_invalid_clocks(
+    clock_iso: str,
+) -> None:
+    SimulationScenario = require_optional("SimulationScenario")
+    scenario = SimulationScenario(name="clock", jobs=())
+
+    result = JobTrailAutomation(_RecordingGateway(), simulation=scenario).run(
+        config=_base_config(), clock_iso=clock_iso
+    )
+
+    assert result.failures == ("simulation:invalid_clock",)
+    assert result.envelope == {"error": "invalid_clock", "redacted": True}
+
+
+def test_build_planned_operations_accepts_and_normalizes_offset_clock() -> None:
+    SimulationScenario = require_optional("SimulationScenario")
+    build_planned_operations = require_optional("build_planned_operations")
+    scenario = SimulationScenario(name="clock", jobs=())
+
+    planned = build_planned_operations(
+        scenario, _base_config(), clock_iso="2025-01-01T03:00:00+03:00"
+    )
+
+    assert planned.to_envelope()["clock"] == "2025-01-01T03:00:00+03:00"
+    assert planned.to_envelope() == build_planned_operations(
+        scenario, _base_config(), clock_iso="2025-01-01T03:00:00+03:00"
+    ).to_envelope()
+
+
+def test_simulation_envelope_redacts_sensitive_substrings() -> None:
+    """``PlannedOperations.to_envelope`` MUST scrub private markers."""
+
+    SimulationScenario = require_optional("SimulationScenario")
+    build_planned_operations = require_optional("build_planned_operations")
+    scenario = SimulationScenario(
+        name="scenario RESUME_SENTINEL /DATA/private",
+        jobs=(
+            _job(
+                source_job_id="x",
+                score=70,
+                title="Engineer at /DATA/AppData/private",
+                description="mentions RESUME_SENTINEL token",
+            ),
+        ),
+    )
+    planned = build_planned_operations(scenario, _base_config())
+    envelope = planned.to_envelope()
+    rendered = str(envelope)
+    assert "/DATA/AppData" not in rendered
+    assert "RESUME_SENTINEL" not in rendered
+
+
+def test_simulation_with_unknown_scenario_type_raises() -> None:
+    gateway = _RecordingGateway()
+    with pytest.raises(ValueError, match="simulation"):
+        JobTrailAutomation(gateway, simulation="not-a-scenario")
+
+
+def test_simulation_with_none_is_equivalent_to_no_simulation() -> None:
+    gateway = _RecordingGateway()
+    JobTrailAutomation(gateway, simulation=None)
+    # No gateway call expected from the constructor.
+    assert gateway.calls == []
+
+
+def test_simulation_envelope_attaches_to_run() -> None:
+    """The dry-run result MUST expose the planned-operations envelope."""
+
+    SimulationScenario = require_optional("SimulationScenario")
+    gateway = _RecordingGateway()
+    scenario = SimulationScenario(
+        name="attach",
+        jobs=(_job(source_job_id="1", score=80, title="Hello"),),
+    )
+    automation = JobTrailAutomation(gateway, simulation=scenario)
+    config = AutomationConfig(
+        scorer_config_path="unused.yaml",
+        scorer_command="unused",
+        score_threshold=70,
+        max_score=10,
+        notify_enabled=True,
+        whatsapp_command="unused",
+        base_url="https://example.test",
+    )
+    result = automation.run(config=config)
+    assert getattr(result, "envelope", None) is not None
+    assert result.envelope["scenario"] == "attach"
+    assert result.envelope["best"]["title"] == "Hello"
+
+
+def test_simulation_filters_jobs_without_score_note() -> None:
+    SimulationScenario = require_optional("SimulationScenario")
+    gateway = _RecordingGateway()
+    scenario = SimulationScenario(
+        name="partial",
+        jobs=(
+            _job(source_job_id="1", score=85),
+            _job(source_job_id="2"),  # no score_note
+            _job(source_job_id="3", score=72),
+        ),
+    )
+    automation = JobTrailAutomation(gateway, simulation=scenario)
+    result = automation.run(config=_base_config())
+    assert result.selected is not None
+    assert result.selected["score"] == 85
+    assert result.envelope["planned_scores"] == 2
+
+
+def test_simulation_rejects_invalid_scenario_name_type() -> None:
+    SimulationScenario = require_optional("SimulationScenario")
+    with pytest.raises(ValueError):
+        SimulationScenario(name=123)  # type: ignore[arg-type]
+
+
+def test_simulation_rejects_non_tuple_jobs() -> None:
+    SimulationScenario = require_optional("SimulationScenario")
+    with pytest.raises(ValueError):
+        SimulationScenario(name="bad", jobs=[_job()])  # type: ignore[arg-type]
+
+
+def test_simulation_rejects_invalid_job_member_at_construction() -> None:
+    SimulationScenario = require_optional("SimulationScenario")
+    with pytest.raises(ValueError, match=r"jobs\[0\].*NormalizedJob"):
+        SimulationScenario(name="bad", jobs=(object(),))  # type: ignore[arg-type]
+
+
+def test_simulation_clock_defaults_to_utc_iso_when_unspecified() -> None:
+    """When ``clock_iso`` is ``None``, the envelope still carries a parseable timestamp."""
+
+    SimulationScenario = require_optional("SimulationScenario")
+    build_planned_operations = require_optional("build_planned_operations")
+    scenario = SimulationScenario(name="clock", jobs=(_job(source_job_id="1", score=80),))
+    planned = build_planned_operations(scenario, _base_config())
+    envelope = planned.to_envelope()
+    assert isinstance(envelope["clock"], str)
+    # ISO-8601 with timezone offset.
+    import re
+
+    assert re.match(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}", envelope["clock"])
+
+
+def test_simulation_envelope_does_not_leak_credential_substrings() -> None:
+    """URLs that embed query credentials MUST NOT appear in the envelope."""
+
+    SimulationScenario = require_optional("SimulationScenario")
+    build_planned_operations = require_optional("build_planned_operations")
+    scenario = SimulationScenario(
+        name="leak",
+        jobs=(
+            _normalised_with_url(
+                "https://api.example.com/v1/search?app_id=SECRET_ID&app_key=SECRET_KEY"
+            ),
+        ),
+    )
+    planned = build_planned_operations(scenario, _base_config())
+    rendered = str(planned.to_envelope())
+    assert "SECRET_ID" not in rendered
+    assert "SECRET_KEY" not in rendered
+
+
+@pytest.mark.parametrize(
+    "credential_key,credential_value",
+    [("%74oken", "ENCODED_TOKEN"), ("%50ASSWORD", "ENCODED_PASSWORD")],
+)
+def test_simulation_envelope_redacts_url_decoded_credential_keys(
+    credential_key: str, credential_value: str
+) -> None:
+    SimulationScenario = require_optional("SimulationScenario")
+    build_planned_operations = require_optional("build_planned_operations")
+    scenario = SimulationScenario(
+        name="encoded-credentials",
+        jobs=(
+            _normalised_with_url(
+                f"https://api.example.com/v1/search?{credential_key}={credential_value}"
+            ),
+        ),
+    )
+
+    rendered = str(build_planned_operations(scenario, _base_config()).to_envelope())
+
+    assert credential_value not in rendered
+
+
+def test_simulation_caps_deduplicated_discovery_and_scrubs_complete_envelope() -> None:
+    SimulationScenario = require_optional("SimulationScenario")
+    build_planned_operations = require_optional("build_planned_operations")
+    scenario = SimulationScenario(
+        name="scenario RESUME_SENTINEL /DATA/private",
+        jobs=(
+            _job(source_job_id="78", score=80, title="First"),
+            _job(source_job_id="78", score=81, title="First latest"),
+            _job(source_job_id="91", score=99, title="Higher"),
+        ),
+    )
+    config = AutomationConfig(score_threshold=70, max_score=1)
+
+    envelope = build_planned_operations(
+        scenario,
+        config,
+        clock_iso="2025-01-01T00:00:00+00:00",
+    ).to_envelope()
+    rendered = str(envelope)
+
+    assert envelope["planned_imports"] == 2
+    assert envelope["planned_scores"] == 1
+    assert envelope["best"]["sourceJobId"] == "78"
+    assert envelope["best"]["title"] == "First"
+    assert "RESUME_SENTINEL" not in rendered
+    assert "/DATA/" not in rendered
+    assert "SECRET_QUERY" not in rendered
+    assert envelope["clock"] == "2025-01-01T00:00:00+00:00"
+
+
+def test_simulation_output_bounds_strings_and_lists() -> None:
+    scrub = _automation._scrub_simulation_value
+    value = scrub({"text": "x" * 10_000, "items": ["item"] * 10_000})
+    assert len(value["text"]) <= _automation._SIMULATION_MAX_STRING
+    assert len(value["items"]) <= _automation._SIMULATION_MAX_LIST
+
+
+def test_simulation_output_bounds_and_scrubs_dictionary_keys() -> None:
+    scrub = _automation._scrub_simulation_value
+    value = scrub(
+        {
+            "RESUME_SENTINEL": "safe",
+            "x" * 10_000: "bounded",
+            **{f"extra-{index}": index for index in range(10_000)},
+        }
+    )
+    assert len(value) <= _automation._SIMULATION_MAX_DICT_ENTRIES
+    assert all("RESUME_SENTINEL" not in key for key in value)
+    assert all(len(key) <= _automation._SIMULATION_MAX_STRING for key in value)
+
+
+def test_simulation_output_bounds_nesting_depth_and_redacts_deep_values() -> None:
+    scrub = _automation._scrub_simulation_value
+    value: dict[str, Any] = {"secret": "RESUME_SENTINEL"}
+    for _ in range(_automation._SIMULATION_MAX_DEPTH + 2):
+        value = {"nested": value}
+
+    scrubbed = scrub(value)
+    current: Any = scrubbed
+    for _ in range(_automation._SIMULATION_MAX_DEPTH - 1):
+        current = current["nested"]
+    assert current == {"[redacted]": "[redacted]"}
+
+
+@pytest.mark.parametrize("clock", ["2025-01-01T00:00:00", "2025-01-01"])
+def test_simulation_naive_or_date_only_clock_returns_stable_error_result(
+    monkeypatch, clock
+) -> None:
+    SimulationScenario = require_optional("SimulationScenario")
+    PlannedOperations = require_optional("PlannedOperations")
+    scenario = SimulationScenario(name="bad-clock", jobs=())
+    planned = PlannedOperations(
+        scenario=scenario.name,
+        searched=0,
+        planned_imports=0,
+        planned_scores=0,
+        would_notify=False,
+        best=None,
+        clock=clock,
+    )
+    monkeypatch.setattr(
+        _automation, "build_planned_operations", lambda *args, **kwargs: planned
+    )
+    result = JobTrailAutomation(_RecordingGateway(), simulation=scenario).run(
+        config=_base_config()
+    )
+    assert result.failures == ("simulation:invalid_clock",)
+    assert result.envelope == {"error": "invalid_clock", "redacted": True}
+
+
+@pytest.mark.parametrize(
+    "clock", ["not-an-iso-clock", "2025-01-01T00:00:00", "2025-01-01"]
+)
+def test_planned_operations_direct_construction_rejects_invalid_clock_on_envelope(
+    clock: str,
+) -> None:
+    PlannedOperations = require_optional("PlannedOperations")
+    planned = PlannedOperations(
+        scenario="bad-clock",
+        searched=0,
+        planned_imports=0,
+        planned_scores=0,
+        would_notify=False,
+        best=None,
+        clock=clock,
+    )
+
+    with pytest.raises(ValueError, match="timezone-aware ISO datetime"):
+        planned.to_envelope()
+
+
+def test_planned_operations_direct_construction_preserves_valid_clock() -> None:
+    PlannedOperations = require_optional("PlannedOperations")
+    planned = PlannedOperations(
+        scenario="valid-clock",
+        searched=0,
+        planned_imports=0,
+        planned_scores=0,
+        would_notify=False,
+        best=None,
+        clock="2025-01-01T03:00:00+03:00",
+    )
+
+    assert planned.to_envelope()["clock"] == "2025-01-01T03:00:00+03:00"
+
+
+def test_simulation_invalid_clock_returns_stable_error_result(monkeypatch) -> None:
+    SimulationScenario = require_optional("SimulationScenario")
+    PlannedOperations = require_optional("PlannedOperations")
+    scenario = SimulationScenario(name="bad-clock", jobs=())
+    planned = PlannedOperations(
+        scenario=scenario.name,
+        searched=0,
+        planned_imports=0,
+        planned_scores=0,
+        would_notify=False,
+        best=None,
+        clock="not-an-iso-clock",
+    )
+    monkeypatch.setattr(_automation, "build_planned_operations", lambda *args, **kwargs: planned)
+    result = JobTrailAutomation(_RecordingGateway(), simulation=scenario).run(
+        config=_base_config()
+    )
+    assert result.failures == ("simulation:invalid_clock",)
+    assert result.envelope["error"] == "invalid_clock"
+
+
+def test_simulation_redacted_clock_sentinel_does_not_crash(monkeypatch) -> None:
+    SimulationScenario = require_optional("SimulationScenario")
+    PlannedOperations = require_optional("PlannedOperations")
+    scenario = SimulationScenario(name="redacted-clock", jobs=())
+    planned = PlannedOperations(
+        scenario=scenario.name,
+        searched=0,
+        planned_imports=0,
+        planned_scores=0,
+        would_notify=False,
+        best=None,
+        clock="RESUME_SENTINEL",
+    )
+    monkeypatch.setattr(_automation, "build_planned_operations", lambda *args, **kwargs: planned)
+    result = JobTrailAutomation(_RecordingGateway(), simulation=scenario).run(
+        config=_base_config()
+    )
+    assert result.failures == ("simulation:invalid_clock",)
+    assert result.envelope["error"] == "invalid_clock"
+
+
+def test_simulation_cap_includes_unscored_discovery_identity() -> None:
+    SimulationScenario = require_optional("SimulationScenario")
+    build_planned_operations = require_optional("build_planned_operations")
+    scenario = SimulationScenario(
+        name="unscored-first",
+        jobs=(
+            _job(source_job_id="78"),
+            _job(source_job_id="91", score=99),
+        ),
+    )
+
+    envelope = build_planned_operations(
+        scenario,
+        AutomationConfig(score_threshold=70, max_score=1),
+        clock_iso="2025-01-01T00:00:00+00:00",
+    ).to_envelope()
+
+    assert envelope["planned_imports"] == 2
+    assert envelope["planned_scores"] == 0
+    assert envelope["best"] is None
+
+
+def _normalised_with_url(url: str) -> NormalizedJob:
+    return NormalizedJob(
+        source="adzuna",
+        source_job_id="1",
+        title="Engineer",
+        company="Acme",
+        description="Build things.",
+        source_url=url,
+        location="Remote",
+        metadata={"score_note": _score_note(75)},
+    )
