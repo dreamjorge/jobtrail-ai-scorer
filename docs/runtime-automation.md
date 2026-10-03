@@ -18,6 +18,12 @@ Use these examples to run JobTrail AI Scorer from a local scheduler while keepin
 > [`scripts/legacy/README.md`](scripts/legacy/README.md) for the replacement
 > mapping and target removal date.
 
+## Shortlist policy
+
+Recommendation eligibility fails closed on SKIP, exclusions and missing hard
+requirements. The legacy score threshold and stable discovery-order ties remain.
+`build_shortlist` returns at most three eligible entries; runtime wiring is separate.
+
 ## Backend URL resolution
 
 The systemd service must reach the JobTrail backend. Instead of baking a private

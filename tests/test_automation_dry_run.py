@@ -17,6 +17,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import json
+
 import pytest
 
 import jobtrail_ai_scorer.automation as _automation
@@ -171,6 +173,36 @@ def _base_config() -> AutomationConfig:
 
 
 # --- Tests --------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("blocked", [
+    {"classification": "SKIP"}, {"recommendation": "SKIP"},
+    {"hard_requirements_missing": ["License"]},
+    {"exclusion_signals": ["Excluded employer"]},
+    {"fit_score": True}, {"fit_score": 80, "coverage_score": 80},
+])
+@pytest.mark.parametrize("with_controls", [False, True])
+def test_simulation_eligibility_gates_latest_note_before_ranking(blocked, with_controls):
+    SimulationScenario = require_optional("SimulationScenario")
+    build_planned_operations = require_optional("build_planned_operations")
+    latest = _job(source_job_id="blocked")
+    latest.metadata["score_note"] = CURRENT_MARKER + "\n" + json.dumps({"score": 99, **blocked})
+    jobs = (_job(source_job_id="blocked", score=100), latest)
+    if with_controls:
+        jobs += (_job(source_job_id="first", score=80), _job(source_job_id="second", score=80))
+    scenario = SimulationScenario(name="eligibility", jobs=jobs)
+    config = _base_config()
+    gateway = _RecordingGateway()
+    planned = build_planned_operations(scenario, config=config)
+    result = JobTrailAutomation(gateway, simulation=scenario).run(config=config)
+
+    assert (planned.best or {}).get("sourceJobId") == ("first" if with_controls else None)
+    assert result.selected == planned.best
+    assert planned.planned_imports == (3 if with_controls else 1)
+    assert planned.planned_scores == (3 if with_controls else 1)
+    assert result.imported == result.scored == 0
+    assert result.failures == ()
+    assert gateway.calls == []
 
 
 def test_simulation_seam_is_optional_and_does_not_affect_constructor() -> None:
