@@ -18,19 +18,9 @@ Use these examples to run JobTrail AI Scorer from a local scheduler while keepin
 > [`scripts/legacy/README.md`](scripts/legacy/README.md) for the replacement
 > mapping and target removal date.
 
-## Shortlist policy
-
-Recommendation eligibility fails closed on SKIP, exclusions and missing hard
-requirements. The legacy score threshold and stable discovery-order ties remain.
-`build_shortlist` returns at most three eligible entries in production and simulation.
-Selected compatibility and default notification behavior remain unchanged.
-
-This snapshot supports injected resolvers/factories; the canonical launcher
-is not yet wired. References below describe the forthcoming launcher contract.
-
 ## Optional public opportunity intelligence
 
-Direct automation callers enable public enrichment only with
+The canonical launcher enables public enrichment only with
 `OPPORTUNITY_INTELLIGENCE_ENABLED=true`; it is off by default. Disabled and
 `--automation-dry-run` paths do not construct the public search/fetch/resolver
 stack or read `BRAVE_SEARCH_API_KEY`. Enabled real runs lazily construct one
@@ -42,7 +32,8 @@ injection remains supported (the caller owns that resolver's lifetime).
 Enabled real runs use this single stack and
 resolve at most three eligible shortlisted matches before composing WhatsApp.
 Search/import/scoring, local journal authority, and selected compatibility remain.
-n8n continues using its existing v1 contract; public-card v2 is forthcoming. There is no additional scheduler.
+Disabled enrichment retains the existing n8n v1 contract exactly; enabled public
+cards use the explicitly versioned v2 contract below. There is no additional scheduler.
 
 Configure `BRAVE_SEARCH_API_KEY` only in operator-controlled runtime settings.
 Missing credentials yield `provider unconfigured` without public HTTP calls.
@@ -75,7 +66,7 @@ provider hosts cannot be employer anchors. Public proof URLs reject embedded
 credentials and secret query parameters. Existing search/fetch per-run budgets
 remain enforced by their adapters, and fetch failures do not prove closure.
 No live/provider validation or deployment is implied. Independent local
-verification of these snapshots is pending; live API setup, production activation and consumer
+verification passed; live API setup, production activation and consumer
 migration remain separate operator decisions.
 
 ## Backend URL resolution
@@ -158,9 +149,11 @@ The final launcher output includes `profile_counts` with `searched`, `imported`,
 ## Public opportunity search
 
 `jobtrail_ai_scorer.public_search.BravePublicSearchAdapter` provides opt-in
-Brave discovery through direct API injection only in this snapshot. The canonical
-launcher remains unchanged. No result destination is fetched by this adapter;
-DNS/fetch safety and evidence resolution are later boundaries.
+Brave discovery through the canonical launcher; see
+[Optional public opportunity intelligence](#optional-public-opportunity-intelligence).
+Disabled and offline simulation runs do not construct the public stack or read
+its credentials. No result destination is fetched by this adapter; the resolver
+uses the separate public-fetch boundary.
 
 `PublicSearchConfig` defaults to `enabled=False`, no API key and a five-second
 HTTP timeout (finite, positive, at most 30 seconds). `from_env` accepts an
@@ -215,8 +208,9 @@ provider validation has been performed.
 ## Public HTTPS retrieval
 
 `jobtrail_ai_scorer.public_http.PublicFetcher` is the synchronous fetching
-boundary available by direct API only in this snapshot. The canonical launcher
-is unchanged; no runtime enrichment is wired. Direct callers must create one object per run
+boundary used by opt-in enrichment. The canonical launcher creates one object
+per run when enrichment starts, after scoring, and shares its budgets across
+all opportunities. Direct callers must likewise create one object per run
 and call `fetch(public_url)` only for caller-approved public URLs. Neither this
 boundary nor a successful response establishes ownership, vacancy identity,
 active hiring, or company claims. Returned HTML/JSON/plain text is untrusted
@@ -286,8 +280,10 @@ DNS, destination requests or Brave requests were performed.
 ## Public opportunity evidence
 
 `jobtrail_ai_scorer.opportunity_intelligence.OpportunityIntelligence` combines
-injected public search and fetch boundaries. The resolver is available through direct API injection only in this snapshot.
-Canonical automation, cards and n8n wiring are later slices.
+injected public search and fetch boundaries. The canonical launcher now wires
+it into opt-in automation and notification cards; see
+[Optional public opportunity intelligence](#optional-public-opportunity-intelligence).
+Public cards use the versioned n8n completion contract described below.
 Offline simulation remains network-free. Live provider validation, production
 activation and n8n consumer migration have not been performed.
 
@@ -344,15 +340,10 @@ not an assurance that company statements are independently true.
 Verification uses synthetic fixtures and injected transports/clocks only; no
 live provider, DNS or destination validation was performed. The repair
 regressions have observed RED/GREEN evidence, but initial T4 writer provenance
-is unknown: no full-source strict-TDD claim is made. Canonical code integration is forthcoming; production activation and live
-consumer migration remain unvalidated. No automatic application, deployment or publication
+is unknown: no full-source strict-TDD claim is made. Canonical code integration
+is available behind an opt-in flag, but production activation and live consumer
+migration remain unvalidated. No automatic application, deployment or publication
 has been performed.
-
-### Public cards
-
-Typed public projections/results can now be serialized and rendered directly.
-Cards keep original links, never promote candidates to official status, and
-omit unsafe quotes rather than rewriting them. Runtime wiring is forthcoming.
 
 ## Optional Adzuna source
 
@@ -921,8 +912,9 @@ network. They serve different purposes and are not interchangeable.
 
 Consumers must explicitly support `schema_version: 2` before enabling public
 opportunity enrichment for n8n. Both `N8N_ENABLED=1` and
-`OPPORTUNITY_INTELLIGENCE_ENABLED=true` are needed for card delivery. Direct callers record locally, then call `build_n8n_envelope(run)` and the same
-optional adapter; canonical launcher wiring is forthcoming. No new channel or scheduler.
+`OPPORTUNITY_INTELLIGENCE_ENABLED=true` are needed for card delivery. The canonical
+launcher still records locally, then calls `build_n8n_envelope(run)` and the same
+optional adapter; no new notification channel or scheduler is introduced.
 
 Disabled enrichment, absent intelligence, or no serializable public cards emits
 **exactly the prior v1 shape**, event-ID domain and optional feedback actions.
@@ -949,7 +941,6 @@ consumers must not treat v2 as implicitly compatible or silently ignore cards.
 
 Validation is hermetic mocked HTTP only. No n8n deployment, live delivery,
 consumer migration, or publication has been validated.
-
 
 JobTrail remains the sole scheduler, source collector, importer, scorer, SeenCache owner, and journal authority. The optional n8n adapter is disabled by default and sends one bounded, versioned, redacted run envelope only after the local run record is written. Hermes WhatsApp remains an independent local channel; n8n delivery never invokes or configures Hermes.
 
