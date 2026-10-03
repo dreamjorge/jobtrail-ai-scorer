@@ -873,7 +873,7 @@ def build_planned_operations(
     forbidden substrings from any value that would leak to the launcher.
     """
 
-    from .scoring import parse_score_note
+    from .scoring import eligible_score, parse_score_note
 
     # Scenario-only dedup: collect every score note for the same identity
     # (source, source_job_id) so we can later resolve to the latest
@@ -899,9 +899,14 @@ def build_planned_operations(
     candidates: list[tuple[int, int, tuple[str, str], NormalizedJob]] = []
     max_score = _bounded_score_limit(config.max_score)
     eligible_identities = list(islice(history_by_identity, max_score))
+    planned_scores = 0
     for index, identity in enumerate(eligible_identities):
         notes = history_by_identity[identity]
         score = parse_score_note([{"body": body} for body in notes])
+        if score is None:
+            continue
+        planned_scores += 1
+        score = eligible_score(score, score_threshold=config.score_threshold)
         if score is None:
             continue
         candidates.append(
@@ -935,7 +940,7 @@ def build_planned_operations(
         scenario=scenario.name,
         searched=len(bounded_jobs),
         planned_imports=len(jobs_by_identity),
-        planned_scores=len(candidates),
+        planned_scores=planned_scores,
         would_notify=bool(scrubbed_best and config.notify_enabled),
         best=scrubbed_best,
         clock=_resolve_simulation_clock(clock_iso),
@@ -1294,13 +1299,16 @@ class JobTrailAutomation:
         best_job = None
         best_score = None
         best_job_id = None
+        from .scoring import eligible_score
+
         for job_id in scored_ids:
             try:
                 job = self.gateway.get_job(job_id)
                 score = parse_score_note(job.get("notes"))
+                if score is not None:
+                    score = eligible_score(score, score_threshold=config.score_threshold)
                 if (
-                    score
-                    and score.get("score", -1) >= config.score_threshold
+                    score is not None
                     and (best is None or score["score"] > best["score"])
                 ):
                     best = {
