@@ -204,7 +204,7 @@ def _candidate_url(value: object) -> str | None:
         if _url_credentials(value):
             return None
         netloc = f"[{host}]" if ":" in host else host
-        return urlunsplit(("https", netloc, parts.path or "/", parts.query, ""))
+        return urlunsplit(("https", netloc, parts.path or "/", parts.query, parts.fragment))
     except ValueError:
         return None
 

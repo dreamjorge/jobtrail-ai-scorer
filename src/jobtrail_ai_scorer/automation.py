@@ -273,9 +273,12 @@ class AutomationConfig:
         def truthy(key: str, default: str = "0") -> bool:
             return e.get(key, default).strip().lower() in {"1", "true", "yes", "on"}
 
-        intelligence_flag = e.get("OPPORTUNITY_INTELLIGENCE_ENABLED", "0").strip().lower()
-        if intelligence_flag not in {"1", "true", "yes", "on", "0", "false", "no", "off"}:
-            raise ValueError("invalid opportunity intelligence enable flag")
+        def _parse_bool_flag(key: str) -> bool:
+            """Strict allowlist parse for tri-state feature flags."""
+            flag = e.get(key, "0").strip().lower()
+            if flag not in {"1", "true", "yes", "on", "0", "false", "no", "off"}:
+                raise ValueError(f"{key} must be 0/1/true/false/yes/no/on/off")
+            return flag in {"1", "true", "yes", "on"}
 
         def _coerce_int(key: str, default: int) -> int:
             raw = e.get(key)
@@ -336,7 +339,7 @@ class AutomationConfig:
             breaker_state_path=e.get("BREAKER_STATE_PATH", "").strip(),
             n8n=N8nConfig.from_env(e),
             feedback_actions_enabled=truthy("N8N_FEEDBACK_ACTIONS_ENABLED"),
-            opportunity_intelligence_enabled=intelligence_flag in {"1", "true", "yes", "on"},
+            opportunity_intelligence_enabled=_parse_bool_flag("OPPORTUNITY_INTELLIGENCE_ENABLED"),
             dry_run=truthy("JOBTRAIL_AUTOMATION_DRY_RUN", "0"),
         )
 
@@ -1532,14 +1535,25 @@ class JobTrailAutomation:
             base_url=self.base_url,
             run_id=run_id,
         )
-        if (notification_body is not None and best and config.notify_enabled
-                and config.opportunity_intelligence_enabled):
-            from .opportunity_cards import serialize_cards, render_cards
-            try:
-                public_body = render_cards(serialize_cards(card_inputs))
-            except Exception:
-                public_body = "Public information: unavailable"
-            notification_body += "\n\n" + public_body
+        if notification_body is not None and config.opportunity_intelligence_enabled:
+            # Public cards are appended to the WhatsApp payload only when the
+            # match summary is the primary delivery (notify_enabled + best)
+            # or when the failure-only alert has no selected match to
+            # describe (notify_on_failure + failures, no best). When a
+            # match was selected but only failure notifications are enabled
+            # (notify_on_failure with notify_enabled=False), the failure
+            # summary is the only content the operator asked for and must
+            # remain a clean JSON envelope; mixing in the match's card text
+            # would break JSON parseability and duplicate match context.
+            if (config.notify_enabled and best) or (
+                config.notify_on_failure and failures and not best
+            ):
+                from .opportunity_cards import serialize_cards, render_cards
+                try:
+                    public_body = render_cards(serialize_cards(card_inputs))
+                except Exception:
+                    public_body = "Public information: unavailable"
+                notification_body += "\n\n" + public_body
         notification_sent = False
         if notification_body is not None:
             try:

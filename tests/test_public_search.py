@@ -307,6 +307,14 @@ def test_client_security_configuration(monkeypatch):
     assert observed[0]["timeout"] == 5.0
 
 
+def test_url_fragment_preserved():
+    assert _candidate_url("https://public.example/jobs#section") == "https://public.example/jobs#section"
+
+
+def test_url_fragment_with_path_and_query_preserved():
+    assert _candidate_url("https://public.example/jobs?page=2#section") == "https://public.example/jobs?page=2#section"
+
+
 @pytest.mark.parametrize("destination", [
     "https://user:synthetic-secret@public.example/jobs",
     "https://user@public.example/jobs",
@@ -364,9 +372,8 @@ def test_candidate_bounds_nested_inspection():
     "description=password%3Drotation",
 ])
 def test_candidate_allows_noncredential_fragment_text(fragment):
-    assert _candidate_url("https://employer.example/jobs#" + fragment) == (
-        "https://employer.example/jobs"
-    )
+    value = "https://employer.example/jobs#" + fragment
+    assert _candidate_url(value) == value
 
 
 @pytest.mark.parametrize("destination", [
@@ -387,7 +394,7 @@ def test_candidate_preserves_safe_nested_destinations(destination, encoding):
     for _ in range(encoding):
         destination = quote(destination, safe="")
     value = "https://EMPLOYER.example:443/jobs?redirect=" + destination
-    assert _candidate_url(value) == value.replace("EMPLOYER.example:443", "employer.example").split("#")[0]
+    assert _candidate_url(value) == value.replace("EMPLOYER.example:443", "employer.example")
 
 
 @pytest.mark.parametrize("value", [
@@ -409,6 +416,6 @@ def test_candidate_accepts_maximum_length_public_url_and_depth_control():
 
 
 def test_contract_url_filter():
-    assert _candidate_url("https://employer.example/jobs/1#fragment") == "https://employer.example/jobs/1"
+    assert _candidate_url("https://employer.example/jobs/1#fragment") == "https://employer.example/jobs/1#fragment"
     assert _candidate_url("https://127.0.0.1/") is None
     assert _candidate_url("https://employer.example/?token=synthetic") is None

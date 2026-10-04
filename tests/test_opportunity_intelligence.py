@@ -14,7 +14,7 @@ from jobtrail_ai_scorer.public_http import FetchResult
 NOW = datetime(2026, 6, 1, tzinfo=timezone.utc)
 CAREERS = 'https://acme.example/careers'
 LISTING = 'https://jobs.lever.co/acme/123'
-ORIGINAL = 'https://aggregator.example/jobs/77'
+ORIGINAL = 'https://aggregator.example/jobs/77#public-section'
 
 
 ATS_FAMILIES = ['workday', 'greenhouse', 'lever', 'ashby', 'bamboohr', 'workable', 'smartrecruiters']
@@ -434,7 +434,7 @@ def test_cross_page_requisition_conflict_or_distinct_plausible_vacancies(conflic
 def test_equivalent_normalized_reference_copies_not_conflicting():
     job = identity(requisition_id=None, requisition_namespace=None)
     result = resolve_post([posting(sameAs=ORIGINAL),
-        posting(sameAs='https://AGGREGATOR.example:443/jobs/77#section')], job=job)
+        posting(sameAs='https://AGGREGATOR.example:443/jobs/77#public-section')], job=job)
     assert result.status == 'verified'
 
 
@@ -554,3 +554,17 @@ def test_valueless_href_in_apply_link():
     class _Page:
         links = [(None, "Apply")]
     assert _apply_link(_Page(), "https://example.com/jobs/123") is None
+
+
+@pytest.mark.parametrize('flag', [
+    'invalid', 'maybe', 'ENABLED', '1.0', 'false1', '',
+])
+def test_automation_config_rejects_invalid_opportunity_flag(flag):
+    """PR98 R11: OPPORTUNITY_INTELLIGENCE_ENABLED must use strict allowlist parsing.
+
+    Consistent with PublicSearchConfig.from_env: invalid flag strings must raise
+    ValueError, not silently coerce to False.
+    """
+    from jobtrail_ai_scorer.automation import AutomationConfig
+    with pytest.raises(ValueError):
+        AutomationConfig.from_env({'OPPORTUNITY_INTELLIGENCE_ENABLED': flag})

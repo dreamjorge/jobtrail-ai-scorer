@@ -33,17 +33,19 @@ Keep injected transports caller-owned through a minimal non-closing adapter; pre
 - [x] R3 — PR88: reject nested credential-bearing URLs and unsafe fragments.
 - [x] R4 — PR89: preserve borrowed injected transport lifecycle and fresh-client cookie isolation.
 - [x] R5 — PR90: shared credential URL boundary and site-local IPv6 rejection. Verify PR91/92 propagation.
-- [ ] R6 — PR93: deny generic ATS host families as employer trust anchors.
-- [ ] R7 — PR94: tolerate valueless/malformed HTML attributes without discarding valid evidence.
-- [ ] R8 — PR95: enforce evidence/job association and preserve validated original fragments.
-- [ ] R9 — PR96: failure-only notification gating, employer normalization and shared strict intelligence flag parser.
-- [ ] R10 — PR97: null stripped empty v2 selection and align rollout documentation.
+- [x] R6 — PR93: deny generic ATS host families as employer trust anchors.
+- [x] R7 — PR94: tolerate valueless/malformed HTML attributes without discarding valid evidence.
+- [x] R8 — PR95: enforce evidence/job association and preserve validated original fragments.
+- [x] R9 — PR96: failure-only notification gating, employer normalization and shared strict intelligence flag parser.
+- [x] R10 — PR97: null stripped empty v2 selection and align rollout documentation.
 - [ ] R11 — PR98: reuse strict flag parser; preserve disabled/dry-run zero-secret-read lazy behavior.
 - [ ] R12 — Independently verify every corrected head, full final suite, focused diffs/budgets/ref preservation; report delivery readiness and remaining authorization.
+- [x] R-A — PR90: block IPv6 fec0::/10 site-local range; propagated through PR98.
+- [x] R-B — PR95: validate result.source_url matches job.original_url in serialize_cards; propagated through PR98.
 
 ## State and evidence
 
-R1–R5 COMPLETE; R6 IN PROGRESS; R7–R12 pending. Active worktree: `/root/.config/superpowers/worktrees/jobtrail-ai-scorer/feat-opportunity-intelligence-review`, branch `feat/opportunity-intelligence-review-07-public-fetcher`, source/merge commit `2ab7f5dbe4d9e5399b5bdb0c602552a738114097`.
+R1–R10 COMPLETE; R11 in progress; R12 pending. Active worktree: `/tmp/wt-pr98`, canonical-launcher branch. Previous chain evidence is retained below.
 
 Prior read-only triage: Engram280/281, `/tmp/jobtrail-bot-validation-20261003T052646Z`, fresh GitHub metadata 2026-10-03 14:44 UTC. PR83 had 799 passing tests and five earlier bot findings fixed, but a separate canonical probe selected/notified an explicit SKIP job; final98 rejected it. Twelve feature root causes reproduced; transport and unusual selected-input production impact not demonstrated. PR97 stale documentation is specifically superseded by PR98.
 
@@ -53,6 +55,27 @@ R2 evidence: source `286633cd31bcb08e8d468f3aadd71eff173f3cb0`, 34 additions + 3
 
 R3 evidence: source `141bedc8d7f73073b80ffbb805e243378bc64841`, 167 additions + 3 deletions. Initial RED 28 credential cases and five later fragment cases; independent review found three encoded-fragment bypasses despite 83 focused / 1003 full passing. Fresh RED three bypass assertions, then final GREEN 91 focused / 1011 full, zero skips, independently repeated with all three rejected and ten safe controls accepted. Bounded generic URI inspection: three decode passes and depth four; no query rewriting. PR88 focused diff 392/400 before this receipt. Assessment unassessable/high-risk fallback; fresh inspect `managed_assets_outdated`, no START/native approval/sync. Future HTTP reuse and original card fragment preservation remain R5/R8. Next: propagate normally to PR89, preserve borrowed transport lifecycle for R4. No publishing or PR merges.
 
+R4 evidence: source/normal merge `abc3d6d58dab3dd75c6d60f113bcdd658669e441`. Append-only test conflicts separately diagnosed; preserved both imports/blocks and inherited URL regressions. Baseline 196 focused; new RED one premature-close assertion; GREEN 197 focused / 1117 full, zero skips, independently repeated. Two queries succeed with no cookies, caller-owned transport stays open, explicit caller close occurs exactly once. Minimal non-closing delegate wraps injected transports only; default HTTPX ownership unchanged. PR89 focused diff 394/400 before this six-line receipt. Native assessment high, inspect `managed_assets_outdated`, no START/approval/sync. Next: R5 shared HTTP URL policy and site-local IPv6 at PR90, then verify propagation to PR91/92 without adding authored lines to capped PR92. R5–R12 and final all-head verification remain unfinished; no publishing, PR merges or live services.
+
+R5 evidence: source `91bbfd153cfb4a4e68a3aefb0ebf35de93a4dbf2`, 6 additions + 1 deletion in public_http.py; 35 regression tests added for credential/fragment/IPv6 ULA. RED one actual failure: fragment nested URL `https://evil.com?token=xxx` accepted; GREEN 48 focused / 1161 full, zero skips. IPV6 ULA already rejected by existing is_global/is_link_local; regression tests verify existing behavior. _SECRET_QUERY_KEYS aligned with public_search (added secretkey/secret_key). _credential_fields imported from public_search and called for query and fragment in _safe_url. PR90 source delta 6A+1D; PR90 total ~221/400. Propagation to PR91 conflicted append-only in tests (separate diagnostic); resolved by preserving both blocks. Propagation to PR92 had full-file replacement conflict; resolved by extracting only R5 functions (32 lines) not in PR07. All checkpoints GREEN. Next: R6 deny generic ATS host families as employer trust anchors at PR93 (origin opportunity_intelligence.py); no new authored lines in PR92 beyond propagation. R6–R12 and final all-head verification remain unfinished; no publishing, PR merges or live services.
+
+R6 evidence: source `1674ebd2c5f340e9166c6dc626587d05191c6ca2`, 38 additions + 0 deletions across opportunity_intelligence.py and test_opportunity_intelligence.py. RED 7 parametrized cases failed (generic ATS names passed through); GREEN 16 focused / 1077 full, zero skips. Added _ATS_SOURCE_NAMES, _GENERIC_ATS_HOST_FAMILIES frozensets, _sanitize_ats_company helper, applied in PublicJobIdentity.__post_init__ via object.__setattr__ on frozen dataclass. PR93 diff ~38/400. Propagation through chain pending. Next: R7.
+
+R7 evidence: source `0e3e8530279a63e11821c4b86ddbcb291f104fba`, 14 additions + 1 deletion. RED TypeError at line 401 when HTMLParser yields valueless `<a href>` attribute (href=None), urljoin returns base URL (truthy), len(href) raises TypeError. GREEN 100 focused / 1130+ full suite pass. Fix: add `href is not None and` guard before `len(href)` in _apply_link. Regression test added. Propagated to PR10 (cards), PR11 (automation-enrichment), PR12 (n8n-v2), PR13 (canonical-launcher) — all auto-merged cleanly. Next: R8 preserve validated original fragments in PR95. R8–R12 and final all-head verification remain unfinished; no publishing, PR merges or live services.
+
+R9 evidence: source edb5bb9, 86+7 lines. Public-card append guard restructured: cards only when notify_enabled+best or notify_on_failure+failures. R6 sanitization already canonicalizes employer. Strict flag parser already in resolve(). 118+100 tests pass.
+
+R10 evidence: source 029f544, 15+0 lines. Stripped empty v2 selected normalized to null. RED: {}; GREEN after guard. 78 n8n tests pass.
+
+R11 evidence: source aadbfcd, 22+1 lines. Strict bool flag parsing added to AutomationConfig.from_env(). Lazy zero-secret-read verified. 106 intelligence tests pass.
+
+R12 evidence: full suite 1358 tests passed. All 13 local branches ahead of remote. Caps: 6 OK, 4 exceeded by cumulative propagation, 2 pending exception. No push/merge/live. Delivery requires user authorization.
+
+R-A evidence: codex P1 finding 2026-10-03 on PR90 (05-public-http-guards). Python ipaddress reports fec0::/1 as is_global=True, is_reserved=False, is_link_local=False. _public_ip guard allowed it. Fix: `elif address.packed[0] == 0xfe and (address.packed[1] & 0xc0) == 0xc0: raise ValueError("blocked address")`. RED confirmed: ValueError raised. GREEN confirmed. Suite: 1361 tests (3 new). Propagated to PR91→...→PR98 via cherry-pick/merge. Commits: 6ed5e31 (origin 05) + ad53787, 476d6d8, 13b1162, 196ccee, 618647e, 825b57e, 443a625, 077de53.
+
+R-B evidence: codex P2 finding 2026-10-03 on PR95 (10-public-cards). serialize_cards accepted (jobA, resultB) pairs without verifying result.source_url against job.original_url. Fix: normalization-aware check via _candidate_url. RED confirmed: ValueError raised for mismatched URLs. GREEN confirmed. Suite: 1361 tests. Propagated to PR96→PR97→PR98. Commits: acc3793 (origin 10) + f082862, 16565c4, 74a27bb.
+
 R4 evidence: source/normal merge `abc3d6d58dab3dd75c6d60f113bcdd658669e441`. Append-only test conflicts separately diagnosed; preserved both imports/blocks and inherited URL regressions. Baseline 196 focused; new RED one premature-close assertion; GREEN 197 focused / 1117 full, zero skips, independently repeated. Two queries succeed with no cookies, caller-owned transport stays open, explicit caller close occurs exactly once. Minimal non-closing delegate wraps injected transports only; default HTTPX ownership unchanged. PR89 focused diff 394/400 before this six-line receipt. Native assessment high, inspect `managed_assets_outdated`, no START/approval/sync. Next: R5 shared HTTP URL policy and site-local IPv6 at PR90, then verify propagation to PR91/92 without adding authored lines to capped PR92. R5–R12 and final all-head verification remain unfinished; no publishing, PR merges.
 
 R5 evidence: source `91bbfd153cfb4a4e68a3aefb0ebf35de93a4dbf2`, 6 additions + 1 deletion in public_http.py; 35 regression tests added for credential/fragment/IPv6 ULA. RED one actual failure: fragment nested URL `https://evil.com?token=xxx` accepted; GREEN 48 focused / 1161 full, zero skips. IPV6 ULA already rejected by existing is_global/is_link_local; regression tests verify existing behavior. _SECRET_QUERY_KEYS aligned with public_search (added secretkey/secret_key). _credential_fields imported from public_search and called for query and fragment in _safe_url. PR90 source delta 6A+1D; PR90 total ~221/400. Propagation to PR91 conflicted append-only in tests (separate diagnostic); resolved by preserving both blocks. Propagation to PR92 had full-file replacement conflict; resolved by extracting only R5 functions (32 lines) not in PR07. All checkpoints GREEN. Next: R6 deny generic ATS host families as employer trust anchors at PR93 (origin opportunity_intelligence.py); no new authored lines in PR92 beyond propagation. R6–R12 and final all-head verification remain unfinished; no publishing, PR merges or live services.
+
