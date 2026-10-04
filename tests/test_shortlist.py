@@ -13,6 +13,11 @@ def shortlist(scores, threshold=80):
 
 
 @pytest.mark.parametrize("patch", [
+    {"score": True},
+    {"score": 99.0},
+    {"score": "99"},
+    {"score": -1},
+    {"score": 101},
     {"recommendation": "SKIP"},
     {"classification": "SKIP"},
     {"hard_requirements_missing": ["license"]},
@@ -40,6 +45,29 @@ def test_shortlist_fails_closed(patch):
     assert shortlist([{"score": 99, **patch}]) == ()
 
 
+@pytest.mark.parametrize("patch", [
+    {},
+    {"hard_requirements_missing": []},
+    {"exclusion_signals": []},
+    {"classification": "APPLY"},
+    {"classification": True},
+    {"classification": " apply "},
+    {"classification": "forged"},
+    {"recommendation": False},
+])
+def test_shortlist_rejects_incomplete_or_malformed_additive_metadata(patch):
+    score = {"score": 99, "fit_score": 90, "coverage_score": 90, **patch}
+    assert shortlist([score]) == ()
+
+
+@pytest.mark.parametrize("classification", [True, " apply ", "forged"])
+def test_shortlist_rejects_invalid_classification_with_complete_safety(classification):
+    score = {"score": 99, "fit_score": 90, "coverage_score": 90,
+             "classification": classification, "hard_requirements_missing": [],
+             "exclusion_signals": []}
+    assert shortlist([score]) == ()
+
+
 @pytest.mark.parametrize("fit,coverage,classification", [
     (90, 90, "APPLY"), (60, 60, "REVIEW"), (30, 60, "EXPLORE"),
 ])
@@ -47,11 +75,11 @@ def test_shortlist_derives_classification_without_lowering_legacy_threshold(
     fit, coverage, classification,
 ):
     score = {"score": 80, "fit_score": fit, "coverage_score": coverage,
-             "classification": "forged", "hard_requirements_missing": [],
+             "classification": "EXPLORE", "hard_requirements_missing": [],
              "exclusion_signals": []}
     result = shortlist([score])
     assert result[0][1]["classification"] == classification
-    assert score["classification"] == "forged"  # pure: no input mutation
+    assert score["classification"] == "EXPLORE"  # pure: no input mutation
     assert shortlist([{**score, "score": 79}]) == ()
 
 
@@ -60,4 +88,6 @@ def test_shortlist_legacy_threshold_cap_and_stable_ties():
     assert [job for job, _ in shortlist(scores)] == ["1", "2", "3"]
     assert shortlist([{"score": 79}]) == ()
     assert shortlist([{"score": 80}]) == (("0", {"score": 80}),)
+    legacy = {"score": 80, "recommendation": "APPLY"}
+    assert shortlist([legacy]) == (("0", legacy),)
     assert shortlist([]) == ()
