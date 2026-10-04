@@ -149,6 +149,62 @@ def test_production_equal_scores_keep_first_input_job():
     assert result.selected["sourceJobId"] == "first"
 
 
+@pytest.mark.parametrize("blocked", [
+    {"classification": "SKIP"}, {"recommendation": "SKIP"},
+    {"hard_requirements_missing": ["License"]},
+    {"exclusion_signals": ["Excluded employer"]},
+    {"fit_score": True}, {"fit_score": 80, "coverage_score": 80},
+])
+@pytest.mark.parametrize("with_controls", [False, True])
+def test_production_eligibility_gates_latest_note_before_ranking(blocked, with_controls):
+    class Gateway:
+        def __init__(self):
+            self.jobs = {}
+
+        def import_job(self, payload):
+            job_id = payload["sourceJobId"]
+            self.jobs[job_id] = {**payload, "id": job_id, "notes": []}
+            return {"id": job_id}
+
+        def get_job(self, job_id):
+            return self.jobs[job_id]
+
+    class Source:
+        name = "synthetic"
+
+        def search(self, request):
+            ids = ("blocked", "first", "second") if with_controls else ("blocked",)
+            return [_automation_test_job(job_id) for job_id in ids]
+
+    gateway = Gateway()
+    calls = []
+    notifier = FakeNotifier()
+
+    def scorer(job_id, config_path):
+        calls.append(job_id)
+        payload = {"score": 99, **blocked} if job_id == "blocked" else {"score": 80}
+        gateway.jobs[job_id]["notes"] = [
+            {"body": "[AI_JOB_SCORE_V1]\n" + json.dumps({"score": 100})},
+            {"body": "[AI_JOB_SCORE_V1]\n" + json.dumps(payload)},
+        ]
+
+    result = JobSearchAutomation(
+        gateway, scorer=scorer, notifier=notifier, source_adapters=(Source(),)
+    ).run(config=AutomationConfig(
+        scorer_config_path="safe/config.yaml", score_threshold=80,
+        notify_enabled=True,
+    ))
+
+    assert (result.selected or {}).get("sourceJobId") == ("first" if with_controls else None)
+    assert result.imported == result.scored == len(calls) == len(gateway.jobs)
+    assert result.failures == ()
+    envelope = automation.build_n8n_envelope(result, occurred_at="2026-10-03T00:00:00Z")
+    assert (envelope["selected"] is not None) == with_controls
+    assert len(notifier.messages) == 1
+    assert "blocked" not in notifier.messages[0]
+    assert ("sin coincidencias" in notifier.messages[0]) == (not with_controls)
+
+
 def test_production_negative_score_cap_is_bounded_to_zero():
     class Source:
         name = "synthetic"
