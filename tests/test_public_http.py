@@ -464,3 +464,43 @@ def test_dns_busy_and_timeout_are_generic():
     fetcher._resolver = timeout
     assert fetcher.fetch("https://public.example").status == "timed_out"
     assert not calls
+
+# R5 credential regression tests from PR06
+def test_encoded_credential_key_in_query():
+    """URL-encoded credential key ?api%20key=VALUE must be rejected."""
+    assert http._safe_url("https://public.example/?api%20key=VALUE") is None
+
+
+def test_encoded_credential_key_in_fragment():
+    """URL-encoded credential key in fragment #api%20key=VALUE must be rejected."""
+    assert http._safe_url("https://public.example/path#api%20key=VALUE") is None
+
+
+def test_fragment_with_nested_url_having_credentials():
+    """Fragment containing nested URL with credentials must be rejected."""
+    assert http._safe_url("https://public.example/#https://evil.com?token=xxx") is None
+
+
+def test_url_encoded_secret_key_api():
+    """URL-encoded secretkey and api key in same query must be rejected."""
+    assert http._safe_url("https://public.example/?api%20key=secret&apikey=VALUE") is None
+
+
+def test_ipv6_ula_fc00_rejected():
+    """IPv6 ULA fc00::/8 site-local must be rejected by _public_ip."""
+    with pytest.raises(ValueError, match="blocked address"):
+        http._public_ip("fc00::1")
+
+
+def test_ipv6_ula_fd00_rejected():
+    """IPv6 ULA fd00::/8 site-local must be rejected by _public_ip."""
+    with pytest.raises(ValueError, match="blocked address"):
+        http._public_ip("fd00::1")
+
+
+
+
+def test_ipv6_ula_fec0_rejected():
+    """fec0::/10 (deprecated site-local) reports is_global=True in Python."""
+    with pytest.raises(ValueError, match="blocked address"):
+        http._public_ip("fec0::1")

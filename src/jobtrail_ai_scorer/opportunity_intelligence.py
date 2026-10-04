@@ -77,13 +77,32 @@ class Citation:
 
 _ATS_SOURCE_NAMES = frozenset({"lever", "greenhouse", "workday", "ashby", "bamboohr", "workable", "smartrecruiters"})
 _GENERIC_ATS_HOST_FAMILIES = frozenset({"workday", "greenhouse", "lever", "ashby", "bamboohr", "workable", "smartrecruiters"})
+# Public board/API domains used by supported ATS integrations. Match only
+# complete DNS labels so an employer such as "Greenhouse Technologies" or a
+# lookalike domain does not get discarded.
+_ATS_PROVIDER_DOMAINS = (
+    "lever.co", "greenhouse.io", "myworkdayjobs.com", "ashbyhq.com",
+    "bamboohr.com", "workable.com", "smartrecruiters.com",
+)
+
+
+def _is_ats_provider_host(value):
+    candidate = value.strip().casefold().rstrip(".")
+    if "://" in candidate:
+        candidate = urlsplit(candidate).hostname or ""
+    elif "/" in candidate:
+        return False
+    return any(candidate == domain or candidate.endswith("." + domain)
+               for domain in _ATS_PROVIDER_DOMAINS)
 
 
 def _sanitize_ats_company(company, source):
     if company is None:
         return None
-    if source and source.lower() in _ATS_SOURCE_NAMES:
-        if company.lower() in _GENERIC_ATS_HOST_FAMILIES:
+    if _is_ats_provider_host(company):
+        return None
+    if source and source.casefold() in _ATS_SOURCE_NAMES:
+        if company.strip().casefold() in _GENERIC_ATS_HOST_FAMILIES:
             return None
     return company
 
@@ -135,7 +154,7 @@ class TrustedEmployerContext:
                 or _host(self.provenance.url) not in self.hosts):
             raise ValueError('invalid explicit employer anchor')
         # Generic ATS provider hosts cannot themselves be employer trust anchors.
-        if any(h in ('jobs.lever.co', 'boards.greenhouse.io', 'job-boards.greenhouse.io') for h in self.hosts):
+        if any(_is_ats_provider_host(h) for h in self.hosts):
             raise ValueError('provider hostname is not employer authority')
 
 

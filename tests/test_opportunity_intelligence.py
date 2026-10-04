@@ -42,6 +42,36 @@ def test_public_identity_validation(changes):
 
 
 
+@pytest.mark.parametrize('provider_host', [
+    'api.lever.co', 'boards-api.greenhouse.io', 'jobs.lever.co',
+    'boards.greenhouse.io', 'job-boards.greenhouse.io',
+    'acme.myworkdayjobs.com', 'jobs.ashbyhq.com', 'acme.bamboohr.com',
+    'apply.workable.com', 'jobs.smartrecruiters.com',
+])
+def test_generic_ats_provider_hosts_cannot_establish_employer_ownership(provider_host):
+    result = identity(company=provider_host, source='lever')
+    assert result.company is None
+
+
+@pytest.mark.parametrize('provider_host', ['api.lever.co', 'boards-api.greenhouse.io'])
+def test_provider_hosts_are_rejected_for_non_ats_sources(provider_host):
+    result = identity(company=provider_host, source='aggregator')
+    assert result.company is None
+
+
+@pytest.mark.parametrize('company,source,expected', [
+    ('Acme', 'lever', 'Acme'),
+    ('Acme Corporation', 'greenhouse', 'Acme Corporation'),
+    ('acme.example', 'lever', 'acme.example'),
+    ('api.lever.co.example', 'lever', 'api.lever.co.example'),
+    ('Greenhouse Technologies', 'greenhouse', 'Greenhouse Technologies'),
+    ('Lever', 'aggregator', 'Lever'),
+    ('Acme Systems', 'aggregator', 'Acme Systems'),
+])
+def test_ats_company_sanitization_preserves_employer_values(company, source, expected):
+    assert identity(company=company, source=source).company == expected
+
+
 @pytest.mark.parametrize('ats_family', ATS_FAMILIES)
 def test_generic_ats_host_cannot_establish_employer_ownership(ats_family):
     """Generic ATS platform names cannot establish employer ownership anchors.
@@ -61,6 +91,8 @@ def test_generic_ats_host_cannot_establish_employer_ownership(ats_family):
 @pytest.mark.parametrize('hosts,careers,anchor', [
     (('acme.example.attacker.example',), CAREERS, CAREERS),
     (('jobs.lever.co',), 'https://jobs.lever.co/acme', 'https://jobs.lever.co/acme'),
+    (('api.lever.co',), 'https://api.lever.co/acme', 'https://api.lever.co/acme'),
+    (('boards-api.greenhouse.io',), 'https://boards-api.greenhouse.io/acme', 'https://boards-api.greenhouse.io/acme'),
     (('acme.example',), CAREERS, 'https://other.example/'),
     (('https://acme.example',), CAREERS, CAREERS),
 ])
