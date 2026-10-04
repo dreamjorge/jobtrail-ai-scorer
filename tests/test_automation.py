@@ -358,6 +358,71 @@ def test_search_payloads_split_sites_and_locations():
     ]
 
 
+def test_automation_config_parses_dry_run_truthy_env():
+    assert AutomationConfig.from_env({"JOBTRAIL_AUTOMATION_DRY_RUN": "yes"}).dry_run is True
+    assert AutomationConfig.from_env({"JOBTRAIL_AUTOMATION_DRY_RUN": "off"}).dry_run is False
+
+
+def test_dry_run_ranks_selected_and_redacts_full_opportunity(monkeypatch):
+    class Adapter:
+        name = "custom"
+        def search(self, request):
+            return [
+                NormalizedJob(source="custom", source_job_id="first", title="First", company="A", description="RESUME_SENTINEL", source_url="https://jobs.test/" + "x" * 500, location="Remote"),
+                NormalizedJob(source="custom", source_job_id="best", title="Best", company="B", description="PROMPT_SENTINEL", source_url="https://jobs.test/best", location="Remote"),
+            ]
+
+    scores = {"first": {"score": 81, "strengths": ["S" * 500], "reasoning": "PROMPT_SENTINEL"},
+              "best": {"score": 99, "strengths": ["safe"]}}
+    run = JobSearchAutomation(FakeJobTrail(), scorer=lambda job_id, path: scores[job_id],
+        source_adapters=(Adapter(),)).run(config=AutomationConfig(dry_run=True, locations=("remote",), notify_enabled=True))
+    assert run.selected["title"] == "Best"
+    assert run.selected == run.opportunities[-1]
+    assert run.notification_preview["title"] == run.selected["title"]
+    encoded = json.dumps({"selected": run.selected, "opportunities": run.opportunities})
+    assert "RESUME_SENTINEL" not in encoded and "PROMPT_SENTINEL" not in encoded
+    assert "reasoning" not in encoded and len(run.opportunities[0]["strengths"][0]) <= 200
+    assert len(run.opportunities[0]["jobUrl"]) <= 200
+
+
+def test_automation_dry_run_has_no_write_side_effects():
+    class Adapter:
+        name = "custom"
+        def search(self, request):
+            return [NormalizedJob(source="custom", source_job_id="source-1", title="Secret role",
+                                  company="Acme", description="private prompt", source_url="https://jobs.test/1",
+                                  location="remote")]
+
+    class Cache:
+        def transaction(self):
+            raise AssertionError("dry-run must not open cache transactions")
+        def mark_seen(self, *args, **kwargs):
+            raise AssertionError("dry-run must not mark cache")
+
+    gateway = FakeJobTrail()
+    notifications = []
+    breaker = type("Breaker", (), {
+        "should_attempt": lambda self: True,
+        "record_success": lambda self: (_ for _ in ()).throw(AssertionError("breaker mutated")),
+    })()
+    journal = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("journal mutated"))
+    run = JobSearchAutomation(
+        gateway,
+        scorer=lambda job_id, path: {"score": 95, "recommendation": "PRIORITY_APPLY",
+                                     "strengths": ["Python"], "gaps": []},
+        notifier=notifications.append, seen_cache=Cache(), source_adapters=(Adapter(),),
+        circuit_breaker=breaker, run_journal=journal,
+    ).run(config=AutomationConfig(scorer_config_path="safe.yaml", dry_run=True,
+                                  locations=("remote",), notify_enabled=True, run_journal_path="journal.json"))
+
+    assert gateway.imported == []
+    assert notifications == []
+    assert run.dry_run is True
+    assert run.planned_operations == {"searched": 1, "imported": 1, "scored": 1, "notified": 1}
+    assert run.notification_preview["company"] == "Acme"
+    assert "private prompt" not in json.dumps(run.notification_preview)
+
+
 def test_automation_config_parses_search_profiles_from_env():
     config = AutomationConfig.from_env(
         {
@@ -2987,3 +3052,30 @@ def test_preflight_healthy_runs_pipeline_with_injected_breaker(tmp_path):
     assert result.failures == ("breaker:open",)
     assert result.imported == 0
     assert result.scored == 0
+
+
+def test_run_journal_records_success_once(tmp_path):
+    calls = []
+    automation = JobSearchAutomation(FakeJobTrail(), scorer=lambda *_: None, run_journal=lambda *args, **kwargs: calls.append((args, kwargs)))
+    automation.run(config=AutomationConfig(scorer_config_path="safe/config.yaml", run_journal_path=str(tmp_path / "runs.jsonl")))
+    assert len(calls) == 1
+
+
+def test_run_journal_records_breaker_open_once(tmp_path):
+    class OpenBreaker:
+        def should_attempt(self): return False
+        def try_alert(self): return False
+    calls = []
+    automation = JobSearchAutomation(FakeJobTrail(), circuit_breaker=OpenBreaker(), run_journal=lambda *a, **k: calls.append(a))
+    result = automation.run(config=AutomationConfig(scorer_config_path="safe/config.yaml", run_journal_path=str(tmp_path / "runs.jsonl")))
+    assert result.failures == ("breaker:open",)
+    assert len(calls) == 1
+
+
+def test_run_journal_records_preflight_abort_once(tmp_path):
+    from jobtrail_ai_scorer.preflight import PreflightReport, PreflightResult, STATUS_UNAVAILABLE
+    calls = []
+    automation = JobSearchAutomation(FakeJobTrail(), preflight_runner=lambda _: PreflightReport((PreflightResult(name="api", status=STATUS_UNAVAILABLE),)), run_journal=lambda *a, **k: calls.append(a))
+    result = automation.run(config=AutomationConfig(scorer_config_path="safe/config.yaml", run_journal_path=str(tmp_path / "runs.jsonl")))
+    assert result.searched == 0
+    assert len(calls) == 1

@@ -498,3 +498,9 @@ def test_ipv6_ula_fd00_rejected():
         http._public_ip("fd00::1")
 
 
+
+
+def test_ipv6_ula_fec0_rejected():
+    """fec0::/10 (deprecated site-local) reports is_global=True in Python."""
+    with pytest.raises(ValueError, match="blocked address"):
+        http._public_ip("fec0::1")
