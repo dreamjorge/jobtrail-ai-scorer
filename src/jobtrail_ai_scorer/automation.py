@@ -10,7 +10,7 @@ import json
 import os
 import shlex
 import subprocess
-from typing import Any, Callable, Mapping, Protocol
+from typing import Any, Callable, Mapping, Protocol, TYPE_CHECKING
 from urllib.parse import quote, unquote
 
 import httpx
@@ -39,6 +39,10 @@ from .notify import (
 )
 from .n8n_outbound import N8nConfig, build_envelope
 from .run_journal import record_run
+
+
+if TYPE_CHECKING:
+    from .opportunity_intelligence import OpportunityResult
 
 
 DEFAULT_TERMS = (
@@ -254,6 +258,7 @@ class AutomationConfig:
     breaker_state_path: str = ""
     n8n: N8nConfig = field(default_factory=N8nConfig)
     feedback_actions_enabled: bool = False
+    opportunity_intelligence_enabled: bool = False
     dry_run: bool = False
 
     @classmethod
@@ -267,6 +272,10 @@ class AutomationConfig:
 
         def truthy(key: str, default: str = "0") -> bool:
             return e.get(key, default).strip().lower() in {"1", "true", "yes", "on"}
+
+        intelligence_flag = e.get("OPPORTUNITY_INTELLIGENCE_ENABLED", "0").strip().lower()
+        if intelligence_flag not in {"1", "true", "yes", "on", "0", "false", "no", "off"}:
+            raise ValueError("invalid opportunity intelligence enable flag")
 
         def _coerce_int(key: str, default: int) -> int:
             raw = e.get(key)
@@ -327,6 +336,7 @@ class AutomationConfig:
             breaker_state_path=e.get("BREAKER_STATE_PATH", "").strip(),
             n8n=N8nConfig.from_env(e),
             feedback_actions_enabled=truthy("N8N_FEEDBACK_ACTIONS_ENABLED"),
+            opportunity_intelligence_enabled=intelligence_flag in {"1", "true", "yes", "on"},
             dry_run=truthy("JOBTRAIL_AUTOMATION_DRY_RUN", "0"),
         )
 
@@ -608,6 +618,7 @@ class AutomationRun:
     notification_sent: bool | None = None
     run_id: str = ""
     opportunities: tuple[dict[str, Any], ...] = ()
+    intelligence: tuple[OpportunityResult, ...] = ()
     dry_run: bool = False
     planned_operations: dict[str, int] = field(default_factory=dict)
     notification_preview: dict[str, Any] | None = None
@@ -998,12 +1009,20 @@ class JobTrailAutomation:
         run_journal: Callable[..., Any] | None = None,
         clock: Callable[[], datetime] | None = None,
         simulation: "SimulationScenario | None" = None,
+        intelligence_resolver: Any | None = None,
+        intelligence_resolver_factory: Callable[[], Any] | None = None,
+        employer_contexts: tuple[Any, ...] = (),
+        intelligence_status: str | None = None,
     ) -> None:
         if simulation is not None and not isinstance(simulation, SimulationScenario):
             raise ValueError(
                 "simulation must be a SimulationScenario instance or None"
             )
         self._simulation = simulation
+        self._intelligence_resolver = intelligence_resolver
+        self._intelligence_resolver_factory = intelligence_resolver_factory
+        self._employer_contexts = employer_contexts
+        self._intelligence_status = intelligence_status
         self.gateway, self.scorer, self.notifier = (
             gateway,
             scorer or self._score,
@@ -1442,6 +1461,45 @@ class JobTrailAutomation:
                 opportunity["searchProfiles"] = list(profiles_by_job_id[job_id])
             opportunities.append(opportunity)
 
+        intelligence = []
+        card_inputs = []
+        if config.opportunity_intelligence_enabled:
+            from .opportunity_intelligence import PublicJobIdentity, OpportunityResult
+            # Local to this run: one deadline/budget shared across the shortlist,
+            # starting only after collection and scoring have finished.
+            resolver = self._intelligence_resolver
+            intelligence_status = self._intelligence_status
+            if (opportunities and not intelligence_status and resolver is None
+                    and self._intelligence_resolver_factory is not None):
+                try:
+                    resolver = self._intelligence_resolver_factory()
+                except Exception:
+                    intelligence_status = "invalid_configuration"
+            for opportunity in opportunities[:3]:
+                identity = None
+                try:
+                    # Explicit projection: never give enrichment scored mappings.
+                    identity = PublicJobIdentity(
+                        company=opportunity["company"], title=opportunity["title"],
+                        location=opportunity["location"], original_url=opportunity["jobUrl"],
+                        source=opportunity["source"], source_job_id=opportunity["sourceJobId"],
+                    )
+                    from .opportunity_intelligence import _norm
+                    context = next((c for c in self._employer_contexts
+                                    if _norm(c.company) == _norm(identity.company)), None)
+                    if intelligence_status or resolver is None:
+                        resolved = OpportunityResult(intelligence_status or "unavailable", identity.original_url)
+                    else:
+                        resolved = resolver.resolve(identity, context, enabled=True)
+                        if type(resolved) is not OpportunityResult:
+                            raise ValueError("invalid intelligence result")
+                except Exception:
+                    resolved = OpportunityResult("unavailable" if identity else "invalid_input",
+                                                 identity.original_url if identity else None)
+                intelligence.append(resolved)
+                if identity is not None:
+                    card_inputs.append((identity, resolved))
+
         best = opportunities[0] if opportunities else None
         best_job = shortlist[0][0][1] if shortlist else None
         best_score = shortlist[0][1] if shortlist else None
@@ -1458,6 +1516,14 @@ class JobTrailAutomation:
             base_url=self.base_url,
             run_id=run_id,
         )
+        if (notification_body is not None and best and config.notify_enabled
+                and config.opportunity_intelligence_enabled):
+            from .opportunity_cards import serialize_cards, render_cards
+            try:
+                public_body = render_cards(serialize_cards(card_inputs))
+            except Exception:
+                public_body = "Public information: unavailable"
+            notification_body += "\n\n" + public_body
         notification_sent = False
         if notification_body is not None:
             try:
@@ -1475,6 +1541,7 @@ class JobTrailAutomation:
             notification_sent=notification_sent,
             run_id=run_id,
             opportunities=tuple(opportunities),
+            intelligence=tuple(intelligence),
         )
         # Step N: record the run outcome on the breaker so it can open
         # after consecutive failures or close after a clean run.
