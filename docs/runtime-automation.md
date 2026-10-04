@@ -230,6 +230,14 @@ public-input boundary. Hermetic tests inject DNS/connections and fake numeric
 sockets/TLS to prove address pinning and original-host verification; no live
 DNS, destination requests or Brave requests were performed.
 
+## Public opportunity evidence
+
+This snapshot provides the public identity, citation, explicit employer trust
+anchor, result/brief and transport protocol models only. No evidence resolution
+or runtime enrichment is available yet. Source identifiers must be public,
+requisitions explicitly namespaced and employer authority operator-asserted.
+Generic ATS hosts cannot serve as employer trust anchors.
+
 ## Optional Adzuna source
 
 `AdzunaSourceAdapter` is an optional source the automation launcher can
