@@ -46,7 +46,7 @@ def _text(value, limit):
 
 def _card_url(value):
     url = _candidate_url(value)
-    return url if url and not _unsafe_text(value) else None
+    return value if url and not _unsafe_text(value) else None
 
 
 def _citation(proof):

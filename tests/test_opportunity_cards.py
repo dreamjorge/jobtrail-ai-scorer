@@ -8,6 +8,20 @@ from jobtrail_ai_scorer.opportunity_intelligence import PublicJobIdentity, Oppor
 
 
 
+def test_serialize_cards_preserves_validated_url_fragments():
+    from jobtrail_ai_scorer.opportunity_cards import serialize_cards
+    job_url = 'https://source.test/jobs#role-123'
+    official_url = 'https://acme.test/careers#engineering'
+    job = PublicJobIdentity('Acme', 'Engineer', 'Remote', job_url, 'indeed', '1')
+    result = OpportunityResult('verified', job_url, official_url=official_url,
+                              checked_at='2026-06-01T00:00:00+00:00')
+
+    card = serialize_cards([(job, result)])[0]
+
+    assert card['original_url'] == job_url
+    assert card['official_url'] == official_url
+
+
 def test_public_cards_bound_and_separate_links():
     from jobtrail_ai_scorer.opportunity_cards import serialize_cards, render_cards
     job = PublicJobIdentity('Acme', 'Engineer', 'Remote', 'https://source.test/1', 'indeed', '1')
