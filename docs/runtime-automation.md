@@ -42,7 +42,7 @@ injection remains supported (the caller owns that resolver's lifetime).
 Enabled real runs use this single stack and
 resolve at most three eligible shortlisted matches before composing WhatsApp.
 Search/import/scoring, local journal authority, and selected compatibility remain.
-n8n continues using its existing v1 contract; public-card v2 is forthcoming. There is no additional scheduler.
+The n8n handoff supports v1 and, when public cards are handed off, completion schema v2. The canonical launcher is not yet wired for public-card delivery; direct callers can use v2 now. v1-only consumers must support or upgrade to v2 before enabling card delivery. There is no additional scheduler.
 
 Configure `BRAVE_SEARCH_API_KEY` only in operator-controlled runtime settings.
 Missing credentials yield `provider unconfigured` without public HTTP calls.
@@ -919,10 +919,7 @@ network. They serve different purposes and are not interchangeable.
 
 ### Opportunity cards: opt into completion schema v2
 
-Consumers must explicitly support `schema_version: 2` before enabling public
-opportunity enrichment for n8n. Both `N8N_ENABLED=1` and
-`OPPORTUNITY_INTELLIGENCE_ENABLED=true` are needed for card delivery. Direct callers record locally, then call `build_n8n_envelope(run)` and the same
-optional adapter; canonical launcher wiring is forthcoming. No new channel or scheduler.
+Completion schema v2 is available when public cards are handed off. Consumers must explicitly support `schema_version: 2` before enabling public opportunity enrichment for n8n; v1-only consumers must support or upgrade before card delivery is enabled. The flags control separate layers: `OPPORTUNITY_INTELLIGENCE_ENABLED=true` enables enrichment during the run, while `N8N_ENABLED=1` enables the outbound adapter. A direct caller runs automation with enrichment enabled, passes the resulting run to `build_n8n_envelope(run)`, then sends that envelope through the enabled `N8nOutboundAdapter`. The canonical launcher is not yet wired for public-card delivery. No new channel or scheduler.
 
 Disabled enrichment, absent intelligence, or no serializable public cards emits
 **exactly the prior v1 shape**, event-ID domain and optional feedback actions.
