@@ -32,7 +32,23 @@ def test_rejects_unknown_recommendation():
 def test_accepts_canonical_score_schema():
     result = ScoreResult.model_validate(canonical_score())
 
-    assert result.model_dump() == canonical_score()
+    assert result.model_dump() == {
+        **canonical_score(),
+        "fit_score": 85,
+        "coverage_score": 85,
+        "classification": "APPLY",
+        "evidence": [],
+        "exclusion_signals": [],
+    }
+    assert 0 <= result.score <= 100
+    assert result.score == 85
+    assert result.recommendation == "APPLY"
+    assert result.strengths == ["Relevant Python experience"]
+    assert result.gaps == ["No Kubernetes production experience"]
+    assert result.needs_confirmation == ["Remote-work location"]
+    assert result.hard_requirements_missing == []
+    assert result.career_value == "High"
+    assert result.reasoning == "The role aligns with the candidate's backend experience."
 
 
 @pytest.mark.parametrize("invalid_score", ["85", 85.0])

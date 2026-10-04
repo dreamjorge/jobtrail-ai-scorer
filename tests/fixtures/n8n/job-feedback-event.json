@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "event": "job_feedback",
+  "run": "synthetic-run-001",
+  "source": "operator_fixture",
+  "sourceJob": "synthetic-job-001",
+  "action": "interesting",
+  "token": "synthetic-token-001.4102444800",
+  "expiry": 4102444800
+}
