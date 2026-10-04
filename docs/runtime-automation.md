@@ -32,8 +32,9 @@ injection remains supported (the caller owns that resolver's lifetime).
 Enabled real runs use this single stack and
 resolve at most three eligible shortlisted matches before composing WhatsApp.
 Search/import/scoring, local journal authority, and selected compatibility remain.
-Disabled enrichment retains the existing n8n v1 contract exactly; enabled public
-cards use the explicitly versioned v2 contract below. There is no additional scheduler.
+The canonical launcher now wires public-card delivery through completion schema v2;
+disabled enrichment retains the existing n8n v1 contract exactly. v1-only consumers
+must support or upgrade to v2 before enabling card delivery. There is no additional scheduler.
 
 Configure `BRAVE_SEARCH_API_KEY` only in operator-controlled runtime settings.
 Missing credentials yield `provider unconfigured` without public HTTP calls.
@@ -913,8 +914,10 @@ network. They serve different purposes and are not interchangeable.
 Consumers must explicitly support `schema_version: 2` before enabling public
 opportunity enrichment for n8n. Both `N8N_ENABLED=1` and
 `OPPORTUNITY_INTELLIGENCE_ENABLED=true` are needed for card delivery. The canonical
-launcher still records locally, then calls `build_n8n_envelope(run)` and the same
-optional adapter; no new notification channel or scheduler is introduced.
+launcher is wired for public-card delivery, records locally, then calls
+`build_n8n_envelope(run)` and the same optional adapter; no new notification
+channel or scheduler is introduced.
+Both `OPPORTUNITY_INTELLIGENCE_ENABLED=true` and `N8N_ENABLED=1` are required for cards: the former enables enrichment, the latter outbound delivery. The canonical launcher passes the run through `build_n8n_envelope(run)` and the existing adapter. No new channel or scheduler.
 
 Disabled enrichment, absent intelligence, or no serializable public cards emits
 **exactly the prior v1 shape**, event-ID domain and optional feedback actions.

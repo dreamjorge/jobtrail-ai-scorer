@@ -250,6 +250,8 @@ def build_envelope(
         # Preserve the selected compatibility summary, not CV-match evidence.
         safe_selected = {key: value for key, value in safe_selected.items()
                          if key in _SELECTED_FIELDS + ('classification',) + _SCORE_FIELDS}
+        if not safe_selected:
+            safe_selected = None
     identity = _valid_identity(selected or {}) or (raw_run_id, "run")
     event_id = _identity_digest({
         "job_id": identity[1],

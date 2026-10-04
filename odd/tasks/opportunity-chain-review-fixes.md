@@ -36,16 +36,16 @@ Keep injected transports caller-owned through a minimal non-closing adapter; pre
 - [x] R6 — PR93: deny generic ATS host families as employer trust anchors.
 - [x] R7 — PR94: tolerate valueless/malformed HTML attributes without discarding valid evidence.
 - [x] R8 — PR95: enforce evidence/job association and preserve validated original fragments.
-- [ ] R9 — PR96: failure-only notification gating, employer normalization and shared strict intelligence flag parser.
+- [x] R9 — PR96: failure-only notification gating, employer normalization and shared strict intelligence flag parser.
 - [x] R10 — PR97: null stripped empty v2 selection and align rollout documentation.
-- [x] R11 — PR98: reuse strict flag parser; preserve disabled/dry-run zero-secret-read lazy behavior.
-- [x] R12 — Independently verify every corrected head, full final suite, focused diffs/budgets/ref preservation; report delivery readiness and remaining authorization.
-- [x] R-A — PR90 (origin 05-public-http-guards): block IPv6 fec0::/10 site-local range. codex P1 finding: Python's ipaddress reports fec0::/10 as is_global=True so _public_ip allowed it. Fix: explicit check on first two bytes (0xfe and 0xc0 mask). Propagated through PR91→...→PR98.
-- [x] R-B — PR95 (origin 10-public-cards): verify result.source_url matches job.original_url in serialize_cards. codex P2 finding: misbehaving caller could pass (jobA, resultB) and card would incorrectly associate jobA's identity with resultB's status. Fix: normalization-aware check via _candidate_url. Propagated through PR96→PR97→PR98.
+- [ ] R11 — PR98: reuse strict flag parser; preserve disabled/dry-run zero-secret-read lazy behavior.
+- [ ] R12 — Independently verify every corrected head, full final suite, focused diffs/budgets/ref preservation; report delivery readiness and remaining authorization.
+- [x] R-A — PR90: block IPv6 fec0::/10 site-local range; propagated through PR98.
+- [x] R-B — PR95: validate result.source_url matches job.original_url in serialize_cards; propagated through PR98.
 
 ## State and evidence
 
-R1–R12 COMPLETE; delivery pending authorization. Active worktree: `/root/.config/superpowers/worktrees/jobtrail-ai-scorer/feat-opportunity-intelligence-review`, branch `feat/opportunity-intelligence-review-FIX-A-B`, HEAD `a2f3daf` (fix: block IPv6 fec0::/10 and validate source_url in serialize_cards). Canonical-launcher branch updated to `74a27bb` after R-A/B propagation.
+R1–R10 COMPLETE; R11 in progress; R12 pending. Active worktree: `/tmp/wt-pr98`, canonical-launcher branch. Previous chain evidence is retained below.
 
 Prior read-only triage: Engram280/281, `/tmp/jobtrail-bot-validation-20261003T052646Z`, fresh GitHub metadata 2026-10-03 14:44 UTC. PR83 had 799 passing tests and five earlier bot findings fixed, but a separate canonical probe selected/notified an explicit SKIP job; final98 rejected it. Twelve feature root causes reproduced; transport and unusual selected-input production impact not demonstrated. PR97 stale documentation is specifically superseded by PR98.
 
@@ -74,4 +74,8 @@ R12 evidence: full suite 1358 tests passed. All 13 local branches ahead of remot
 R-A evidence: codex P1 finding 2026-10-03 on PR90 (05-public-http-guards). Python ipaddress reports fec0::/1 as is_global=True, is_reserved=False, is_link_local=False. _public_ip guard allowed it. Fix: `elif address.packed[0] == 0xfe and (address.packed[1] & 0xc0) == 0xc0: raise ValueError("blocked address")`. RED confirmed: ValueError raised. GREEN confirmed. Suite: 1361 tests (3 new). Propagated to PR91→...→PR98 via cherry-pick/merge. Commits: 6ed5e31 (origin 05) + ad53787, 476d6d8, 13b1162, 196ccee, 618647e, 825b57e, 443a625, 077de53.
 
 R-B evidence: codex P2 finding 2026-10-03 on PR95 (10-public-cards). serialize_cards accepted (jobA, resultB) pairs without verifying result.source_url against job.original_url. Fix: normalization-aware check via _candidate_url. RED confirmed: ValueError raised for mismatched URLs. GREEN confirmed. Suite: 1361 tests. Propagated to PR96→PR97→PR98. Commits: acc3793 (origin 10) + f082862, 16565c4, 74a27bb.
+
+R4 evidence: source/normal merge `abc3d6d58dab3dd75c6d60f113bcdd658669e441`. Append-only test conflicts separately diagnosed; preserved both imports/blocks and inherited URL regressions. Baseline 196 focused; new RED one premature-close assertion; GREEN 197 focused / 1117 full, zero skips, independently repeated. Two queries succeed with no cookies, caller-owned transport stays open, explicit caller close occurs exactly once. Minimal non-closing delegate wraps injected transports only; default HTTPX ownership unchanged. PR89 focused diff 394/400 before this six-line receipt. Native assessment high, inspect `managed_assets_outdated`, no START/approval/sync. Next: R5 shared HTTP URL policy and site-local IPv6 at PR90, then verify propagation to PR91/92 without adding authored lines to capped PR92. R5–R12 and final all-head verification remain unfinished; no publishing, PR merges.
+
+R5 evidence: source `91bbfd153cfb4a4e68a3aefb0ebf35de93a4dbf2`, 6 additions + 1 deletion in public_http.py; 35 regression tests added for credential/fragment/IPv6 ULA. RED one actual failure: fragment nested URL `https://evil.com?token=xxx` accepted; GREEN 48 focused / 1161 full, zero skips. IPV6 ULA already rejected by existing is_global/is_link_local; regression tests verify existing behavior. _SECRET_QUERY_KEYS aligned with public_search (added secretkey/secret_key). _credential_fields imported from public_search and called for query and fragment in _safe_url. PR90 source delta 6A+1D; PR90 total ~221/400. Propagation to PR91 conflicted append-only in tests (separate diagnostic); resolved by preserving both blocks. Propagation to PR92 had full-file replacement conflict; resolved by extracting only R5 functions (32 lines) not in PR07. All checkpoints GREEN. Next: R6 deny generic ATS host families as employer trust anchors at PR93 (origin opportunity_intelligence.py); no new authored lines in PR92 beyond propagation. R6–R12 and final all-head verification remain unfinished; no publishing, PR merges or live services.
 

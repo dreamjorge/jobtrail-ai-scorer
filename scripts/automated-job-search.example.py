@@ -212,7 +212,10 @@ def _record_local_then_deliver(
 
 def _build_intelligence(env, *, dry_run=False):
     """Defer the per-run bounded stack and credentials until enrichment starts."""
-    if dry_run or _parse_truthy(env.get("OPPORTUNITY_INTELLIGENCE_ENABLED", "false")) is not True:
+    enabled = _parse_truthy(env.get("OPPORTUNITY_INTELLIGENCE_ENABLED", "false"))
+    if enabled is None:
+        raise ValueError("OPPORTUNITY_INTELLIGENCE_ENABLED must be 0/1/true/false/yes/no/on/off")
+    if dry_run or not enabled:
         return {}
     from jobtrail_ai_scorer.opportunity_intelligence import OpportunityIntelligence, parse_employer_contexts
     from jobtrail_ai_scorer.public_search import BravePublicSearchAdapter, PublicSearchConfig

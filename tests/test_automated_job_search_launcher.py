@@ -16,6 +16,12 @@ import pytest
 
 from jobtrail_ai_scorer.n8n_outbound import DeliveryResult, N8nConfig
 
+def test_intelligence_factory_rejects_invalid_enabled_boolean():
+    module = _load_module()
+    with pytest.raises(ValueError, match="OPPORTUNITY_INTELLIGENCE_ENABLED"):
+        module._build_intelligence({"OPPORTUNITY_INTELLIGENCE_ENABLED": "tru"})
+
+
 def test_intelligence_factory_disabled_and_dryrun_do_not_read_secret():
     module = _load_module()
     class Guard(dict):

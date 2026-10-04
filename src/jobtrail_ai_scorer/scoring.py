@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import json
-from typing import Any, Protocol
+import unicodedata
+from typing import Any, Mapping, Protocol
 
 from pydantic import ValidationError
 
@@ -14,6 +16,37 @@ from .providers.base import ScoreProvider
 
 CURRENT_MARKER = "[AI_JOB_SCORE_V1]"
 LEGACY_MARKER = "[HERMES_JOB_SCORE_V1]"
+FINGERPRINT_VERSION = 1
+_FINGERPRINT_FIELDS = {
+    "title": ("title", "position"),
+    "company": ("company",),
+    "location": ("location",),
+    "description": ("description",),
+    "salaryMin": ("salaryMin", "salary_min"),
+    "salaryMax": ("salaryMax", "salary_max"),
+    "salaryCurrency": ("salaryCurrency", "salary_currency"),
+    "jobType": ("jobType", "job_type", "employment_type"),
+    "remote": ("remote",),
+}
+
+
+def _normalize_fingerprint_value(value: Any) -> Any:
+    if isinstance(value, str):
+        normalized = unicodedata.normalize("NFKC", value)
+        return " ".join(normalized.casefold().split())
+    return value
+
+
+def job_fingerprint(job: Mapping[str, Any]) -> str:
+    """Return the versioned digest of fields that affect a job score."""
+    canonical = {
+        field: _normalize_fingerprint_value(
+            next((job[key] for key in aliases if key in job), None)
+        )
+        for field, aliases in _FINGERPRINT_FIELDS.items()
+    }
+    payload = json.dumps(canonical, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _coerce_int(value: Any) -> int | None:
@@ -58,6 +91,8 @@ def parse_score_note(
     stricter validation can pipe the result through :class:`ScoreResult`.
     """
 
+    if isinstance(notes, str):
+        notes = [{"body": notes}]
     if not isinstance(notes, list):
         return None
     markers = (marker, LEGACY_MARKER) if marker == CURRENT_MARKER else (marker,)
@@ -130,6 +165,19 @@ class JobTrailGateway(Protocol):
         """Add a note to a job."""
 
 
+_MAX_OUTPUT_STRING = 500
+_MAX_OUTPUT_ITEMS = 20
+_MAX_OUTPUT_ITEM_STRING = 200
+
+
+def _bound_string(value: str) -> str:
+    return value[:_MAX_OUTPUT_STRING]
+
+
+def _bound_list(values: tuple[str, ...]) -> list[str]:
+    return [_bound_string(value[:_MAX_OUTPUT_ITEM_STRING]) for value in values[:_MAX_OUTPUT_ITEMS]]
+
+
 @dataclass(frozen=True)
 class ScoreOutcome:
     """A privacy-safe result for one attempted job."""
@@ -137,6 +185,26 @@ class ScoreOutcome:
     job_id: str
     status: str
     reason: str
+    score: int | None = None
+    recommendation: str | None = None
+    strengths: tuple[str, ...] = ()
+    gaps: tuple[str, ...] = ()
+    career_value: str | None = None
+    reasoning: str | None = None
+    hard_requirements_missing: tuple[str, ...] = ()
+    needs_confirmation: tuple[str, ...] = ()
+
+    def as_json(self) -> dict[str, Any]:
+        result: dict[str, Any] = {"job_id": _bound_string(self.job_id), "status": _bound_string(self.status)}
+        if self.score is not None:
+            result.update({"score": self.score, "recommendation": _bound_string(self.recommendation or ""),
+                           "strengths": _bound_list(self.strengths), "gaps": _bound_list(self.gaps),
+                           "career_value": _bound_string(self.career_value or ""),
+                           "reasoning": _bound_string(self.reasoning or ""),
+                           "hard_requirements_missing": _bound_list(self.hard_requirements_missing),
+                           "needs_confirmation": _bound_list(self.needs_confirmation)})
+        result["reason"] = _bound_string(self.reason)
+        return {key: result[key] for key in sorted(result)}
 
 
 @dataclass(frozen=True)
@@ -148,9 +216,18 @@ class ScoreRunResult:
     failed: int
     outcomes: tuple[ScoreOutcome, ...]
 
+    @property
+    def json_output(self) -> list[dict[str, Any]]:
+        return [outcome.as_json() for outcome in self.outcomes]
+
+    @property
+    def json_text(self) -> str:
+        return json.dumps(self.json_output, sort_keys=True, separators=(",", ":"))
+
 
 def should_score(
-    job: dict[str, Any], *, force: bool = False, marker: str = CURRENT_MARKER
+    job: dict[str, Any], *, force: bool = False, marker: str = CURRENT_MARKER,
+    current_fingerprint: str | None = None,
 ) -> bool:
     """Return whether a complete job is eligible for scoring."""
 
@@ -160,7 +237,9 @@ def should_score(
         return False
     if force:
         return True
-    return not _contains_score_marker(job.get("notes"), marker=marker)
+    return not _contains_score_marker(
+        job.get("notes"), marker=marker, current_fingerprint=current_fingerprint
+    )
 
 
 def render_prompt(
@@ -221,6 +300,63 @@ def classify_score(
     return "SKIP"
 
 
+def eligible_score(
+    score: Mapping[str, Any], *, score_threshold: int,
+) -> dict[str, Any] | None:
+    """Return a normalized eligible copy, preserving legacy score ranking.
+
+    Apply this after parsing the latest valid note; rejection must never fall
+    back to an older note. Any additive marker requires both strict dual scores
+    and explicit safety arrays. Genuine legacy notes need no additive defaults.
+    Neither this helper nor its callers rewrite persisted notes.
+    """
+
+    legacy_score = score.get("score")
+    if (
+        isinstance(legacy_score, bool)
+        or not isinstance(legacy_score, int)
+        or not 0 <= legacy_score <= 100
+        or legacy_score < score_threshold
+    ):
+        return None
+    for field in ("recommendation", "classification"):
+        if field in score:
+            value = score[field]
+            if not isinstance(value, str) or value.strip().upper() == "SKIP":
+                return None
+    if "classification" in score and score["classification"] not in (
+        "APPLY", "REVIEW", "EXPLORE",
+    ):
+        return None
+
+    additive = any(field in score for field in (
+        "fit_score", "coverage_score", "classification", "evidence", "exclusion_signals",
+    ))
+    for field in ("hard_requirements_missing", "exclusion_signals"):
+        if field not in score:
+            if additive:
+                return None
+            continue
+        value = score[field]
+        if not isinstance(value, list) or not all(
+            isinstance(entry, str) and entry.strip() for entry in value
+        ):
+            return None
+        if value:
+            return None
+
+    normalized = dict(score)
+    if additive:
+        try:
+            classification = classify_score(score.get("fit_score"), score.get("coverage_score"))
+        except ValueError:
+            return None
+        if classification == "SKIP":
+            return None
+        normalized["classification"] = classification
+    return normalized
+
+
 def score_jobs(
     client: JobTrailGateway,
     provider: ScoreProvider,
@@ -233,16 +369,22 @@ def score_jobs(
     marker: str = CURRENT_MARKER,
     emit_status: bool = True,
     strategy_context: dict[str, Any] | str | None = None,
+    output_json: bool = False,
+    job_payload: dict[str, Any] | None = None,
 ) -> ScoreRunResult:
     """Score independently eligible jobs and save only validated results."""
 
+    if output_json and not dry_run:
+        raise ValueError("output_json requires dry_run")
     marker = _normalize_marker(marker)
-    candidates = _select_candidates(client, job_id=job_id, limit=limit)
+    candidates = [job_payload] if job_payload is not None else _select_candidates(client, job_id=job_id, limit=limit)
     outcomes: list[ScoreOutcome] = []
     processed = skipped = failed = 0
 
     for candidate in candidates:
         candidate_id = candidate.get("id")
+        if job_payload is not None and not isinstance(candidate_id, str):
+            candidate_id = job_id
         if not isinstance(candidate_id, str) or not candidate_id:
             failed += 1
             outcomes.append(ScoreOutcome("<unknown>", "failed", "invalid_job_id"))
@@ -253,8 +395,12 @@ def score_jobs(
             continue
 
         try:
-            full_job = client.get_job(candidate_id)
-            if not should_score(full_job, force=force, marker=marker):
+            full_job = candidate if job_payload is not None else client.get_job(candidate_id)
+            current_fingerprint = job_fingerprint(full_job)
+            if not should_score(
+                full_job, force=force, marker=marker,
+                current_fingerprint=current_fingerprint,
+            ):
                 skipped += 1
                 reason = "empty_description" if not _has_description(full_job) else "already_scored"
                 outcomes.append(ScoreOutcome(candidate_id, "skipped", reason))
@@ -271,10 +417,11 @@ def score_jobs(
                     key in decoded_score
                     for key in ("fit_score", "coverage_score", "evidence", "exclusion_signals", "classification")
                 ),
+                job=full_job,
             )
             if dry_run:
                 processed += 1
-                outcomes.append(ScoreOutcome(candidate_id, "dry_run", "validated"))
+                outcomes.append(_validated_outcome(candidate_id, score) if output_json else ScoreOutcome(candidate_id, "dry_run", "validated"))
                 if emit_status:
                     print(f"DRY RUN {candidate_id}: validated score {score.score}")
             else:
@@ -293,6 +440,13 @@ def score_jobs(
                 print(f"FAILED {candidate_id}: {error.__class__.__name__}")
 
     return ScoreRunResult(processed, skipped, failed, tuple(outcomes))
+
+
+def _validated_outcome(job_id: str, score: ScoreResult) -> ScoreOutcome:
+    return ScoreOutcome(job_id, "dry_run", "validated", score.score, score.recommendation,
+                       tuple(score.strengths), tuple(score.gaps), score.career_value,
+                       score.reasoning, tuple(score.hard_requirements_missing),
+                       tuple(score.needs_confirmation))
 
 
 _MAX_PROVIDER_RESPONSE = 1_000_000
@@ -341,24 +495,47 @@ def _has_description(job: dict[str, Any]) -> bool:
     return isinstance(description, str) and bool(description.strip())
 
 
-def _contains_score_marker(notes: Any, *, marker: str) -> bool:
+def _contains_score_marker(
+    notes: Any, *, marker: str, current_fingerprint: str | None = None
+) -> bool:
     if not isinstance(notes, list):
         return False
-    for note in notes:
+    if marker == CURRENT_MARKER:
+        for note in notes:
+            body = note.get("body") if isinstance(note, dict) else None
+            if isinstance(body, str) and LEGACY_MARKER in body:
+                return True
+    for note in reversed(notes):
         body = note.get("body") if isinstance(note, dict) else None
-        if isinstance(body, str) and (
-            marker in body or (marker == CURRENT_MARKER and LEGACY_MARKER in body)
-        ):
+        if not isinstance(body, str) or marker not in body:
+            continue
+        payload = parse_score_note([{"body": body}], marker=marker)
+        if payload is None or current_fingerprint is None:
             return True
+        recorded = payload.get("input_fingerprint")
+        if not isinstance(recorded, str):
+            return True
+        return recorded == current_fingerprint
     return False
 
 
+def serialize_score_note(
+    marker: str, score: ScoreResult | Mapping[str, Any], *, job: Mapping[str, Any] | None = None
+) -> str:
+    payload = score.model_dump(mode="json") if isinstance(score, ScoreResult) else dict(score)
+    if job is not None:
+        payload["fingerprint_version"] = FINGERPRINT_VERSION
+        payload["input_fingerprint"] = job_fingerprint(job)
+    canonical_json = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return f"{marker}\n{canonical_json}"
+
+
 def _serialize_note(
-    marker: str, score: ScoreResult, *, include_additive: bool = True
+    marker: str, score: ScoreResult, *, include_additive: bool = True,
+    job: Mapping[str, Any] | None = None,
 ) -> str:
     payload = score.model_dump(mode="json")
     if not include_additive:
         for key in ("fit_score", "coverage_score", "evidence", "exclusion_signals", "classification"):
             payload.pop(key, None)
-    canonical_json = json.dumps(payload, sort_keys=True, separators=(",", ":"))
-    return f"{marker}\n{canonical_json}"
+    return serialize_score_note(marker, payload, job=job)

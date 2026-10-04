@@ -560,6 +560,32 @@ def test_selected_summary_rejects_nested_values_and_redacts_strings_and_urls():
     assert selected["jobTrailLink"] == "https://trail.test/1"
 
 
+def test_v2_selected_removed_fields_normalize_to_none_and_are_delivered():
+    from jobtrail_ai_scorer.opportunity_cards import serialize_cards
+    from jobtrail_ai_scorer.opportunity_intelligence import (
+        PublicJobIdentity, OpportunityResult,
+    )
+    job = PublicJobIdentity('Acme', 'Engineer', 'Remote', 'https://source.test/1', 'indeed', '1')
+    cards = serialize_cards([(job, OpportunityResult('unverified', job.original_url))])
+    envelope = build_envelope(
+        run_id='run-1', occurred_at='2026-06-01T00:00:00+00:00', searched=1,
+        imported=1, scored=1,
+        selected={'evidence': [{'label': 'direct', 'text': 'CV match'}], 'strengths': ['Python']},
+        opportunities=cards,
+    )
+    assert envelope['selected'] is None
+    requests = []
+    adapter = N8nOutboundAdapter(
+        N8nConfig(enabled=True, endpoint='https://n8n.test/hook'),
+        transport=httpx.MockTransport(
+            lambda request: (requests.append(json.loads(request.content)) or httpx.Response(202))
+        ),
+    )
+    result = adapter.send(envelope)
+    assert result == DeliveryResult('accepted', 1, envelope['event_id'])
+    assert requests == [envelope]
+
+
 def test_v2_public_quotes_selected_compatibility_and_retry_identity():
     envelope = _v2_envelope()
     assert envelope['schema_version'] == 2
