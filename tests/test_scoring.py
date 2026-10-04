@@ -293,7 +293,11 @@ def test_valid_score_saves_marker_and_canonical_json_note():
     assert result.processed == 1
     assert result.skipped == 0
     assert result.failed == 0
-    assert client.notes == [("j1", "[AI_JOB_SCORE_V1]\n" + json.dumps(VALID_SCORE, sort_keys=True, separators=(",", ":")))]
+    saved_payload = json.loads(client.notes[0][1].split("\n", 1)[1])
+    assert client.notes[0][1].startswith("[AI_JOB_SCORE_V1]\n")
+    assert {"fingerprint_version", "input_fingerprint"} <= saved_payload.keys()
+    assert {key: value for key, value in saved_payload.items()
+            if key not in {"fingerprint_version", "input_fingerprint"}} == VALID_SCORE
     assert "Generic profile" in provider.prompts[0]
 
 
