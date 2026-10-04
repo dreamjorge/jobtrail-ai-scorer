@@ -363,6 +363,28 @@ def test_automation_config_parses_dry_run_truthy_env():
     assert AutomationConfig.from_env({"JOBTRAIL_AUTOMATION_DRY_RUN": "off"}).dry_run is False
 
 
+def test_dry_run_ranks_selected_and_redacts_full_opportunity(monkeypatch):
+    class Adapter:
+        name = "custom"
+        def search(self, request):
+            return [
+                NormalizedJob(source="custom", source_job_id="first", title="First", company="A", description="RESUME_SENTINEL", source_url="https://jobs.test/" + "x" * 500, location="Remote"),
+                NormalizedJob(source="custom", source_job_id="best", title="Best", company="B", description="PROMPT_SENTINEL", source_url="https://jobs.test/best", location="Remote"),
+            ]
+
+    scores = {"first": {"score": 81, "strengths": ["S" * 500], "reasoning": "PROMPT_SENTINEL"},
+              "best": {"score": 99, "strengths": ["safe"]}}
+    run = JobSearchAutomation(FakeJobTrail(), scorer=lambda job_id, path: scores[job_id],
+        source_adapters=(Adapter(),)).run(config=AutomationConfig(dry_run=True, locations=("remote",), notify_enabled=True))
+    assert run.selected["title"] == "Best"
+    assert run.selected == run.opportunities[-1]
+    assert run.notification_preview["title"] == run.selected["title"]
+    encoded = json.dumps({"selected": run.selected, "opportunities": run.opportunities})
+    assert "RESUME_SENTINEL" not in encoded and "PROMPT_SENTINEL" not in encoded
+    assert "reasoning" not in encoded and len(run.opportunities[0]["strengths"][0]) <= 200
+    assert len(run.opportunities[0]["jobUrl"]) <= 200
+
+
 def test_automation_dry_run_has_no_write_side_effects():
     class Adapter:
         name = "custom"

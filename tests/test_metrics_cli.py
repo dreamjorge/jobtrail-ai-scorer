@@ -39,6 +39,23 @@ def test_metrics_invalid_period_is_rejected():
     assert result.exception is not None
 
 
+def test_metrics_close_failure_after_backend_failure_still_emits_safe_json(monkeypatch, tmp_path):
+    class BrokenClient:
+        def __init__(self, url):
+            pass
+        def list_jobs(self):
+            raise RuntimeError("backend secret")
+        def close(self):
+            raise RuntimeError("cleanup secret")
+
+    monkeypatch.setattr(main, "JobTrailClient", BrokenClient)
+    result = runner.invoke(main.app, ["metrics", "--json", "--journal-path", str(tmp_path / "missing")])
+    assert result.exit_code == 0, result.stdout
+    payload = json.loads(result.stdout)
+    assert "scored_jobs" in payload["missing_data"]
+    assert "backend secret" not in result.stdout and "cleanup secret" not in result.stdout
+
+
 def test_metrics_backend_failure_still_emits_missing_data(monkeypatch, tmp_path):
     class BrokenClient:
         def __init__(self, url):

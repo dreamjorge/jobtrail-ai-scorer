@@ -8,17 +8,6 @@ Defaults are safe and bounded: `JOBTRAIL_BASE_URL=http://127.0.0.1:8000`, `JOB_S
 
 Set `WHATSAPP_NOTIFY_COMMAND=./notify-whatsapp-via-hermes.local.sh` (the helper accepts the summary on stdin), then set `WHATSAPP_NOTIFY_ENABLED=1` only when the configured Hermes notification helper is ready. At most one summary is sent per run, and only for the highest validated score at or above the threshold. The summary contains title, company, location, score, recommendation, recommendation label, strengths, gaps, the external job URL, the JobTrail link, and the run identifier, plus optional selected public `searchProfiles` names only when profile provenance exists. See [Daily WhatsApp summary fields](#daily-whatsapp-summary-fields) for the contract and the optional `WHATSAPP_SHORT_URL_BASE` shortener. This workflow writes `[AI_JOB_SCORE_V1]` notes and sends WhatsApp when enabled, but **never applies to jobs automatically**. It must not expose descriptions, profiles, prompts, notes, credentials, or secrets.
 
-### Full-automation dry-run
-
-Use `scripts/automated-job-search.example.py --dry-run`, or set
-`JOBTRAIL_AUTOMATION_DRY_RUN=1`, to exercise the full search-and-score pipeline without
-side effects. The CLI flag takes precedence over the environment setting. Output includes
-`planned_operations` (`searched`, `imported`, `scored`, and `notified`) and a deterministic,
-redacted `notification_preview`. In this mode searches and scorer previews run, but jobs are
-not imported, score notes are not saved, WhatsApp is not called, and the seen cache, circuit
-breaker, and run journal are not created or changed. This is distinct from the scorer-only
-`jobtrail-ai-scorer score --dry-run`, which does not perform the full automation search.
-
 Use these examples to run JobTrail AI Scorer from a local scheduler while keeping private runtime files out of the repository. Copy the example files, edit only local ignored copies, and dry-run first before allowing writes to JobTrail notes.
 
 > **Deprecation note.** The historical dry-run wrappers
@@ -176,6 +165,77 @@ This snapshot exposes FetchConfig/FetchResult, HTTPS URL/address guards and
 bounded DNS resolution only. No fetch or transport API is wired to automation.
 Every numeric address must be public; DNS workers are capped at two and do not
 block process exit. Running libc lookups cannot be cancelled.
+
+PinnedHTTPSConnection now opens numeric TCP destinations with original-host
+TLS certificate/SNI verification and deadline-aware, byte-charged HTTP reads.
+The complete redirect/fetch orchestration is not yet available.
+The following timeout and wire-reader contracts describe the implemented
+transport; fetch orchestration will apply these per-run limits in slice 07.
+
+The following full-fetch contracts are documented ahead of slice 07; redirect
+orchestration and result behavior are not available in this snapshot.
+
+All initial and redirect URLs must use HTTPS/443 without userinfo or known
+credential query keys (the same narrow key policy as public search). Local
+hostnames and non-global, private, metadata, reserved, multicast, link-local,
+loopback and unspecified literal/DNS addresses, including IPv4-mapped IPv6,
+are blocked. Every DNS answer must pass; mixed public/private answers fail
+closed. The production connection opens a socket directly to **one validated
+numeric IP**, without another DNS lookup, and verifies TLS using the original
+hostname for SNI and certificate identity. Certificate checking is enabled via
+`ssl.create_default_context()`. No proxies, ambient authentication, cookies,
+browser execution, retries, caching or pagination are used. Every redirect
+(including relative locations) is revalidated, resolved and pinned separately;
+loops fail closed and at most two redirect hops are followed.
+
+Defaults and maxima are connect/DNS 3 seconds, read 5 seconds and a shared
+90-second monotonic deadline starting at object construction. Timeout settings
+must be finite and positive and may only be reduced. Remaining time bounds each
+operation; production TLS receives also enforce the deadline during trickled
+headers/chunk framing. Injected resolver and connection implementations are
+trusted test seams and must honor their timeout and byte-budget contracts.
+Connections must implement `set_byte_budget(budget)`: before each underlying
+HTTP read, limit its size with `budget.allowance(size)` and immediately charge
+all received bytes with `budget.received(size)`, before deadline checks or
+parsing. Fake connections must model header/framing reads as well as bodies. Injected monotonic
+and UTC datetime clocks make deadlines and retrieval timestamps deterministic.
+Use this object sequentially, not concurrently.
+
+The default resolver has **two process-wide outstanding daemon DNS workers**.
+Lookup timeout returns without waiting for shutdown; exhausted worker slots
+return `failed` / `dns_busy`. Python cannot cancel a running libc DNS lookup:
+a timed-out lookup keeps its slot until it finishes. No executor or unlimited
+per-URL thread creation is used, and stalled workers cannot block process exit.
+
+Budgets are shared across calls: twelve connection attempts (including failed
+connects and redirects), 512 KiB per response and 3 MiB aggregate **HTTP wire
+bytes**: status lines, headers, chunk framing/trailers and bodies, including
+prefetched or discarded bytes on errors, redirects and post-read deadlines.
+These are decrypted HTTP bytes returned by TLS receives, not TCP/TLS record or
+handshake overhead. The allowance is applied before every raw receive below
+HTTP buffering; received bytes are charged immediately and exactly once, never
+again when decoded body bytes are returned. This conservatively stronger cap
+also bounds header/framing overhead and retains the 512 KiB decoded-body cap.
+Bodies stream in at most 8 KiB parser reads and are bounded before decoding.
+At an exhausted wire allowance, any further raw read fails with
+`budget_exhausted`, without an extra byte read. Already-buffered complete
+framing can establish completion at the exact wire cap; otherwise exhaustion
+fails closed. A decoded body exactly at its cap still fails closed. Requests specify
+`Accept-Encoding: identity`; any unexpected compression returns `unsupported`
+with `unsupported_encoding`, without decompression. Supported MIME types are
+`text/html`, `text/plain` and `application/json`, with UTF-8 only; unsupported
+MIME/charset or invalid UTF-8 fail safely.
+
+`FetchResult` contains `status`, safe success `url`, UTC `checked_at`, and on
+success `content_type` and `text`. Statuses distinguish `ok`, `blocked`,
+`timed_out`, `failed`, `unsupported`, and `budget_exhausted`; failures contain
+only generic `error` codes and no URL, body or raw exception. No fetch logging
+is performed. The credential-key check is intentionally narrow and cannot
+prove arbitrary caller-supplied URLs contain no secrets; callers own that
+public-input boundary. Hermetic tests inject DNS/connections and fake numeric
+sockets/TLS to prove address pinning and original-host verification; no live
+DNS, destination requests or Brave requests were performed.
+
 ## Optional Adzuna source
 
 `AdzunaSourceAdapter` is an optional source the automation launcher can
@@ -753,10 +813,7 @@ Telegram callbacks, public HTTPS ingress, authenticated write-back, Google Sheet
 
 ## Safety rules
 
-- **Dry-run first:** `SCORER_DRY_RUN=1` applies to the scorer-only runner; use
-  `JOBTRAIL_AUTOMATION_DRY_RUN=1` or the launcher `--dry-run` for the full automation
-  search/import/score/notify plan. Keep the applicable dry-run setting enabled until the
-  config, JobTrail connection, provider, and logs look correct.
+- **Dry-run first:** keep `SCORER_DRY_RUN=1` until the config, JobTrail connection, provider, and logs look correct.
 - Local config stays ignored. Do not commit `config.yaml`, candidate profiles, logs, secrets, tokens, or copied runtime scripts containing machine-specific paths.
 - Store logs outside the repository, for example under `/tmp/jobtrail-ai-scorer-logs` or another local operator-owned directory.
 - For JobTrail maintenance commands, use both JobTrail compose files together: `compose.hub.yml` and `compose.override.yml`. Keep maintenance commands explicit so the override services, ports, and mounts are included.
@@ -1070,7 +1127,3 @@ board slug, profile name, HTML-stripped content, remote heuristic, and UTC
 retrieval timestamp. `4xx` responses are terminal; `5xx` and transport errors
 use bounded retries. A failed Greenhouse search is recorded without blocking
 JobSpy or Lever adapters.
-
-### Funnel metrics
-
-Use `jobtrail-ai-scorer metrics --period today|7d|30d --json` for a bounded privacy-safe view. `today` means the current UTC day; `7d` and `30d` are rolling half-open windows. Set `JOBTRAIL_RUN_JOURNAL_PATH` (or pass `--journal-path`) to enable journaling; it is disabled by default. Missing backend, journal, score, or application-status data is reported in `missing_data`; application status is limited to fields exposed by JobTrail.
