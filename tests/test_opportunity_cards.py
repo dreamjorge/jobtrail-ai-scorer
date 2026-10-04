@@ -1,0 +1,340 @@
+import json
+
+import pytest
+
+from jobtrail_ai_scorer.automation import AutomationConfig, AutomationRun, JobSearchAutomation, SimulationScenario
+from jobtrail_ai_scorer.opportunity_intelligence import PublicJobIdentity, OpportunityResult
+
+
+@pytest.mark.parametrize('raw, expected', [
+    (' 1 ', True), ('TRUE', True), (' yes ', True), ('On', True),
+    ('0', False), ('False', False), (' no ', False), ('OFF', False),
+])
+def test_intelligence_config_strict_boolean_tokens(raw, expected):
+    assert AutomationConfig.from_env({'OPPORTUNITY_INTELLIGENCE_ENABLED': raw}).opportunity_intelligence_enabled is expected
+
+
+def test_intelligence_config_rejects_unknown_boolean_token():
+    with pytest.raises(ValueError):
+        AutomationConfig.from_env({'OPPORTUNITY_INTELLIGENCE_ENABLED': 'maybe'})
+
+
+def test_config_is_opt_in_and_positional_result_compatible():
+    assert not AutomationConfig.from_env({}).opportunity_intelligence_enabled
+    assert AutomationConfig.from_env({'OPPORTUNITY_INTELLIGENCE_ENABLED': 'true'}).opportunity_intelligence_enabled
+    assert AutomationRun(1, 2, 3, (), {'title': 'old'}).intelligence == ()
+
+
+def test_serialize_cards_preserves_validated_url_fragments():
+    from jobtrail_ai_scorer.opportunity_cards import serialize_cards
+    job_url = 'https://source.test/jobs#role-123'
+    official_url = 'https://acme.test/careers#engineering'
+    job = PublicJobIdentity('Acme', 'Engineer', 'Remote', job_url, 'indeed', '1')
+    result = OpportunityResult('verified', job_url, official_url=official_url,
+                              checked_at='2026-06-01T00:00:00+00:00')
+
+    card = serialize_cards([(job, result)])[0]
+
+    assert card['original_url'] == job_url
+    assert card['official_url'] == official_url
+
+
+def test_public_cards_bound_and_separate_links():
+    from jobtrail_ai_scorer.opportunity_cards import serialize_cards, render_cards
+    job = PublicJobIdentity('Acme', 'Engineer', 'Remote', 'https://source.test/1', 'indeed', '1')
+    result = OpportunityResult('unverified', job.original_url, official_url='https://acme.test/1', candidate_url='https://acme.test/1')
+    cards = serialize_cards([(job, result)] * 5)
+    assert len(cards) == 3
+    assert 'official_url' not in cards[0]
+    assert cards[0]['original_url'] == job.original_url
+    assert 'Candidate (unverified)' in render_cards(cards)
+
+
+def test_serialize_cards_rejects_mismatched_source_url():
+    """A result whose source_url differs from its job's original_url is a misbehaving caller."""
+    from jobtrail_ai_scorer.opportunity_cards import serialize_cards
+    job = PublicJobIdentity('Acme', 'Engineer', 'Remote', 'https://source.test/1', 'indeed', '1')
+    result = OpportunityResult('verified', 'https://other.example/jobs/99')
+    with pytest.raises(ValueError, match='source_url'):
+        serialize_cards([(job, result)])
+
+
+@pytest.mark.parametrize('url', ['https://a.test/?token=secret', 'https://user:pass@a.test/', 'http://a.test/'])
+def test_cards_reject_unsafe_proof(url):
+    from jobtrail_ai_scorer.opportunity_cards import serialize_cards
+    job = PublicJobIdentity('Acme', 'Engineer', 'Remote', 'https://source.test/1', 'indeed', '1')
+    card = serialize_cards([(job, OpportunityResult('verified', job.original_url, official_url=url))])[0]
+    assert card['status'] != 'verified'
+    assert 'official_url' not in card
+
+
+def test_enabled_run_projects_public_fields_and_survives_failure(monkeypatch):
+    import jobtrail_ai_scorer.automation as automation
+    monkeypatch.setattr(automation.os, 'environ', {})
+    class Gateway:
+        def search(self, payload):
+            return [{'site': 'indeed', 'id': '1', 'title': 'Engineer', 'company': 'Acme', 'location': 'Remote', 'job_url': 'https://source.test/1'}]
+        def import_job(self, payload):
+            self.job = dict(payload, id='1', profile={'cv': 'PRIVATE_SENTINEL'}, reasoning='PRIVATE_SENTINEL')
+            return {'id': '1'}
+        def get_job(self, job_id):
+            return self.job
+    gateway = Gateway()
+    def score(*args):
+        gateway.job['notes'] = [{'body': '[AI_JOB_SCORE_V1]\n' + json.dumps({'score': 91, 'recommendation': 'APPLY', 'strengths': [], 'gaps': []})}]
+    calls = []
+    class Resolver:
+        def resolve(self, job, context=None, **kwargs):
+            calls.append(job)
+            assert type(job) is PublicJobIdentity
+            assert 'PRIVATE_SENTINEL' not in repr(job)
+            raise ValueError('SECRET_DIAGNOSTIC')
+    messages = []
+    result = JobSearchAutomation(gateway, scorer=score, notifier=messages.append, intelligence_resolver=Resolver()).run(config=AutomationConfig(scorer_config_path='synthetic', locations=('Remote',), notify_enabled=True, opportunity_intelligence_enabled=True))
+    assert len(calls) == 1
+    assert result.selected and not result.failures
+    assert result.intelligence[0].status == 'unavailable'
+    assert 'Public information' in messages[0]
+    assert 'SECRET_DIAGNOSTIC' not in messages[0]
+
+
+@pytest.mark.parametrize('card', [
+    {'company': 'Acme', 'title': 'Engineer', 'status': 'unverified'},
+    {'company': 'Acme', 'title': 'Engineer', 'status': 'verified', 'original_url': 'https://source.test/1'},
+])
+def test_renderer_requires_original_and_consistent_verified_output(card):
+    from jobtrail_ai_scorer.opportunity_cards import render_cards
+    with pytest.raises(ValueError):
+        render_cards([card])
+
+
+@pytest.mark.parametrize('status', ['unverified', 'stale', 'closed', 'fetch_failed', 'unavailable'])
+def test_renderer_never_promotes_failure(status):
+    from jobtrail_ai_scorer.opportunity_cards import serialize_cards, render_cards
+    job = PublicJobIdentity('Acme', 'Engineer', 'Remote', 'https://source.test/1', 'indeed', '1')
+    cards = serialize_cards([(job, OpportunityResult(status, job.original_url,
+        official_url='https://acme.test/1', candidate_url='https://acme.test/1'))])
+    assert 'Official (verified)' not in render_cards(cards)
+    assert cards[0]['original_url'] == job.original_url
+
+
+def test_selected_match_failure_notification_does_not_append_opportunity_cards(monkeypatch):
+    import jobtrail_ai_scorer.automation as automation
+    monkeypatch.setattr(automation.os, 'environ', {})
+
+    class Gateway:
+        def __init__(self):
+            self.job = {}
+        def search(self, payload):
+            return [
+                {'site': 'indeed', 'id': '1', 'title': 'Engineer', 'company': 'Acme',
+                 'location': 'Remote', 'job_url': 'https://source.test/1'},
+                {'site': 'indeed', 'id': '2', 'title': 'Engineer 2', 'company': 'Acme',
+                 'location': 'Remote', 'job_url': 'https://source.test/2'},
+            ]
+        def import_job(self, payload):
+            job_id = payload['sourceJobId']
+            self.job[job_id] = dict(payload, id=job_id, notes=[])
+            return {'id': job_id}
+        def get_job(self, job_id):
+            return self.job[job_id]
+
+    class Resolver:
+        def resolve(self, job, *args, **kwargs):
+            return OpportunityResult('unverified', job.original_url)
+
+    gateway = Gateway()
+    def fail_score(job_id, *args):
+        if job_id == '2':
+            raise RuntimeError('scoring failed')
+        gateway.job[job_id]['notes'] = [{'body': '[AI_JOB_SCORE_V1]\n' + json.dumps({'score': 91})}]
+    messages = []
+    result = JobSearchAutomation(gateway, scorer=fail_score, notifier=messages.append,
+        intelligence_resolver=Resolver()).run(config=AutomationConfig(
+            scorer_config_path='synthetic', locations=('Remote',), notify_enabled=False,
+            notify_on_failure=True, opportunity_intelligence_enabled=True))
+
+    assert result.selected is not None
+    assert len(messages) == 1
+    assert json.loads(messages[0])['kind'] == 'failure_summary'
+    assert 'Public information' not in messages[0]
+
+
+def test_employer_context_selection_uses_collapsed_casefold_normalization(monkeypatch):
+    import jobtrail_ai_scorer.automation as automation
+    monkeypatch.setattr(automation.os, 'environ', {})
+    from jobtrail_ai_scorer.opportunity_intelligence import TrustedEmployerContext, Citation
+
+    class Gateway:
+        def __init__(self): self.job = None
+        def search(self, payload):
+            return [{'site': 'indeed', 'id': '1', 'title': 'Engineer', 'company': 'Acme Corp',
+                     'location': 'Remote', 'job_url': 'https://source.test/1'}]
+        def import_job(self, payload):
+            self.job = dict(payload, id='1', notes=[])
+            return {'id': '1'}
+        def get_job(self, job_id): return self.job
+
+    context = TrustedEmployerContext('  Acme   Corp ', ('acme.example',), 'https://acme.example/careers',
+        Citation('https://acme.example/careers', 'Operator assertion',
+                 '2026-06-01T00:00:00+00:00', 'user_confirmed'))
+    class Resolver:
+        def resolve(self, job, selected_context=None, **kwargs):
+            assert selected_context is context
+            return OpportunityResult('unverified', job.original_url)
+    gateway = Gateway()
+    def score(*args):
+        gateway.job['notes'] = [{'body': '[AI_JOB_SCORE_V1]\n' + json.dumps({'score': 91})}]
+    result = JobSearchAutomation(gateway, scorer=score, notifier=lambda _: None,
+        intelligence_resolver=Resolver(), employer_contexts=(context,)).run(config=AutomationConfig(
+            scorer_config_path='synthetic', locations=('Remote',), opportunity_intelligence_enabled=True))
+    assert result.intelligence[0].status == 'unverified'
+
+
+def test_context_closed_schema_and_bounds():
+    from jobtrail_ai_scorer.opportunity_intelligence import parse_employer_contexts
+    context = {'company': 'Acme', 'hosts': ['acme.example'], 'careers_url': 'https://acme.example/careers',
+               'provenance': {'url': 'https://acme.example/careers', 'excerpt': 'Operator assertion',
+                              'checked_at': '2026-06-01T00:00:00+00:00', 'kind': 'user_confirmed'}}
+    assert parse_employer_contexts(json.dumps([context]))[0].company == 'Acme'
+    for payload in [[context] * 11, [dict(context, profile='RESUME_SENTINEL')], [context, context],
+                    [dict(context, hosts=['jobs.lever.co'])]]:
+        with pytest.raises(ValueError, match='^invalid employer contexts$'):
+            parse_employer_contexts(json.dumps(payload))
+
+
+@pytest.mark.parametrize('enabled', [False, True])
+def test_no_match_message_exact_and_resolver_not_called(monkeypatch, enabled):
+    import jobtrail_ai_scorer.automation as automation
+    monkeypatch.setattr(automation.os, 'environ', {})
+    class Gateway:
+        def search(self, payload):
+            return []
+    class Resolver:
+        def resolve(self, *args, **kwargs):
+            pytest.fail('empty run resolved')
+    messages = []
+    def factory():
+        pytest.fail('empty run constructed intelligence')
+    result = JobSearchAutomation(Gateway(), notifier=messages.append, intelligence_resolver_factory=factory).run(
+        config=AutomationConfig(scorer_config_path='synthetic', locations=('Remote',),
+                                notify_enabled=True, opportunity_intelligence_enabled=enabled))
+    assert result.intelligence == ()
+    assert messages == ['JobTrail — sin coincidencias\nBuscadas: 0\nPuntuadas: 0\nUmbral: 80\nNo hubo ofertas que calificaran.']
+
+
+def test_cards_omit_forbidden_claims_and_nested_payloads():
+    from jobtrail_ai_scorer.opportunity_cards import serialize_cards, render_cards
+    from jobtrail_ai_scorer.opportunity_intelligence import Citation, CompanyBrief, CompanyClaim
+    job = PublicJobIdentity('Acme', 'Engineer', 'Remote', 'https://source.test/1', 'indeed', '1')
+    proof = Citation('https://acme.test/', 'PROFILE_SENTINEL', '2026-06-01T00:00:00+00:00', 'company_reported')
+    cards = serialize_cards([(job, OpportunityResult('unverified', job.original_url,
+        citations=(proof,), company_brief=CompanyBrief('available', (
+            CompanyClaim('sector', 'RESUME_SENTINEL', proof),))))])
+    assert cards[0]['citations'] == cards[0]['claims'] == []
+    assert 'SENTINEL' not in render_cards(cards)
+    cards[0]['claims'] = [{'value': {'profile': {'cv': 'RESUME_SENTINEL'}}}]
+    with pytest.raises(ValueError):
+        render_cards(cards)
+
+
+_CREDENTIAL_TEXT_URLS = [
+    'https://user:pass@public.example/?token=synthetic-secret',
+    'https://public.example/?ToKeN=synthetic-secret',
+    'https://public.example/?%61pi_key=synthetic-secret',
+    'HTTPS://public.example/?%2541CCESS_TOKEN=synthetic-secret',
+    'https%3A%2F%2Fuser%3Apass%40public.example%2F',
+] + [f'https://public.example/?{key}=synthetic-secret' for key in (
+    'apikey', 'password', 'client_secret', 'secret', 'app_id', 'app_key',
+)]
+
+
+@pytest.mark.parametrize('url', _CREDENTIAL_TEXT_URLS)
+@pytest.mark.parametrize('field', ['claim', 'excerpt'])
+def test_cards_omit_inline_credentials_without_rewriting_quotes(url, field):
+    from jobtrail_ai_scorer.opportunity_cards import serialize_cards, render_cards
+    from jobtrail_ai_scorer.opportunity_intelligence import Citation, CompanyBrief, CompanyClaim
+    job = PublicJobIdentity('Acme', 'Engineer', 'Remote', 'https://source.test/1', 'indeed', '1')
+    unsafe = f'Company information at {url} is available.'
+    proof = Citation('https://public.example/about', unsafe if field == 'excerpt' else 'Software company',
+                     '2026-06-01T00:00:00+00:00', 'company_reported')
+    claim = CompanyClaim('sector', unsafe if field == 'claim' else 'Software', proof)
+    cards = serialize_cards([(job, OpportunityResult('unverified', job.original_url,
+        citations=(proof,), company_brief=CompanyBrief('available', (claim,))))])
+    assert cards[0]['claims'] == []
+    assert cards[0]['citations'] == ([] if field == 'excerpt' else [{
+        'url': proof.url, 'excerpt': proof.excerpt, 'retrieved_at': proof.checked_at}])
+    assert url not in json.dumps(cards)
+    assert url not in render_cards(cards)
+    assert 'synthetic-secret' not in render_cards(cards)
+
+
+@pytest.mark.parametrize('field', ['company', 'title', 'location'])
+@pytest.mark.parametrize('url', _CREDENTIAL_TEXT_URLS)
+def test_identity_text_rejects_embedded_credentials(field, url):
+    from dataclasses import replace
+    job = PublicJobIdentity('Acme', 'Engineer', 'Remote', 'https://source.test/1', 'indeed', '1')
+    with pytest.raises(ValueError, match='invalid public search field'):
+        replace(job, **{field: f'Public text {url}'})
+
+
+@pytest.mark.parametrize('field', ['company', 'title', 'claim', 'excerpt'])
+@pytest.mark.parametrize('url', _CREDENTIAL_TEXT_URLS)
+def test_renderer_revalidates_embedded_credentials(field, url):
+    from jobtrail_ai_scorer.opportunity_cards import render_cards
+    proof = {'url': 'https://public.example/about', 'excerpt': 'Software company',
+             'retrieved_at': '2026-06-01T00:00:00+00:00'}
+    claim = {'field': 'sector', 'value': 'Software', 'attribution': 'company_reported',
+             'citation': proof}
+    card = {'company': 'Acme', 'title': 'Engineer', 'status': 'unverified',
+            'original_url': 'https://source.test/1', 'claims': [claim], 'citations': [proof]}
+    unsafe = f'Company information at {url} is available.'
+    if field in ('company', 'title'):
+        card[field] = unsafe
+    elif field == 'claim':
+        claim['value'] = unsafe
+    else:
+        proof['excerpt'] = unsafe
+    with pytest.raises(ValueError, match='invalid public card text'):
+        render_cards([card])
+
+
+@pytest.mark.parametrize('url', _CREDENTIAL_TEXT_URLS)
+def test_status_text_cannot_disclose_credentials(url):
+    from jobtrail_ai_scorer.opportunity_cards import serialize_cards, render_cards
+    job = PublicJobIdentity('Acme', 'Engineer', 'Remote', 'https://source.test/1', 'indeed', '1')
+    cards = serialize_cards([(job, OpportunityResult(f'Public status {url}', job.original_url))])
+    assert cards[0]['status'] == 'unavailable'
+    assert url not in json.dumps(cards)
+    assert url not in render_cards(cards)
+    cards[0]['status'] = f'Public status {url}'
+    with pytest.raises(ValueError, match='invalid status'):
+        render_cards(cards)
+
+
+def test_cards_preserve_supported_quotes_with_safe_inline_public_urls():
+    from jobtrail_ai_scorer.opportunity_cards import serialize_cards, render_cards
+    from jobtrail_ai_scorer.opportunity_intelligence import Citation, CompanyBrief, CompanyClaim
+    job = PublicJobIdentity('Acme', 'Engineer', 'Remote', 'https://source.test/1', 'indeed', '1')
+    excerpt = 'Software company (https://public.example/about?lang=en).'
+    proof = Citation('https://public.example/about', excerpt,
+                     '2026-06-01T00:00:00+00:00', 'company_reported')
+    value = 'Software: https://public.example/sector?lang=en'
+    cards = serialize_cards([(job, OpportunityResult('unverified', job.original_url,
+        citations=(proof,), company_brief=CompanyBrief('available', (
+            CompanyClaim('sector', value, proof),))))])
+    assert cards[0]['citations'][0]['excerpt'] == excerpt
+    assert cards[0]['claims'][0]['citation']['excerpt'] == excerpt
+    assert cards[0]['claims'][0]['value'] == value
+    assert excerpt in render_cards(cards)
+    assert value in render_cards(cards)
+
+
+def test_simulation_never_resolves():
+    class Resolver:
+        def resolve(self, *args, **kwargs):
+            pytest.fail('simulation resolved')
+    def factory():
+        pytest.fail('simulation constructed intelligence')
+    result = JobSearchAutomation(None, simulation=SimulationScenario('offline'), intelligence_resolver=Resolver(), intelligence_resolver_factory=factory).run(config=AutomationConfig(opportunity_intelligence_enabled=True))
+    assert result.intelligence == ()

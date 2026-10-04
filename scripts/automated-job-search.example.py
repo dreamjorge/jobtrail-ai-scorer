@@ -210,6 +210,29 @@ def _record_local_then_deliver(
     record_delivery(journal_path, run_id=run_id, event_id=envelope["event_id"], result=delivery)
 
 
+def _build_intelligence(env, *, dry_run=False):
+    """Defer the per-run bounded stack and credentials until enrichment starts."""
+    enabled = _parse_truthy(env.get("OPPORTUNITY_INTELLIGENCE_ENABLED", "false"))
+    if enabled is None:
+        raise ValueError("OPPORTUNITY_INTELLIGENCE_ENABLED must be 0/1/true/false/yes/no/on/off")
+    if dry_run or not enabled:
+        return {}
+    from jobtrail_ai_scorer.opportunity_intelligence import OpportunityIntelligence, parse_employer_contexts
+    from jobtrail_ai_scorer.public_search import BravePublicSearchAdapter, PublicSearchConfig
+    from jobtrail_ai_scorer.public_http import PublicFetcher
+    try:
+        raw = env.get("OPPORTUNITY_EMPLOYER_CONTEXTS_JSON")
+        contexts = parse_employer_contexts(raw) if raw is not None else ()
+        def resolver_factory():
+            search_config = PublicSearchConfig.from_env(env)
+            return OpportunityIntelligence(
+                BravePublicSearchAdapter(search_config), PublicFetcher())
+        return {"intelligence_resolver_factory": resolver_factory,
+                "employer_contexts": contexts}
+    except Exception:
+        return {"intelligence_status": "invalid_configuration"}
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", help="override SCORER_CONFIG_PATH")
@@ -326,7 +349,8 @@ def main() -> int:
     try:
         started_at = datetime.now(timezone.utc)
         result = JobSearchAutomation(
-            gateway, seen_cache=seen_cache, ats_boards=config.ats_boards
+            gateway, seen_cache=seen_cache, ats_boards=config.ats_boards,
+            **_build_intelligence(os.environ),
         ).run(config=config)
         finished_at = datetime.now(timezone.utc)
     finally:

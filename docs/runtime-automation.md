@@ -18,6 +18,58 @@ Use these examples to run JobTrail AI Scorer from a local scheduler while keepin
 > [`scripts/legacy/README.md`](scripts/legacy/README.md) for the replacement
 > mapping and target removal date.
 
+## Optional public opportunity intelligence
+
+The canonical launcher enables public enrichment only with
+`OPPORTUNITY_INTELLIGENCE_ENABLED=true`; it is off by default. Disabled and
+`--automation-dry-run` paths do not construct the public search/fetch/resolver
+stack or read `BRAVE_SEARCH_API_KEY`. Enabled real runs lazily construct one
+stack after collection/scoring, only when there are shortlisted opportunities.
+The factory reads search credentials at that point. Its fetcher's 90-second
+monotonic deadline starts then and is shared across all three opportunities;
+it is never reset per opportunity or reused across runs. Direct resolver
+injection remains supported (the caller owns that resolver's lifetime).
+Enabled real runs use this single stack and
+resolve at most three eligible shortlisted matches before composing WhatsApp.
+Search/import/scoring, local journal authority, and selected compatibility remain.
+The canonical launcher now wires public-card delivery through completion schema v2;
+disabled enrichment retains the existing n8n v1 contract exactly. v1-only consumers
+must support or upgrade to v2 before enabling card delivery. There is no additional scheduler.
+
+Configure `BRAVE_SEARCH_API_KEY` only in operator-controlled runtime settings.
+Missing credentials yield `provider unconfigured` without public HTTP calls.
+Enrichment errors never suppress a match notification: enabled notifications
+append bounded public cards or a concise unavailable status. Default-off and
+no-match notifications retain their existing text. Cards retain the original
+source link, label uncertain candidates explicitly unverified, and expose an
+additional official link only when T4 verifies the listing. Claims are
+extractive, attributed **company reported**, and include retrieval timestamps;
+search snippets are not evidence. Cards never include score reasoning,
+descriptions, CVs or profiles.
+
+Optional `OPPORTUNITY_EMPLOYER_CONTEXTS_JSON` is a JSON array of at most ten
+operator-asserted public employer anchors (at most 16 KiB UTF-8). Each entry has
+exactly `company`, `hosts` (one to five exact hostnames), `careers_url`, and
+`provenance`. Provenance has exactly `url`, `excerpt`, `checked_at` (timezone-aware
+ISO datetime), and `kind` (`user_confirmed` or `public_citation`). Example with
+synthetic public identifiers:
+
+```json
+[{"company":"Acme","hosts":["acme.example"],"careers_url":"https://acme.example/careers","provenance":{"url":"https://acme.example/careers","excerpt":"Operator confirmed employer careers page","checked_at":"2026-06-01T00:00:00+00:00","kind":"user_confirmed"}}]
+```
+
+These anchors are assertions of domain trust by the operator, **never generated
+from Brave results**. Unknown keys, duplicate employers, unsafe URLs, invalid
+provenance and oversized configuration fail safely with generic
+`invalid configuration` status; configuration values are not printed in
+errors. Absent anchors leave discovered candidates unverified. Generic ATS
+provider hosts cannot be employer anchors. Public proof URLs reject embedded
+credentials and secret query parameters. Existing search/fetch per-run budgets
+remain enforced by their adapters, and fetch failures do not prove closure.
+No live/provider validation or deployment is implied. Independent local
+verification passed; live API setup, production activation and consumer
+migration remain separate operator decisions.
+
 ## Backend URL resolution
 
 The systemd service must reach the JobTrail backend. Instead of baking a private
@@ -94,6 +146,205 @@ Example:
 The JSON is configuration only: it must not contain secrets, credentials, private filesystem paths, CV/profile text, provider prompts, or new source-provider definitions. `sites` only selects among the source providers already supported by the automation boundary. If `JOB_SEARCH_PROFILES` is unset, the launcher preserves the legacy single-profile behavior using `JOB_SEARCH_SITES`, `JOB_SEARCH_TERMS`, and `JOB_SEARCH_LOCATIONS`.
 
 The final launcher output includes `profile_counts` with `searched`, `imported`, `duplicates`, and `failures` per profile when profiles are configured; it is `{}` for the legacy fallback.
+
+## Public opportunity search
+
+`jobtrail_ai_scorer.public_search.BravePublicSearchAdapter` provides opt-in
+Brave discovery through the canonical launcher; see
+[Optional public opportunity intelligence](#optional-public-opportunity-intelligence).
+Disabled and offline simulation runs do not construct the public stack or read
+its credentials. No result destination is fetched by this adapter; the resolver
+uses the separate public-fetch boundary.
+
+`PublicSearchConfig` defaults to `enabled=False`, no API key and a five-second
+HTTP timeout (finite, positive, at most 30 seconds). `from_env` accepts an
+explicitly supplied environment mapping, rather than reading ambient variables:
+
+| Variable | Default | Contract |
+| --- | --- | --- |
+| `OPPORTUNITY_INTELLIGENCE_ENABLED` | `false` | `1/true/yes/on` enables; `0/false/no/off` disables. Other values are rejected. |
+| `BRAVE_SEARCH_API_KEY` | absent | Secret configuration only, excluded from config repr. Missing/blank when enabled yields `provider_unconfigured`, with zero HTTP attempts. |
+
+Fake placeholders only (do not commit real keys):
+
+```text
+OPPORTUNITY_INTELLIGENCE_ENABLED=1
+BRAVE_SEARCH_API_KEY=fake-placeholder-not-a-real-key
+```
+
+Callers must construct `PublicSearchRequest(company, title, location)` from
+approved public identifiers only, never raw job/profile/description/notes
+mappings. Fields are required nonblank strings, bounded to 160/200/120 characters;
+existing forbidden markers, controls and query-injection punctuation are
+rejected. The deterministic query quotes each field and appends `jobs` (at most
+493 characters). This defense does not prove that arbitrary caller-supplied text
+is public: callers still own the public-field boundary.
+
+Each **new adapter per run** has a shared budget of three attempts and ten
+unique candidate URLs. Each query makes one GET to the fixed
+`https://api.search.brave.com/res/v1/web/search` endpoint with
+`X-Subscription-Token`, requesting five results. There are no retries,
+pagination, dynamic endpoints or caching. Only the first five result members
+are inspected. Disabled and `dry_run=True` calls make zero HTTP attempts.
+Clients disable ambient proxy configuration and redirects; a fresh client per
+query prevents response cookies being reused. Response bodies are limited to
+256 KiB before JSON parsing; compressed responses are rejected.
+
+Statuses distinguish `found`, successful empty `not_found`, discarded or
+duplicate-only `untrusted`, `provider_error` (terminal 4xx), `quota_exceeded`
+(429), `timeout`, `unavailable` (transport/5xx), `bad_response`,
+`oversized_response`, `budget_exhausted`, and the three no-network gates
+`disabled`, `dry_run`, `provider_unconfigured`. Failures return labels only,
+never raw provider errors/bodies or keys. Malformed results are discarded.
+
+Returned title/description snippets are **unverified leads** (`verified=False`)
+with a source URL, not cited company claims or ownership/job-identity evidence.
+HTTPS URL filtering rejects credentials, obvious local/private literal hosts,
+nonstandard ports and unknown/malformed URL forms. It does not resolve DNS,
+prove public destination addresses, or protect a later fetch against rebinding;
+those checks belong to the separate public-fetching slice before any destination
+is contacted. Mocked tests exercise synthetic requests and bodies only; no live
+provider validation has been performed.
+
+## Public HTTPS retrieval
+
+`jobtrail_ai_scorer.public_http.PublicFetcher` is the synchronous fetching
+boundary used by opt-in enrichment. The canonical launcher creates one object
+per run when enrichment starts, after scoring, and shares its budgets across
+all opportunities. Direct callers must likewise create one object per run
+and call `fetch(public_url)` only for caller-approved public URLs. Neither this
+boundary nor a successful response establishes ownership, vacancy identity,
+active hiring, or company claims. Returned HTML/JSON/plain text is untrusted
+UTF-8 data: never execute page instructions, scripts or automatic applications.
+
+All initial and redirect URLs must use HTTPS/443 without userinfo or known
+credential query keys (the same narrow key policy as public search). Local
+hostnames and non-global, private, metadata, reserved, multicast, link-local,
+loopback and unspecified literal/DNS addresses, including IPv4-mapped IPv6,
+are blocked. Every DNS answer must pass; mixed public/private answers fail
+closed. The production connection opens a socket directly to **one validated
+numeric IP**, without another DNS lookup, and verifies TLS using the original
+hostname for SNI and certificate identity. Certificate checking is enabled via
+`ssl.create_default_context()`. No proxies, ambient authentication, cookies,
+browser execution, retries, caching or pagination are used. Every redirect
+(including relative locations) is revalidated, resolved and pinned separately;
+loops fail closed and at most two redirect hops are followed.
+
+Defaults and maxima are connect/DNS 3 seconds, read 5 seconds and a shared
+90-second monotonic deadline starting at object construction. Timeout settings
+must be finite and positive and may only be reduced. Remaining time bounds each
+operation; production TLS receives also enforce the deadline during trickled
+headers/chunk framing. Injected resolver and connection implementations are
+trusted test seams and must honor their timeout and byte-budget contracts.
+Connections must implement `set_byte_budget(budget)`: before each underlying
+HTTP read, limit its size with `budget.allowance(size)` and immediately charge
+all received bytes with `budget.received(size)`, before deadline checks or
+parsing. Fake connections must model header/framing reads as well as bodies. Injected monotonic
+and UTC datetime clocks make deadlines and retrieval timestamps deterministic.
+Use this object sequentially, not concurrently.
+
+The default resolver has **two process-wide outstanding daemon DNS workers**.
+Lookup timeout returns without waiting for shutdown; exhausted worker slots
+return `failed` / `dns_busy`. Python cannot cancel a running libc DNS lookup:
+a timed-out lookup keeps its slot until it finishes. No executor or unlimited
+per-URL thread creation is used, and stalled workers cannot block process exit.
+
+Budgets are shared across calls: twelve connection attempts (including failed
+connects and redirects), 512 KiB per response and 3 MiB aggregate **HTTP wire
+bytes**: status lines, headers, chunk framing/trailers and bodies, including
+prefetched or discarded bytes on errors, redirects and post-read deadlines.
+These are decrypted HTTP bytes returned by TLS receives, not TCP/TLS record or
+handshake overhead. The allowance is applied before every raw receive below
+HTTP buffering; received bytes are charged immediately and exactly once, never
+again when decoded body bytes are returned. This conservatively stronger cap
+also bounds header/framing overhead and retains the 512 KiB decoded-body cap.
+Bodies stream in at most 8 KiB parser reads and are bounded before decoding.
+At an exhausted wire allowance, any further raw read fails with
+`budget_exhausted`, without an extra byte read. Already-buffered complete
+framing can establish completion at the exact wire cap; otherwise exhaustion
+fails closed. A decoded body exactly at its cap still fails closed. Requests specify
+`Accept-Encoding: identity`; any unexpected compression returns `unsupported`
+with `unsupported_encoding`, without decompression. Supported MIME types are
+`text/html`, `text/plain` and `application/json`, with UTF-8 only; unsupported
+MIME/charset or invalid UTF-8 fail safely.
+
+`FetchResult` contains `status`, safe success `url`, UTC `checked_at`, and on
+success `content_type` and `text`. Statuses distinguish `ok`, `blocked`,
+`timed_out`, `failed`, `unsupported`, and `budget_exhausted`; failures contain
+only generic `error` codes and no URL, body or raw exception. No fetch logging
+is performed. The credential-key check is intentionally narrow and cannot
+prove arbitrary caller-supplied URLs contain no secrets; callers own that
+public-input boundary. Hermetic tests inject DNS/connections and fake numeric
+sockets/TLS to prove address pinning and original-host verification; no live
+DNS, destination requests or Brave requests were performed.
+
+## Public opportunity evidence
+
+`jobtrail_ai_scorer.opportunity_intelligence.OpportunityIntelligence` combines
+injected public search and fetch boundaries. The canonical launcher now wires
+it into opt-in automation and notification cards; see
+[Optional public opportunity intelligence](#optional-public-opportunity-intelligence).
+Public cards use the versioned n8n completion contract described below.
+Offline simulation remains network-free. Live provider validation, production
+activation and n8n consumer migration have not been performed.
+
+Create one resolver, search adapter and public fetcher per sequential run;
+retain their shared quotas across calls. The resolver accepts at most **three
+public opportunities/cards per run**, not three attempts per candidate, and
+extracts at most **three company-reported claims per brief**. It does not
+implement notification-card serialization. Disabled and dry-run resolution
+perform zero search/fetch calls. Pass only approved public company, title,
+location and identifiers, never private descriptions, CV/profile or score notes.
+
+Verification requires an explicit `TrustedEmployerContext`: exact employer
+hosts, a careers URL on those hosts, and public-citation or user-confirmed
+provenance. Current source adapters do not supply that trusted anchor. Search
+rank, an ATS tenant name, HTTP 200 and self-claimed Organization metadata cannot
+bootstrap employer authority. Without the anchor, candidates stay `unverified`.
+A freshly fetched careers page must contain a literal link to the exact employer
+listing or a supported Lever/Greenhouse tenant. Redirects must retain the host
+and tenant and independently satisfy careers delegation.
+
+A bounded JobPosting record must corroborate company, title, exact location
+(including remote restrictions), and an explicitly namespaced employer
+requisition or an exact normalized reference to the original source URL.
+Unknown or insufficient identity remains `unverified`. The original aggregator
+URL is always retained separately; it is never silently replaced. Source
+references compare normalized host case/default port/fragments, but their
+identity citations quote the actual bounded raw matching page field. If that
+field is not a literal substring of fetched text, it cannot become a synthetic
+quotation and resolution fails closed.
+
+All fetched JobPosting records are checked **before matching filters** for
+conflicting evidence sharing a listing URL or namespaced requisition. Contradictory
+company/title/location/remote/identifier/reference/date evidence returns
+`ambiguous` with reason `conflicting_vacancy_evidence`, no official URL and no
+chosen vacancy citations. This is intentionally conservative, including missing
+versus present core fields; optional descriptions are not identity. Different
+plausible listings/requisitions remain separately ambiguous with reason
+`multiple_plausible_vacancies`. Verification never merges conflicting copies.
+An explicit parseable future `validThrough`, nonfuture consistent `datePosted`
+when supplied, and a literal same-host listing-specific Apply link are required
+for `verified`. Expired corroborated evidence can return `closed`. Fetch failure
+(including undifferentiated 404/410), bounded empty search or unsupported page
+structure cannot prove closure or vacancy nonexistence. Partial fetch/quota
+failure prevents claiming a unique verified match.
+
+Company briefs extract only supported Organization fields from the trusted
+careers page, omitting conflicting/unsupported fields instead of padding them.
+Claims carry `company_reported` attribution, source URL, extracted excerpt and
+retrieval timestamp. They do not infer culture or hiring probability. Evidence
+parsing is bounded HTML links and LD+JSON/JSON, not browser execution, arbitrary
+HTML fact extraction or instruction following. Citations record fresh retrieval,
+not an assurance that company statements are independently true.
+
+Verification uses synthetic fixtures and injected transports/clocks only; no
+live provider, DNS or destination validation was performed. The repair
+regressions have observed RED/GREEN evidence, but initial T4 writer provenance
+is unknown: no full-source strict-TDD claim is made. Canonical code integration
+is available behind an opt-in flag, but production activation and live consumer
+migration remain unvalidated. No automatic application, deployment or publication
+has been performed.
 
 ## Optional Adzuna source
 
@@ -657,6 +908,42 @@ end: no source calls, no provider calls, no persistence writes, no
 network. They serve different purposes and are not interchangeable.
 
 ## One-way n8n handoff
+
+### Opportunity cards: opt into completion schema v2
+
+Consumers must explicitly support `schema_version: 2` before enabling public
+opportunity enrichment for n8n. Both `N8N_ENABLED=1` and
+`OPPORTUNITY_INTELLIGENCE_ENABLED=true` are needed for card delivery. The canonical
+launcher is wired for public-card delivery, records locally, then calls
+`build_n8n_envelope(run)` and the same optional adapter; no new notification
+channel or scheduler is introduced.
+Both `OPPORTUNITY_INTELLIGENCE_ENABLED=true` and `N8N_ENABLED=1` are required for cards: the former enables enrichment, the latter outbound delivery. The canonical launcher passes the run through `build_n8n_envelope(run)` and the existing adapter. No new channel or scheduler.
+
+Disabled enrichment, absent intelligence, or no serializable public cards emits
+**exactly the prior v1 shape**, event-ID domain and optional feedback actions.
+v1 rejects an `opportunities` field. v2 adds a required nonempty array of at most
+three T5A public cards: company/title, original URL, status, optional verified
+official URL or unverified candidate URL, at most three citations and three
+company-reported claims (`legalName`, `sector`, `foundingDate`). Citation objects
+contain only source URL, unchanged quoted excerpt, and timezone-aware retrieval
+date. No raw result objects, job descriptions, notes, reasoning, profiles or
+CV-match evidence are exported in cards. v2 retains the bounded `selected`
+compatibility identity/score/recommendation fields, but omits its evidence,
+strengths, gaps and evidence/gap labels; v1 retains its existing behavior.
+
+The builder and adapter enforce closed v2 fields with the public-card validation
+policy, including nested bounds, dates, URL/inline-credential checks and
+status/official-URL consistency. Typed serialization may drop unsafe proofs;
+unsafe caller mappings instead fail before HTTP, without repairing quotes.
+v2 JSON is capped at 256 KiB. Its event ID uses the explicit `jobtrail-n8n-v2`
+hash domain, stable across retries. Optional feedback action IDs remain bound
+to that completion event with the existing canonical action set and one-day
+expiry. This is a **completion-event** version, not a feedback-event upgrade:
+existing v1 feedback events and workflow JSON are unchanged. Existing v1-only
+consumers must not treat v2 as implicitly compatible or silently ignore cards.
+
+Validation is hermetic mocked HTTP only. No n8n deployment, live delivery,
+consumer migration, or publication has been validated.
 
 JobTrail remains the sole scheduler, source collector, importer, scorer, SeenCache owner, and journal authority. The optional n8n adapter is disabled by default and sends one bounded, versioned, redacted run envelope only after the local run record is written. Hermes WhatsApp remains an independent local channel; n8n delivery never invokes or configures Hermes.
 

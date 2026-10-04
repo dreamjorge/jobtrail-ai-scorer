@@ -10,7 +10,7 @@ import json
 import os
 import shlex
 import subprocess
-from typing import Any, Callable, Mapping, Protocol
+from typing import Any, Callable, Mapping, Protocol, TYPE_CHECKING
 from urllib.parse import quote, unquote
 
 import httpx
@@ -21,6 +21,7 @@ from .discover import (  # noqa: F401  (re-exported on purpose)
 )
 from .retry import RetryPolicy, classify_retryable, retry_call
 from .seen_cache import SeenCache
+from .shortlist import build_shortlist
 from .sources import (
     JobSpySourceAdapter,
     NormalizedJob,
@@ -37,6 +38,11 @@ from .notify import (
     recommendation_label,
 )
 from .n8n_outbound import N8nConfig, build_envelope
+from .run_journal import record_run
+
+
+if TYPE_CHECKING:
+    from .opportunity_intelligence import OpportunityResult
 
 
 DEFAULT_TERMS = (
@@ -233,6 +239,7 @@ class AutomationConfig:
     score_threshold: int = 80
     scorer_command: str = "jobtrail-ai-scorer"
     scorer_config_path: str = ""
+    run_journal_path: str = ""
     notify_enabled: bool = False
     notify_on_failure: bool = False
     whatsapp_command: str = ""
@@ -251,6 +258,8 @@ class AutomationConfig:
     breaker_state_path: str = ""
     n8n: N8nConfig = field(default_factory=N8nConfig)
     feedback_actions_enabled: bool = False
+    opportunity_intelligence_enabled: bool = False
+    dry_run: bool = False
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "AutomationConfig":
@@ -263,6 +272,13 @@ class AutomationConfig:
 
         def truthy(key: str, default: str = "0") -> bool:
             return e.get(key, default).strip().lower() in {"1", "true", "yes", "on"}
+
+        def _parse_bool_flag(key: str) -> bool:
+            """Strict allowlist parse for tri-state feature flags."""
+            flag = e.get(key, "0").strip().lower()
+            if flag not in {"1", "true", "yes", "on", "0", "false", "no", "off"}:
+                raise ValueError(f"{key} must be 0/1/true/false/yes/no/on/off")
+            return flag in {"1", "true", "yes", "on"}
 
         def _coerce_int(key: str, default: int) -> int:
             raw = e.get(key)
@@ -305,6 +321,7 @@ class AutomationConfig:
             score_threshold=int(e.get("JOB_SCORE_THRESHOLD", "80")),
             scorer_command=e.get("SCORER_COMMAND", "jobtrail-ai-scorer"),
             scorer_config_path=e.get("SCORER_CONFIG_PATH", ""),
+            run_journal_path=e.get("JOBTRAIL_RUN_JOURNAL_PATH", "").strip(),
             notify_enabled=truthy("WHATSAPP_NOTIFY_ENABLED", "0"),
             notify_on_failure=truthy("WHATSAPP_NOTIFY_ON_FAILURE", "0"),
             whatsapp_command=e.get("WHATSAPP_NOTIFY_COMMAND", ""),
@@ -322,6 +339,8 @@ class AutomationConfig:
             breaker_state_path=e.get("BREAKER_STATE_PATH", "").strip(),
             n8n=N8nConfig.from_env(e),
             feedback_actions_enabled=truthy("N8N_FEEDBACK_ACTIONS_ENABLED"),
+            opportunity_intelligence_enabled=_parse_bool_flag("OPPORTUNITY_INTELLIGENCE_ENABLED"),
+            dry_run=truthy("JOBTRAIL_AUTOMATION_DRY_RUN", "0"),
         )
 
 
@@ -601,6 +620,11 @@ class AutomationRun:
     envelope: dict[str, Any] | None = None
     notification_sent: bool | None = None
     run_id: str = ""
+    opportunities: tuple[dict[str, Any], ...] = ()
+    intelligence: tuple[OpportunityResult, ...] = ()
+    dry_run: bool = False
+    planned_operations: dict[str, int] = field(default_factory=dict)
+    notification_preview: dict[str, Any] | None = None
 
 
 def build_n8n_envelope(
@@ -615,6 +639,21 @@ def build_n8n_envelope(
     scheduler or hiding delivery policy in the search pipeline.
     """
 
+    cards = []
+    if getattr(run, 'intelligence', ()):
+        from .opportunity_intelligence import PublicJobIdentity
+        from .opportunity_cards import serialize_cards
+        for opportunity, result in islice(zip(run.opportunities, run.intelligence), 3):
+            try:
+                identity = PublicJobIdentity(
+                    company=opportunity['company'], title=opportunity['title'],
+                    location=opportunity.get('location', ''), original_url=opportunity['jobUrl'],
+                    source=opportunity.get('source', ''), source_job_id=opportunity.get('sourceJobId', ''),
+                )
+                cards.extend(serialize_cards([(identity, result)]))
+            except (ValueError, TypeError, KeyError):
+                # Same drop/deny boundary as public notification presentation.
+                continue
     return build_envelope(
         run_id=run_id if run_id is not None else run.run_id,
         occurred_at=occurred_at,
@@ -624,6 +663,7 @@ def build_n8n_envelope(
         failures=run.failures,
         selected=run.selected,
         feedback_actions=feedback_actions,
+        opportunities=cards or None,
     )
 
 
@@ -708,6 +748,8 @@ class PlannedOperations:
     best: dict[str, Any] | None
     clock: str
     redacted: bool = True
+    # Internal only: preserve the existing launcher envelope contract.
+    opportunities: tuple[dict[str, Any], ...] = ()
 
     def to_envelope(self) -> dict[str, Any]:
         return _scrub_simulation_value(
@@ -896,49 +938,41 @@ def build_planned_operations(
             notes.append(note_body)
 
         jobs_by_identity.setdefault(identity, job)
-    candidates: list[tuple[int, int, tuple[str, str], NormalizedJob]] = []
+    candidates: list[tuple[NormalizedJob, dict[str, Any]]] = []
     max_score = _bounded_score_limit(config.max_score)
     eligible_identities = list(islice(history_by_identity, max_score))
-    for index, identity in enumerate(eligible_identities):
+    planned_scores = 0
+    for identity in eligible_identities:
         notes = history_by_identity[identity]
         score = parse_score_note([{"body": body} for body in notes])
         if score is None:
             continue
-        candidates.append(
-            (score["score"], -index, identity, jobs_by_identity[identity])
-        )
+        planned_scores += 1
+        candidates.append((jobs_by_identity[identity], score))
 
-    # Python's sort is stable, so equal scores retain discovery order just
-    # like the production ``score > best`` comparison.
-    candidates.sort(key=lambda item: -item[0])
-    eligible = [
-        (_score, job)
-        for _score, _order, _identity, job in candidates
-        if _score >= config.score_threshold
-    ]
-
-    best: dict[str, Any] | None = None
-    if eligible:
-        score, winner = eligible[0]
-        best = {
-            "title": winner.title or "",
-            "company": winner.company or "",
-            "location": winner.location or "",
-            "score": score,
-            "jobUrl": winner.source_url or "",
-            "sourceJobId": winner.source_job_id or "",
-            "source": winner.source or "",
-        }
-
-    scrubbed_best = _scrub_simulation_value(best) if best is not None else None
+    eligible = build_shortlist(candidates, score_threshold=config.score_threshold)
+    opportunities = tuple(
+        _scrub_simulation_value({
+            "title": job.title or "",
+            "company": job.company or "",
+            "location": job.location or "",
+            "score": score["score"],
+            "jobUrl": job.source_url or "",
+            "sourceJobId": job.source_job_id or "",
+            "source": job.source or "",
+        })
+        for job, score in eligible
+    )
+    scrubbed_best = opportunities[0] if opportunities else None
     return PlannedOperations(
         scenario=scenario.name,
         searched=len(bounded_jobs),
         planned_imports=len(jobs_by_identity),
-        planned_scores=len(candidates),
+        planned_scores=planned_scores,
         would_notify=bool(scrubbed_best and config.notify_enabled),
         best=scrubbed_best,
         clock=_resolve_simulation_clock(clock_iso),
+        opportunities=opportunities,
     )
 
 
@@ -991,13 +1025,23 @@ class JobTrailAutomation:
         ats_boards: AtsBoardConfig | None = None,
         preflight_runner: Callable[["AutomationConfig"], Any] | None = None,
         circuit_breaker: Any | None = None,
-            simulation: "SimulationScenario | None" = None,
+        run_journal: Callable[..., Any] | None = None,
+        clock: Callable[[], datetime] | None = None,
+        simulation: "SimulationScenario | None" = None,
+        intelligence_resolver: Any | None = None,
+        intelligence_resolver_factory: Callable[[], Any] | None = None,
+        employer_contexts: tuple[Any, ...] = (),
+        intelligence_status: str | None = None,
     ) -> None:
         if simulation is not None and not isinstance(simulation, SimulationScenario):
             raise ValueError(
                 "simulation must be a SimulationScenario instance or None"
             )
         self._simulation = simulation
+        self._intelligence_resolver = intelligence_resolver
+        self._intelligence_resolver_factory = intelligence_resolver_factory
+        self._employer_contexts = employer_contexts
+        self._intelligence_status = intelligence_status
         self.gateway, self.scorer, self.notifier = (
             gateway,
             scorer or self._score,
@@ -1034,6 +1078,8 @@ class JobTrailAutomation:
         # :meth:`_resolve_breaker`).
         self._preflight_runner = preflight_runner
         self._circuit_breaker = circuit_breaker
+        self._run_journal = run_journal or record_run
+        self._clock = clock or (lambda: datetime.now(timezone.utc))
         # Default ``source_adapters`` preserves the historical
         # ``(JobSpySourceAdapter(gateway),)`` tuple when no ATS boards are
         # configured. When ``ats_boards`` is supplied, the factory appends
@@ -1049,7 +1095,7 @@ class JobTrailAutomation:
                 )
         self.source_adapters = source_adapters
 
-    def _score(self, job_id: str, config_path: str) -> None:
+    def _score(self, job_id: str, config_path: str, job_payload: dict[str, Any] | None = None) -> Any:
         # No retry here: ``run()`` already wraps every call to ``self.scorer``
         # (default or injected) in a single ``retry_call`` with
         # ``_scorer_retry_policy``. Retrying here too would nest attempts
@@ -1060,8 +1106,7 @@ class JobTrailAutomation:
         # ``AutomationConfig.base_url`` in ``run()``) so the scorer targets
         # the same backend instead of falling back to whatever static
         # ``jobtrail_base_url`` is committed in the scorer's own YAML config.
-        subprocess.run(
-            [
+        args = [
                 *shlex.split(self._scorer_command),
                 "score",
                 "--config",
@@ -1071,9 +1116,14 @@ class JobTrailAutomation:
                 "--force",
                 "--base-url",
                 self.base_url,
-            ],
-            check=True,
-        )
+            ]
+        if getattr(self, "_dry_run", False) and job_payload is not None:
+            args.extend(["--dry-run", "--json", "--job-json", "-"])
+            result = subprocess.run(args, input=json.dumps(job_payload, sort_keys=True, separators=(",", ":")),
+                                    text=True, capture_output=True, check=True)
+            return json.loads(result.stdout)
+        subprocess.run(args, check=True)
+        return None
 
     def _notify(self, message: str) -> None:
         if not self._whatsapp_command:
@@ -1137,11 +1187,111 @@ class JobTrailAutomation:
             selected=selected,
             profile_counts={},
             envelope=envelope,
+            opportunities=planned.opportunities,
             run_id=build_run_id(
                 seed=f"simulation:{scenario.name}",
                 clock=lambda: simulation_clock,
             ),
         )
+
+    def _run_dry(self, *, config: AutomationConfig) -> AutomationRun:
+        failures: list[str] = []
+        searched = scored = imported = notified = 0
+        previews: list[tuple[str, Mapping[str, Any]]] = []
+        profile_counts = {p.name: {"searched": 0, "imported": 0, "duplicates": 0, "failures": 0}
+                          for p in config.search_profiles} if config.search_profiles else {}
+        identities: dict[tuple[str, str], str] = {}
+        profiles: dict[str, list[str]] = {}
+        for adapter in self.source_adapters:
+            requests = (ats_source_search_requests(config)
+                        if getattr(adapter, "name", None) in {"lever", "greenhouse"}
+                        else source_search_requests(config))
+            for request in requests:
+                try:
+                    jobs = adapter.search(request)
+                    searched += len(jobs)
+                    for job in jobs:
+                        payload = job.to_import_payload()
+                        identity = self._cache_identity(job)
+                        if identity is not None and identity in identities:
+                            continue
+                        job_id = identity[1] if identity else str(payload.get("jobUrl") or searched)
+                        if identity is not None:
+                            identities[identity] = job_id
+                        previews.append((job_id, payload))
+                        self._append_profile_provenance(profiles, job_id, request.profile_name)
+                    if request.profile_name in profile_counts:
+                        profile_counts[request.profile_name]["searched"] += len(jobs)
+                except Exception as exc:
+                    failures.append(_format_failure("search", exc))
+        scored_jobs = []
+        for job_id, payload in previews[:config.max_score]:
+            try:
+                import inspect
+                try:
+                    inspect.signature(self.scorer).bind(job_id, config.scorer_config_path, payload)
+                    score = self.scorer(job_id, config.scorer_config_path, payload)
+                except TypeError:
+                    score = self.scorer(job_id, config.scorer_config_path)
+                if not isinstance(score, Mapping) or not isinstance(score.get("score"), (int, float)):
+                    raise ValueError("scorer preview must be a score mapping")
+                scored_jobs.append((job_id, payload, dict(score)))
+                scored += 1
+            except Exception as exc:
+                failures.append(_format_failure("score", exc, job_id=job_id))
+        eligible = [
+            (job_id, job, score)
+            for job_id, job, score in scored_jobs
+            if score["score"] >= config.score_threshold
+        ]
+        # max() is stable: equal scores retain the first source-order candidate.
+        best_entry = max(eligible, key=lambda item: item[2]["score"], default=None)
+        opportunities = []
+        for job_id, job, score in eligible:
+            safe_job = {
+                "id": job.get("id", job_id),
+                "position": job.get("position", job.get("title", "")),
+                "company": job.get("company", ""),
+                "location": job.get("location", ""),
+                "jobUrl": job.get("jobUrl", job.get("job_url", "")),
+            }
+            opportunity = build_notification_summary(
+                safe_job, score, base_url=config.base_url
+            )
+            if job_id in profiles:
+                # Provenance is useful but untrusted; the notification builder
+                # is the established boundary for clipping/redacting it.
+                opportunity["searchProfiles"] = build_notification_summary(
+                    safe_job, {**score, "searchProfiles": profiles[job_id]},
+                    base_url=config.base_url,
+                ).get("searchProfiles", [])
+            opportunities.append(opportunity)
+        if best_entry is not None:
+            best_id, best_job, best_score = best_entry
+            best = opportunities[eligible.index(best_entry)]
+        else:
+            best = best_job = best_score = None
+        body = self._compose_notification(best=best, best_job=best_job, best_score=best_score,
+            failures=tuple(failures), notify_enabled=config.notify_enabled, notify_on_failure=config.notify_on_failure,
+            searched=searched, scored=scored, score_threshold=config.score_threshold, base_url=config.base_url)
+        preview = None
+        if body is not None:
+            notified = 1
+            if best_job is not None and best_score is not None:
+                score_for_preview = dict(best_score)
+                if best and best.get("searchProfiles"):
+                    score_for_preview["searchProfiles"] = best["searchProfiles"]
+                preview = build_notification_summary(
+                    best_job, score_for_preview, base_url=config.base_url
+                )
+            else:
+                # Do not expose arbitrary failure text or rendered notification
+                # content when there is no selected job to summarize.
+                preview = {"kind": "notification_preview", "redacted": True}
+        return AutomationRun(searched=searched, imported=0, scored=scored, failures=tuple(failures),
+            selected=best, profile_counts=profile_counts, dry_run=True,
+            planned_operations={"searched": searched, "imported": len(previews), "scored": scored, "notified": notified},
+            notification_preview=preview, opportunities=tuple(opportunities))
 
     def run(
         self, *, config: AutomationConfig, clock_iso: str | None = None
@@ -1152,7 +1302,9 @@ class JobTrailAutomation:
         # notifier, no production-state mutation.
         if self._simulation is not None:
             return self._run_simulation(config, clock_iso=clock_iso)
-        started_at = datetime.now(timezone.utc)
+        if config.dry_run:
+            return self._run_dry(config=config)
+        started_at = self._clock()
         run_id = build_run_id(moment=started_at, seed=started_at.isoformat())
         if not config.scorer_config_path:
             raise ValueError("SCORER_CONFIG_PATH is required")
@@ -1173,10 +1325,12 @@ class JobTrailAutomation:
             # the operator's notify flags), and return an empty run. The
             # breaker-opened run MUST NOT increment the failure counter
             # so the alert does not extend the cooldown.
-            return self._handle_breaker_open(
+            run = self._handle_breaker_open(
                 breaker=breaker,
                 config=config,
             )
+            self._journal_run(config, run, started_at)
+            return run
 
         # Step 0b: preflight is opt-in. When ``preflight_runner`` is
         # provided, a non-empty ``should_abort`` aborts the run before
@@ -1185,9 +1339,9 @@ class JobTrailAutomation:
             report = self._preflight_runner(config)
             if getattr(report, "should_abort", False):
                 preflight_failures = self._preflight_failure_labels(report)
-                return self._empty_run(
-                    tuple(preflight_failures), breaker=breaker
-                )
+                run = self._empty_run(tuple(preflight_failures), breaker=breaker)
+                self._journal_run(config, run, started_at)
+                return run
 
         failures: list[str] = []
         ids: list[str] = []
@@ -1290,47 +1444,84 @@ class JobTrailAutomation:
                 scored += 1
             except Exception as exc:
                 failures.append(_format_failure("score", exc, job_id=job_id))
-        best = None
-        best_job = None
-        best_score = None
-        best_job_id = None
+        candidates = []
         for job_id in scored_ids:
             try:
                 job = self.gateway.get_job(job_id)
                 score = parse_score_note(job.get("notes"))
-                if (
-                    score
-                    and score.get("score", -1) >= config.score_threshold
-                    and (best is None or score["score"] > best["score"])
-                ):
-                    best = {
-                        "title": job.get("position", job.get("title", "")),
-                        "company": job.get("company", ""),
-                        "location": job.get("location", ""),
-                        "score": score["score"],
-                        "recommendation": score.get("recommendation", ""),
-                        "strengths": score.get("strengths", []),
-                        "gaps": score.get("gaps", []),
-                        "jobUrl": job.get("jobUrl", job.get("job_url", "")),
-                        "source": job.get("source", ""),
-                        "sourceJobId": job.get("sourceJobId", ""),
-                    }
-                    # These additive fields are copied only when the scorer
-                    # supplied them; the outbound boundary clips/redacts them.
-                    for field_name in (
-                        "fit_score", "coverage_score", "classification",
-                        "evidence", "evidence_labels", "gap_labels",
-                    ):
-                        if field_name in score:
-                            best[field_name] = score[field_name]
-                    best_job = job
-                    best_score = score
-                    best_job_id = job_id
+                if score is not None:
+                    candidates.append(((job_id, job), score))
             except Exception as exc:
                 failures.append(_format_failure("read", exc, job_id=job_id))
 
-        if best is not None and best_job_id in profiles_by_job_id:
-            best["searchProfiles"] = list(profiles_by_job_id[best_job_id])
+        shortlist = build_shortlist(candidates, score_threshold=config.score_threshold)
+        opportunities = []
+        for (job_id, job), score in shortlist:
+            opportunity = {
+                "title": job.get("position", job.get("title", "")),
+                "company": job.get("company", ""),
+                "location": job.get("location", ""),
+                "score": score["score"],
+                "recommendation": score.get("recommendation", ""),
+                "strengths": score.get("strengths", []),
+                "gaps": score.get("gaps", []),
+                "jobUrl": job.get("jobUrl", job.get("job_url", "")),
+                "source": job.get("source", ""),
+                "sourceJobId": job.get("sourceJobId", ""),
+            }
+            # Copy only existing additive fields; outbound contracts stay unchanged.
+            for field_name in (
+                "fit_score", "coverage_score", "classification",
+                "evidence", "evidence_labels", "gap_labels",
+            ):
+                if field_name in score:
+                    opportunity[field_name] = score[field_name]
+            if job_id in profiles_by_job_id:
+                opportunity["searchProfiles"] = list(profiles_by_job_id[job_id])
+            opportunities.append(opportunity)
+
+        intelligence = []
+        card_inputs = []
+        if config.opportunity_intelligence_enabled:
+            from .opportunity_intelligence import PublicJobIdentity, OpportunityResult
+            # Local to this run: one deadline/budget shared across the shortlist,
+            # starting only after collection and scoring have finished.
+            resolver = self._intelligence_resolver
+            intelligence_status = self._intelligence_status
+            if (opportunities and not intelligence_status and resolver is None
+                    and self._intelligence_resolver_factory is not None):
+                try:
+                    resolver = self._intelligence_resolver_factory()
+                except Exception:
+                    intelligence_status = "invalid_configuration"
+            for opportunity in opportunities[:3]:
+                identity = None
+                try:
+                    # Explicit projection: never give enrichment scored mappings.
+                    identity = PublicJobIdentity(
+                        company=opportunity["company"], title=opportunity["title"],
+                        location=opportunity["location"], original_url=opportunity["jobUrl"],
+                        source=opportunity["source"], source_job_id=opportunity["sourceJobId"],
+                    )
+                    from .opportunity_intelligence import _norm
+                    context = next((c for c in self._employer_contexts
+                                    if _norm(c.company) == _norm(identity.company)), None)
+                    if intelligence_status or resolver is None:
+                        resolved = OpportunityResult(intelligence_status or "unavailable", identity.original_url)
+                    else:
+                        resolved = resolver.resolve(identity, context, enabled=True)
+                        if type(resolved) is not OpportunityResult:
+                            raise ValueError("invalid intelligence result")
+                except Exception:
+                    resolved = OpportunityResult("unavailable" if identity else "invalid_input",
+                                                 identity.original_url if identity else None)
+                intelligence.append(resolved)
+                if identity is not None:
+                    card_inputs.append((identity, resolved))
+
+        best = opportunities[0] if opportunities else None
+        best_job = shortlist[0][0][1] if shortlist else None
+        best_score = shortlist[0][1] if shortlist else None
         notification_body = self._compose_notification(
             best=best,
             best_job=best_job,
@@ -1344,6 +1535,25 @@ class JobTrailAutomation:
             base_url=self.base_url,
             run_id=run_id,
         )
+        if notification_body is not None and config.opportunity_intelligence_enabled:
+            # Public cards are appended to the WhatsApp payload only when the
+            # match summary is the primary delivery (notify_enabled + best)
+            # or when the failure-only alert has no selected match to
+            # describe (notify_on_failure + failures, no best). When a
+            # match was selected but only failure notifications are enabled
+            # (notify_on_failure with notify_enabled=False), the failure
+            # summary is the only content the operator asked for and must
+            # remain a clean JSON envelope; mixing in the match's card text
+            # would break JSON parseability and duplicate match context.
+            if (config.notify_enabled and best) or (
+                config.notify_on_failure and failures and not best
+            ):
+                from .opportunity_cards import serialize_cards, render_cards
+                try:
+                    public_body = render_cards(serialize_cards(card_inputs))
+                except Exception:
+                    public_body = "Public information: unavailable"
+                notification_body += "\n\n" + public_body
         notification_sent = False
         if notification_body is not None:
             try:
@@ -1360,6 +1570,8 @@ class JobTrailAutomation:
             profile_counts,
             notification_sent=notification_sent,
             run_id=run_id,
+            opportunities=tuple(opportunities),
+            intelligence=tuple(intelligence),
         )
         # Step N: record the run outcome on the breaker so it can open
         # after consecutive failures or close after a clean run.
@@ -1368,7 +1580,17 @@ class JobTrailAutomation:
                 breaker.record_failure()
             else:
                 breaker.record_success()
+        self._journal_run(config, run, started_at)
         return run
+
+    def _journal_run(self, config: AutomationConfig, run: AutomationRun, started_at: datetime) -> None:
+        if not config.run_journal_path:
+            return
+        try:
+            self._run_journal(config.run_journal_path, run, started_at=started_at,
+                              finished_at=self._clock(), base_url_source="static")
+        except Exception:
+            pass
 
     # --- Breaker / preflight helpers --------------------------------------
 
