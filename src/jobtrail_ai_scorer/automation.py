@@ -636,6 +636,21 @@ def build_n8n_envelope(
     scheduler or hiding delivery policy in the search pipeline.
     """
 
+    cards = []
+    if getattr(run, 'intelligence', ()):
+        from .opportunity_intelligence import PublicJobIdentity
+        from .opportunity_cards import serialize_cards
+        for opportunity, result in islice(zip(run.opportunities, run.intelligence), 3):
+            try:
+                identity = PublicJobIdentity(
+                    company=opportunity['company'], title=opportunity['title'],
+                    location=opportunity.get('location', ''), original_url=opportunity['jobUrl'],
+                    source=opportunity.get('source', ''), source_job_id=opportunity.get('sourceJobId', ''),
+                )
+                cards.extend(serialize_cards([(identity, result)]))
+            except (ValueError, TypeError, KeyError):
+                # Same drop/deny boundary as public notification presentation.
+                continue
     return build_envelope(
         run_id=run_id if run_id is not None else run.run_id,
         occurred_at=occurred_at,
@@ -645,6 +660,7 @@ def build_n8n_envelope(
         failures=run.failures,
         selected=run.selected,
         feedback_actions=feedback_actions,
+        opportunities=cards or None,
     )
 
 

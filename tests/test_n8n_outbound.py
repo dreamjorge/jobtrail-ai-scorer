@@ -1,4 +1,8 @@
+from copy import deepcopy
 from hashlib import sha256
+import json
+
+import pytest
 
 import httpx
 
@@ -8,6 +12,48 @@ from jobtrail_ai_scorer.n8n_outbound import (
     N8nOutboundAdapter,
     build_envelope,
 )
+
+
+def _v2_envelope():
+    from jobtrail_ai_scorer.opportunity_cards import serialize_cards
+    from jobtrail_ai_scorer.opportunity_intelligence import (
+        PublicJobIdentity, OpportunityResult, Citation, CompanyClaim, CompanyBrief,
+    )
+    job = PublicJobIdentity('Acme', 'Engineer', 'Remote', 'https://source.test/1', 'indeed', '1')
+    proof = Citation('https://acme.test/about',
+                     'Software company (https://acme.test/about?lang=en).',
+                     '2026-06-01T00:00:00+00:00', 'company_reported')
+    cards = serialize_cards([(job, OpportunityResult(
+        'verified', job.original_url, official_url='https://acme.test/jobs/1',
+        checked_at=proof.checked_at, citations=(proof,),
+        company_brief=CompanyBrief('available', (CompanyClaim('sector', 'Software', proof),)),
+    ))])
+    return build_envelope(
+        run_id='run-1', occurred_at='2026-06-01T00:00:00+00:00', searched=1,
+        imported=1, scored=1, selected={'source': 'indeed', 'sourceJobId': '1',
+                                      'score': 91, 'evidence': [{'label': 'direct', 'text': 'CV match'}]},
+        opportunities=cards, feedback_actions=True,
+    )
+
+
+@pytest.mark.parametrize('field', ['original_url', 'official_url', 'proof_url'])
+@pytest.mark.parametrize('url', [
+    'https://acme.test/?token=synthetic', 'https://user:pass@acme.test/',
+    'https://acme.test/?%2561pi_key=synthetic',
+    'https://acme.test/#token=synthetic', 'https://127.0.0.1/', 'http://acme.test/',
+])
+def test_v2_denies_unsafe_url_mappings_before_http(field, url):
+    envelope = _v2_envelope()
+    card = envelope['opportunities'][0]
+    if field == 'proof_url':
+        card['citations'][0]['url'] = url
+    else:
+        card[field] = url
+    calls = []
+    adapter = N8nOutboundAdapter(N8nConfig(enabled=True, endpoint='https://n8n.test/hook'),
+        transport=httpx.MockTransport(lambda request: (calls.append(request) or httpx.Response(202))))
+    assert adapter.send(envelope) == DeliveryResult('failed', 0, '', 'terminal')
+    assert calls == []
 
 
 def _envelope():
@@ -512,3 +558,134 @@ def test_selected_summary_rejects_nested_values_and_redacts_strings_and_urls():
     assert "recommendation" not in selected
     assert selected["jobUrl"] == "https://jobs.test/1?keep=yes"
     assert selected["jobTrailLink"] == "https://trail.test/1"
+
+
+def test_v2_selected_removed_fields_normalize_to_none_and_are_delivered():
+    from jobtrail_ai_scorer.opportunity_cards import serialize_cards
+    from jobtrail_ai_scorer.opportunity_intelligence import (
+        PublicJobIdentity, OpportunityResult,
+    )
+    job = PublicJobIdentity('Acme', 'Engineer', 'Remote', 'https://source.test/1', 'indeed', '1')
+    cards = serialize_cards([(job, OpportunityResult('unverified', job.original_url))])
+    envelope = build_envelope(
+        run_id='run-1', occurred_at='2026-06-01T00:00:00+00:00', searched=1,
+        imported=1, scored=1,
+        selected={'evidence': [{'label': 'direct', 'text': 'CV match'}], 'strengths': ['Python']},
+        opportunities=cards,
+    )
+    assert envelope['selected'] is None
+    requests = []
+    adapter = N8nOutboundAdapter(
+        N8nConfig(enabled=True, endpoint='https://n8n.test/hook'),
+        transport=httpx.MockTransport(
+            lambda request: (requests.append(json.loads(request.content)) or httpx.Response(202))
+        ),
+    )
+    result = adapter.send(envelope)
+    assert result == DeliveryResult('accepted', 1, envelope['event_id'])
+    assert requests == [envelope]
+
+
+def test_v2_public_quotes_selected_compatibility_and_retry_identity():
+    envelope = _v2_envelope()
+    assert envelope['schema_version'] == 2
+    assert envelope['selected'] == {'source': 'indeed', 'sourceJobId': '1', 'score': 91}
+    assert envelope['event_id'] == sha256(
+        b'{"job_id":"1","run_id":"run-1","source":"indeed","version":"jobtrail-n8n-v2"}'
+    ).hexdigest()[:32]
+    assert envelope == _v2_envelope()
+    attempts = []
+    def respond(request):
+        attempts.append(json.loads(request.content))
+        return httpx.Response(503 if len(attempts) < 3 else 202)
+    adapter = N8nOutboundAdapter(N8nConfig(enabled=True, endpoint='https://n8n.test/hook'),
+        transport=httpx.MockTransport(respond), sleep=lambda _: None)
+    assert adapter.send(envelope) == DeliveryResult('accepted', 3, envelope['event_id'])
+    assert attempts == [envelope] * 3
+    proof = attempts[0]['opportunities'][0]['citations'][0]
+    assert proof['excerpt'] == 'Software company (https://acme.test/about?lang=en).'
+    assert proof['retrieved_at'] == '2026-06-01T00:00:00+00:00'
+    assert envelope['actions'][0]['expires_at'] == '2026-06-02T00:00:00+00:00'
+
+
+@pytest.mark.parametrize('mutation', [
+    'missing', 'empty', 'four', 'tuple', 'unknown_top', 'v1_cards', 'bool_version',
+    'string_version', 'unknown_version', 'unknown_card', 'nested_title', 'unknown_status',
+    'missing_official', 'inconsistent_official', 'missing_claims', 'four_claims',
+    'four_proofs', 'bad_date', 'naive_date', 'date_only', 'unknown_proof', 'nested_quote',
+    'unknown_claim', 'bad_field', 'bad_attribution', 'nested_value', 'forbidden_quote',
+    'inline_secret_quote', 'inline_fragment_secret', 'cv_evidence',
+])
+def test_v2_closed_schema_rejects_mutations_before_http(mutation):
+    envelope = _v2_envelope()
+    card = envelope['opportunities'][0]
+    proof = card['citations'][0]
+    claim = card['claims'][0]
+    if mutation == 'missing': del envelope['opportunities']
+    elif mutation == 'empty': envelope['opportunities'] = []
+    elif mutation == 'four': envelope['opportunities'] *= 4
+    elif mutation == 'tuple': envelope['opportunities'] = tuple(envelope['opportunities'])
+    elif mutation == 'unknown_top': envelope['profile'] = 'private'
+    elif mutation == 'v1_cards': envelope['schema_version'] = 1
+    elif mutation == 'bool_version': envelope['schema_version'] = True
+    elif mutation == 'string_version': envelope['schema_version'] = '2'
+    elif mutation == 'unknown_version': envelope['schema_version'] = 3
+    elif mutation == 'unknown_card': card['reasoning'] = 'private'
+    elif mutation == 'nested_title': card['title'] = {'profile': 'private'}
+    elif mutation == 'unknown_status': card['status'] = 'success'
+    elif mutation == 'missing_official': del card['official_url']
+    elif mutation == 'inconsistent_official': card['status'] = 'unverified'
+    elif mutation == 'missing_claims': del card['claims']
+    elif mutation == 'four_claims': card['claims'] *= 4
+    elif mutation == 'four_proofs': card['citations'] *= 4
+    elif mutation == 'bad_date': proof['retrieved_at'] = 'not a date'
+    elif mutation == 'naive_date': proof['retrieved_at'] = '2026-06-01T00:00:00'
+    elif mutation == 'date_only': proof['retrieved_at'] = '2026-06-01'
+    elif mutation == 'unknown_proof': proof['notes'] = 'private'
+    elif mutation == 'nested_quote': proof['excerpt'] = {'text': 'nested'}
+    elif mutation == 'unknown_claim': claim['description'] = 'private'
+    elif mutation == 'bad_field': claim['field'] = 'culture'
+    elif mutation == 'bad_attribution': claim['attribution'] = 'verified_fact'
+    elif mutation == 'nested_value': claim['value'] = ['nested']
+    elif mutation == 'forbidden_quote': proof['excerpt'] = 'PROFILE_SENTINEL'
+    elif mutation == 'inline_secret_quote': proof['excerpt'] = 'See https%3A%2F%2Facme.test%2F%3Ftoken%3Dsynthetic'
+    elif mutation == 'inline_fragment_secret': proof['excerpt'] = 'See https://acme.test/#token=synthetic'
+    elif mutation == 'cv_evidence': envelope['selected']['evidence'] = [{'label': 'direct', 'text': 'private'}]
+    calls = []
+    adapter = N8nOutboundAdapter(N8nConfig(enabled=True, endpoint='https://n8n.test/hook'),
+        transport=httpx.MockTransport(lambda request: (calls.append(request) or httpx.Response(202))))
+    assert adapter.send(envelope) == DeliveryResult('failed', 0, '', 'terminal')
+    assert calls == []
+
+
+def test_v2_builder_denies_empty_oversized_and_unsafe_cards():
+    valid = _v2_envelope()['opportunities']
+    unsafe = deepcopy(valid)
+    unsafe[0]['profile'] = 'private'
+    for cards in ([], valid * 4, unsafe):
+        with pytest.raises(ValueError):
+            build_envelope(run_id='run', occurred_at='now', searched=0, imported=0,
+                           scored=0, opportunities=cards)
+
+
+def test_canonical_wrapper_exact_v1_and_three_card_cap():
+    from jobtrail_ai_scorer.automation import AutomationRun, build_n8n_envelope
+    from jobtrail_ai_scorer.opportunity_intelligence import OpportunityResult
+    selected = {'company': 'Acme', 'title': 'Engineer', 'location': 'Remote',
+                'jobUrl': 'https://source.test/1', 'source': 'indeed', 'sourceJobId': '1',
+                'evidence': [{'label': 'direct', 'text': 'legacy'}]}
+    kwargs = dict(occurred_at='2026-06-01T00:00:00+00:00', feedback_actions=True)
+    run = AutomationRun(searched=4, scored=4, selected=selected, run_id='run-1',
+                        opportunities=(selected,) * 4)
+    legacy = build_envelope(run_id='run-1', searched=4, imported=0, scored=4,
+                            selected=selected, **kwargs)
+    assert build_n8n_envelope(run, **kwargs) == legacy
+    from dataclasses import replace
+    enriched = replace(run, intelligence=(OpportunityResult('unverified', selected['jobUrl']),) * 4)
+    envelope = build_n8n_envelope(enriched, **kwargs)
+    assert envelope['schema_version'] == 2 and len(envelope['opportunities']) == 3
+    assert envelope['selected']['sourceJobId'] == legacy['selected']['sourceJobId']
+    assert 'evidence' not in envelope['selected']
+    assert 'evidence' in legacy['selected']
+    # Intelligence without a valid public identity must never emit empty v2.
+    assert build_n8n_envelope(replace(run, opportunities=(), intelligence=enriched.intelligence), **kwargs) == legacy
